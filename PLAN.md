@@ -383,6 +383,21 @@ byte time (320 us); at most a second's worth wait (a USB keyboard can send faste
   DMA, the latch and the timeout. Without MIDI every firmware's audio is byte-identical to
   before; with it JIT == interpreter == per step.
 
+## 5.11 A repository of its own; FM-1 SID as a synth with effects (2026-10-12)
+
+- The emulator and fm1-sid moved from ai-smarthome (`audio/fm-1`, `audio/fm1-sid`, history kept)
+  to github.com/joakimeriksson/fm1-emu; Pages: the emulator at the top, the SID player under
+  `fm1-sid/` (`tools/build_site.sh`, `.github/workflows/pages.yml`: unit tests, both smoke tests,
+  deploy). The old ai-smarthome addresses forward here with their query.
+- The page got a guide below the synth (what it is, playing, MIDI in, a card per firmware from
+  `web/firmwares.json`, M-VAVE's own, limits, how it works, credits).
+- FM-1 SID's update package boots into the synth (pack flag 8 on a pack of its own tune), and the
+  firmware has effects (`fm1-sid/firmware/fx.c`, after Felucca's): stereo chorus, tempo delay,
+  room reverb on an FX page. The player stays dry by default and its output is bit for bit the
+  firmware's before; the audio interrupt goes from ~10 % to ~14 %, RAM to 425 of 432 KB.
+- The SID firmware builds on macOS with the JieLi toolchain in Docker (`linux/amd64`), the
+  image byte-identical to the one built on Linux.
+
 ## 6. Phase 5 — Boot & integration
 
 - Boot stock firmware to a stable idle/main-loop state.

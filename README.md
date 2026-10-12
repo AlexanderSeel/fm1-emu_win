@@ -15,8 +15,8 @@ it, the same update package you would install on a real FM-1. M-VAVE's own firmw
 fetched that way, so download `FM-1.fwsc` from M-VAVE and open it on the page.
 
 Also here: **[FM-1 SID](fm1-sid/)**, a firmware that turns the FM-1 into a Commodore 64 SID
-synth and tune player ([its page](https://joakimeriksson.github.io/fm1-emu/fm1-sid/) plays
-all of HVSC).
+synth, with a step sequencer and stereo chorus, delay and reverb, that also plays C64 tunes
+([its page](https://joakimeriksson.github.io/fm1-emu/fm1-sid/) plays all of HVSC).
 
 ## What runs
 
