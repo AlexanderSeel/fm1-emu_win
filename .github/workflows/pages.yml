@@ -1,0 +1,66 @@
+# Test the emulator, build the site (the emulator's page and the FM-1 SID player) and publish
+# it on GitHub Pages from the Actions artifact (Settings -> Pages -> Source: GitHub Actions).
+
+name: Test and deploy
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Rust wasm target
+        run: rustup target add wasm32-unknown-unknown
+
+      # The CPU, decoder and peripherals (fm1-live needs ALSA headers, the tests do not).
+      - name: Unit tests
+        run: cargo test --release -p fm1-isa -p fm1-core -p fm1-soc
+
+      - name: Build the site
+        run: tools/build_site.sh _site
+
+      # The emulator's wasm boots a real firmware (Felucca, fetched from its author's site like
+      # the page does) to audio and a screen, and a MIDI note sounds.
+      - name: Test the emulator page
+        run: node web/smoke.mjs _site
+
+      # The SID player's wasm boots the player firmware with the page's own tune pack.
+      - name: Test the FM-1 SID player page
+        run: node fm1-sid/web/smoke.mjs _site/fm1-sid
+
+      - if: github.event_name != 'pull_request'
+        uses: actions/configure-pages@v5
+      - if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

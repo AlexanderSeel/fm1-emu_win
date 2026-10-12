@@ -369,7 +369,7 @@ when it reproduces every (raw, value) example the solver kept for it.
 
 ### Flags, carry and soft double (2026-10-11)
 
-Found by running reSID 0.16 on the emulator (a SID study, `audio/fm1-sid`): its `double` math (compiler-rt
+Found by running reSID 0.16 on the emulator (a SID study, `fm1-sid`): its `double` math (compiler-rt
 `__muldf3` / `__divdf3`, libm `sin`) came out wrong, so its sampling setup and filter
 coefficients did. Probes `probes/softfloat/*.c` (`run.sh`; 64-bit add / sub / compare /
 shift / multiply, soft double) compare the emulator with the host.
@@ -390,7 +390,7 @@ shift / multiply, soft double) compare the emulator with the host.
 - **`d1 e8 <mask>` / `d9 e8 <mask>`**: pop / push of rets and a register mask for any mask
   (libm's `sin` pops `{rets, r11-r8, r6-r4}`; the classes matched only the corpus masks).
 - **Table classes fitted to corpus operands** (found running floooh's m6502 in a SID player
-  firmware, `audio/fm1-sid/firmware`): when the table has no class, `fetch_at` now falls back
+  firmware, `fm1-sid/firmware`): when the table has no class, `fetch_at` now falls back
   to `decode_alu4` for every 4-byte ALU form it knows (`6c e8` `[r0+24] <<= 1`, `64 e8`
   `[r1+-4] &= r0`) and to route 19 for the post-increment family `d1..d7 ec/ed/ee`
   (`h[r4++=480] = r0`).

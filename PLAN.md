@@ -297,8 +297,8 @@ All fifteen downloadable community firmwares from fm1-editor.com/firmware run: F
 its forks, AMB-1, ChoralRoot, FoMni, FuMi-1, GHOULBOX, Hortator, Jangada, Melodee,
 PurpleMonkey, FM1 Quest, SLOOP (+ALG), X0X. `web/firmwares.json` is the catalog.
 
-- The page is published with the repo's other demos (scripts/build-pages.mjs, slug `fm-1`;
-  CI builds the wasm and runs `web/smoke.mjs`, which boots Felucca to audio and a screen).
+- The page is published by `tools/build_site.sh` and `.github/workflows/pages.yml` (until
+  2026-10-12 with ai-smarthome's other demos, where this project started; CI builds the wasm and runs `web/smoke.mjs`, which boots Felucca to audio and a screen).
   It hosts no firmware: it fetches each package from its author's GitHub Pages (all allow
   cross-origin reads) and unpacks it with `web/fwsc.js` (our own unpacker, byte-equal to
   Felucca's package code on every package). Authors move on fast: when the catalog's
