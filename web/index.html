@@ -16,6 +16,7 @@
   header { display: flex; flex-wrap: wrap; gap: 8px 16px; align-items: baseline; justify-content: space-between; }
   h1 { font-size: 18px; font-weight: 600; margin: 0; }
   #status { color: var(--dim); font-variant-numeric: tabular-nums; }
+  .runs { flex-basis: 100%; margin: -6px 0 0; color: var(--dim); }
   .stage { position: relative; }
   /* the whole synth in view on a laptop: as wide as the room allows below the bar (--above,
      --aspect: set by main.js), never narrower than 560px */
@@ -128,6 +129,7 @@
   <header>
     <h1 id="title">M-VAVE FM-1 (emulated)</h1>
     <span id="status">click Start to boot</span>
+    <p class="runs">Runs an FM-1 emulator in a WASM virtual machine.</p>
   </header>
   <div class="bar">
     <label>Firmware <select id="fw" aria-label="Firmware"></select></label>
