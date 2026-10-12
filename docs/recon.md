@@ -114,5 +114,5 @@ Findings from public sources, 2026-10-08. Sources listed at the bottom.
 - github.com/AL-255/FM-1-RE (README + docs)
 - github.com/ip2k/lunar-modulator (README + docs map)
 - github.com/hugelton/Felucca (README)
-- github.com/oxcar/awesome-mwave-fm1
+- github.com/cicloid/awesome-fm-1
 - kagaimiq.github.io/jielie

@@ -68,7 +68,7 @@
       "package": "https://hericdk.github.io/fm1-quest/firmware/fm1-quest-15.fwsc",
       "installer": "https://hericdk.github.io/fm1-quest/webapp/installer/" },
     { "id": "sid", "name": "FM-1 SID", "version": "0.1", "author": "joakimeriksson", "license": "GPL-3.0",
-      "about": "A SID chip on the FM-1: reSID 0.16 and a 6502 run C64 tunes, its own tune plays at boot. HOME turns it into a SID synth: the keys play 12 instruments, KNOB1-4 are cutoff, resonance, attack, release. Built in this repository (fm1-sid/), not on fm1-editor.com's list; its own page plays all of HVSC: joakimeriksson.github.io/fm1-emu/fm1-sid/",
+      "about": "A SID chip on the FM-1, as a synth: the keys play 12 instruments, KNOB1-4 are cutoff, resonance, attack, release. HOME turns it into a C64 tune player (reSID 0.16 and a 6502 running the tune's own code), starting with its own tune. Built in this repository (fm1-sid/), not on fm1-editor.com's list; its own page plays all of HVSC: joakimeriksson.github.io/fm1-emu/fm1-sid/",
       "repo": "https://github.com/joakimeriksson/fm1-emu/tree/master/fm1-sid",
       "package": "https://joakimeriksson.github.io/fm1-emu/fm1-sid/sidplayer.fwsc" },
     { "id": "sloop", "name": "SLOOP", "version": "2.5", "author": "isod89", "license": "GPL-3.0",

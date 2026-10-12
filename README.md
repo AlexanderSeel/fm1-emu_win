@@ -80,4 +80,4 @@ Built on the community's reverse engineering of the FM-1:
 [ip2k/lunar-modulator](https://github.com/ip2k/lunar-modulator),
 kagaimiq's [jielie](https://kagaimiq.github.io/jielie), the hardware layer of
 [hugelton/Felucca](https://github.com/hugelton/Felucca) and
-[awesome-mwave-fm1](https://github.com/oxcar/awesome-mwave-fm1). Thanks to every firmware author for publishing their work.
+[awesome-fm-1](https://github.com/cicloid/awesome-fm-1). Thanks to every firmware author for publishing their work.
