@@ -5,6 +5,7 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="${1:-$ROOT/_site}"
+mkdir -p "$OUT" && OUT="$(cd "$OUT" && pwd)"
 "$ROOT/web/build.sh" "$OUT" >/dev/null
 mkdir -p "$OUT/fm1-sid"
 (cd "$ROOT/fm1-sid/web" && cp -R $(ls | grep -v '^smoke\.mjs$') "$OUT/fm1-sid/")
