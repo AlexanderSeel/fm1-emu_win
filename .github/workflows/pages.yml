@@ -35,6 +35,10 @@ jobs:
       - name: Unit tests
         run: cargo test --release -p fm1-isa -p fm1-core -p fm1-soc
 
+      # The README's table of firmwares (links that open each one on the page) matches the catalog.
+      - name: README firmware table
+        run: node tools/readme_firmwares.mjs --check
+
       - name: Build the site
         run: tools/build_site.sh _site
 
