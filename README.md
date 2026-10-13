@@ -12,6 +12,11 @@ a MIDI keyboard.
 
 [![The emulated FM-1's front panel running fifteen of the firmwares in turn](docs/media/firmwares.gif)](https://joakimeriksson.github.io/fm1-emu/)
 
+With sound: nine of the firmwares in 50 seconds.
+https://github.com/user-attachments/assets/6849316e-7239-497e-b617-be74317dc2b1
+
+
+
 The page hosts no firmware: it downloads each one from its author's own site when you start
 it, the same update package you would install on a real FM-1. M-VAVE's own firmware can't be
 fetched that way, so download `FM-1.fwsc` from M-VAVE and open it on the page.
