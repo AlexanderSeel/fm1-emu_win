@@ -8,7 +8,7 @@ for (const f of cat.firmwares) {
   try {
     const { bytes, url } = await fetchPackage(f);
     const app = appFromPackage(bytes);
-    const moved = url === f.package ? "" : `  (moved on: ${url})`;
+    const moved = url === (f.package || f.installer) ? "" : `  (moved on: ${url})`;   // embedded: the page
     console.log(`${f.id.padEnd(13)} ${String(app.length).padStart(7)} bytes${moved}`);
   } catch (e) {
     bad++;

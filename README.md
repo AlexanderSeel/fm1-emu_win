@@ -20,9 +20,10 @@ synth, with a step sequencer and stereo chorus, delay and reverb, that also play
 
 ## What runs
 
-The 15 community firmwares listed on [fm1-editor.com/firmware](https://fm1-editor.com/firmware/)
-(Felucca and its relatives, AMB, ChoralRoot, FoMni, FuMi, GHOULBOX, Hortator, Jangada,
-Melodee, PurpleMonkey, Quest, SLOOP, X0X and more: `web/firmwares.json` has the list),
+The 20 community firmwares listed on [fm1-editor.com/firmware](https://fm1-editor.com/firmware/)
+whose packages are published (Felucca and its relatives, AMB, April OS, ChoralRoot, FiMba-1,
+FoMni, FuMi, GHOULBOX, Hortator, Jangada, Melodee, ORBIT, PurpleMonkey, Quest, Rainbow mode,
+SLOOP, WaveLoop Kit, X0X and more: `web/firmwares.json` has the list),
 FM-1 SID, and M-VAVE's stock firmware (V13 and V15) with both CPU cores running.
 
 MIDI in works through the emulated MIDI IN jack, so each firmware reads MIDI with its own

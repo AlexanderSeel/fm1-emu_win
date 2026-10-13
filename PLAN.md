@@ -398,6 +398,21 @@ byte time (320 us); at most a second's worth wait (a USB keyboard can send faste
 - The SID firmware builds on macOS with the JieLi toolchain in Docker (`linux/amd64`), the
   image byte-identical to the one built on Linux.
 
+## 5.12 Every firmware's newest version, and five more (2026-10-13)
+
+- Felucca 1.6 halted on a word store with a negative offset (`docs/isa-notes.md`); the catalog
+  was then refreshed: ChoralRoot 0.21, FuMi 1.0.7, GHOULBOX 2.1, Hortator 0.16.0, Jangada 0.9.9,
+  Melodee 1.3.3, Quest 0.21, SLOOP 2.6 and X0X 1.0.6, and five new: April OS (beta 1.1), FiMba-1
+  0.6.1, ORBIT 0.7.0, Rainbow mode 1.1.5-rb and WaveLoop Kit. SLICE64-FM is on the list too, but
+  its firmware is not published.
+- Five of the fourteen halted on table gaps (sreg moves, if-blocks with else, rev8, sp pairs,
+  register-increment accesses), and April OS waited for its sample flash: all fixed, see
+  `docs/isa-notes.md`. Each was tested with keys and MIDI, screens checked, JIT == block
+  interpreter == per-step audio, natively and in the wasm build; every firmware that ran before is
+  byte-identical. Jangada 0.9.9 now starts the second core, as Melodee does.
+- The catalog's packages can be found by a `manifest` (ORBIT's manifest.json, FiMba-1's
+  latest.json) or `embedded` in the installer page (April OS's base64 `DEFAULT_FIRMWARE`).
+
 ## 6. Phase 5 — Boot & integration
 
 - Boot stock firmware to a stable idle/main-loop state.

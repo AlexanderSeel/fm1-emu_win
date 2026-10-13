@@ -20,7 +20,7 @@ for (const f of cat.firmwares) {
     const xip = new Uint8Array(0x120 + app.length);
     xip.set(app, 0x120);
     writeFileSync(out + ".xip.bin", xip);
-    console.log(`${f.id.padEnd(13)} ${url.split("/").pop().padEnd(36)} app ${app.length} bytes`);
+    console.log(`${f.id.padEnd(13)} ${url.replace(/\/$/, "").split("/").pop().padEnd(36)} app ${app.length} bytes`);
   } catch (e) {
     console.log(`${f.id.padEnd(13)} FAILED ${e.message}`);
   }

@@ -116,10 +116,30 @@ export function appFromPackage(file) {
 
 // Fetch a catalog entry's package (web/firmwares.json): its `package` URL, or when that has
 // gone (a newer version replaced it) the .fwsc its `installer` page links now, found in the
-// page or the scripts it loads. Returns { bytes, url }. `fetchFn` is fetch (browser, Node 18+).
+// page or the scripts it loads, or named by its `manifest` (a JSON file whose `package` or
+// `file` is relative to it: ORBIT's manifest.json, FiMba-1's latest.json). An entry with
+// `embedded` names the variable its installer page keeps the package in, base64 (April OS's
+// `DEFAULT_FIRMWARE`). Returns { bytes, url }.
+// `fetchFn` is fetch (browser, Node 18+).
 export async function fetchPackage(entry, fetchFn = fetch) {
+  if (entry.embedded) {
+    const r = await fetchFn(entry.installer);
+    if (!r.ok) throw new Error(`${entry.installer}: ${r.status}`);
+    const m = (await r.text()).match(new RegExp(`${entry.embedded}\\s*=\\s*["']([A-Za-z0-9+/=]+)["']`));
+    if (!m) throw new Error(`${entry.installer} has no ${entry.embedded}`);
+    const bin = atob(m[1]);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return { bytes, url: entry.installer };
+  }
   let r = await fetchFn(entry.package);
   if (r.ok) return { bytes: new Uint8Array(await r.arrayBuffer()), url: entry.package };
+  if (entry.manifest) {
+    const m = await (await fetchFn(entry.manifest)).json();
+    const url = new URL(m.package || m.file, entry.manifest).href;
+    r = await fetchFn(url);
+    if (r.ok) return { bytes: new Uint8Array(await r.arrayBuffer()), url };
+  }
   if (!entry.installer) throw new Error(`${entry.package}: ${r.status}`);
   const find = (text) => [...text.matchAll(/[\w./-]+\.fwsc/g)].map((m) => m[0]).filter((n) => !/(^|\/)FM-1\.fwsc$/i.test(n));
   const page = await (await fetchFn(entry.installer)).text();

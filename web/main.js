@@ -181,7 +181,7 @@ function showFirmware() {
   if (loadedUrl) {
     const p = document.createElement("a");
     p.href = loadedUrl;
-    p.textContent = loadedUrl.split("/").pop();
+    p.textContent = loadedUrl.replace(/\/$/, "").split("/").pop();   // April OS: its installer page
     parts.push(" Running ", p, ".");
   }
   about.replaceChildren(...parts);
@@ -460,7 +460,7 @@ let ac = null, last = null, bootSeq = 0, booting = 0;
 async function boot() {
   const seq = ++bootSeq;
   const f = fw;
-  if (f.id !== "local" && !f.byo) status.textContent = `downloading ${f.name} from ${new URL(f.package).host}…`;
+  if (f.id !== "local" && !f.byo) status.textContent = `downloading ${f.name} from ${new URL(f.package || f.installer).host}…`;
   let got;
   try {
     got = await packageOf(f);
