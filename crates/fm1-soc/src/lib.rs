@@ -103,8 +103,9 @@ pub struct Soc {
     sfr: std::collections::HashMap<u32, u32>,
     /// Core 0 / 1 paused by the other (C0_CON / C1_CON bit 2 pulses, bit 3 resumes).
     paused: [bool; 2],
-    /// The XIP window continues into the flash chip past the image (the stock layout; other
-    /// firmwares' images read 0 past their end, as they always have here).
+    /// The XIP window continues into the flash chip past the image (the stock layout, which
+    /// the updater gives every firmware: April OS keeps its samples at flash 0x74000, read
+    /// through XIP 0x02070000, and waits at boot until it finds them or a blank chip's 0xff).
     pub xip_flash: bool,
     /// cpu0 set 0x10008 bit 3 (core 1's release); latched until the runner starts cpu1, as
     /// firmwares hold the bit only while they wait for core 1 to report in.
@@ -132,6 +133,23 @@ fn dbg_line(addr: u32) -> &'static str {
 }
 
 impl Soc {
+    /// After an erase or page program: the XIP window shows the flash chip, also where the
+    /// window's contents come from the package (`xip`, the app area as installed). A booted
+    /// package's window reaches flash 0x93000, and April OS writes its samples from 0x74000
+    /// and reads them back through XIP.
+    fn sync_xip(&mut self) {
+        let Some((a, b)) = self.flash.changed.take() else { return };
+        if !self.xip_flash {
+            return;
+        }
+        for o in a.max(XIP_FLASH_OFFSET)..b {
+            match self.xip.get_mut(o - XIP_FLASH_OFFSET) {
+                Some(x) => *x = self.flash.mem[o],
+                None => break,
+            }
+        }
+    }
+
     /// `ram_size` in bytes; `xip` = the app binary mapped at XIP_BASE.
     pub fn new(ram_size: usize, xip: Vec<u8>) -> Self {
         Self {
@@ -151,7 +169,7 @@ impl Soc {
             rand: 0x9e37_79b9_7f4a_7c15,
             cpu1_release: false,
             audio_trace: std::env::var_os("FM1_AUDIO_TRACE").is_some(),
-            xip_flash: false,
+            xip_flash: true,
             gpio_writes: std::env::var("FM1_GPIO_TRACE").ok().map(|_| Default::default()),
             unknown_log: Vec::new(),
         }
@@ -613,6 +631,7 @@ impl Soc {
                 // key-matrix shift registers
                 if addr == 0x500c0 {
                     self.flash.set_cs(value & 1 == 0);
+                    self.sync_xip();
                 }
                 self.periph.write(addr, value);
                 self.sfr_set(addr, value)
@@ -622,7 +641,10 @@ impl Soc {
                     self.sfr_set(addr, value);
                 }
             }
-            Region::Spi0 => self.flash.write(addr, value),
+            Region::Spi0 => {
+                self.flash.write(addr, value);
+                self.sync_xip();
+            }
             Region::Iomap => self.sfr_set(addr, value),
             Region::Ana => self.sfr_set(addr, value),
             Region::Bt => {}
@@ -734,4 +756,27 @@ pub fn write_boot_info(soc: &mut Soc, at: u32, flash: &[u8]) -> u32 {
         soc.write8(at + 24 + i as u32, *b);
     }
     at
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flash_writes_show_through_xip() {
+        // a booted package's window (0x80000 bytes, flash 0x4000..0x84000): erasing the sector
+        // at flash 0x74000 and programming two bytes there reads back through XIP 0x02070000,
+        // as April OS's samples do
+        let mut soc = Soc::new(1 << 16, vec![0xaa; 0x80000]);
+        for cmd in [&[0x06][..], &[0x20, 0x07, 0x40, 0x00], &[0x06], &[0x02, 0x07, 0x40, 0x00, 0x12, 0x34]] {
+            soc.write32(0x500c0, 0); // PD0 low: chip select
+            for &b in cmd {
+                soc.write32(spiflash::SPI0_BASE + 8, b as u32);
+            }
+            soc.write32(0x500c0, 1);
+        }
+        assert_eq!(soc.read32(0x0207_0000), 0xffff_3412);
+        assert_eq!(soc.read32(0x0207_0ffc), 0xffff_ffff, "the rest of the sector erased");
+        assert_eq!(soc.read32(0x0207_1000), 0xaaaa_aaaa, "the next sector as installed");
+    }
 }

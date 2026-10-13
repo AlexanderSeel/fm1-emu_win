@@ -32,6 +32,9 @@ pub struct SpiFlash {
     trace: bool,
     /// JEDEC / unique-id reads
     pub jedec: [u8; 3],
+    /// The flash range the last erase or page program changed (`Soc` mirrors it into the XIP
+    /// window), taken by the reader.
+    pub changed: Option<(usize, usize)>,
 }
 
 impl SpiFlash {
@@ -48,6 +51,7 @@ impl SpiFlash {
             pending_prog: Vec::new(),
             jedec: [0x85, 0x60, 0x14],
             trace: std::env::var_os("FM1_FLASH_TRACE").is_some(),
+            changed: None,
         }
     }
 
@@ -72,6 +76,8 @@ impl SpiFlash {
                 let a = (self.addr as usize + i) & (FLASH_SIZE - 1);
                 self.mem[a] &= *b;
             }
+            let a = self.addr as usize & (FLASH_SIZE - 1);
+            self.changed = Some((a, (a + self.pending_prog.len()).min(FLASH_SIZE)));
             self.pending_prog.clear();
             self.wel = false;
         }
@@ -139,6 +145,7 @@ impl SpiFlash {
         for b in &mut self.mem[base..(base + size).min(FLASH_SIZE)] {
             *b = 0xff;
         }
+        self.changed = Some((base, (base + size).min(FLASH_SIZE)));
         self.wel = false;
     }
 

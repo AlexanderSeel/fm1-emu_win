@@ -404,6 +404,36 @@ write-back), off = 4*sext9(bits(18,19) | bits(24,27)<<2 | bit0<<6 | bit1<<7 | bi
 pair accesses' field. `d4..d7 ec` (byte0 bit 2: negative offsets) and table misses in `d1..d7 ec`
 now go to route 18, which decodes it.
 
+### New firmware versions: five table gaps (2026-10-13)
+
+Nine catalog firmwares moved on and five were new on fm1-editor.com; five of the fourteen halted
+on classes the corpora had fitted to the few register / size combinations they used. Each family
+now has a raw decoder, checked on every corpus sample (the 25 listings and the 15 new ones), all
+in `decode_any`, which `fetch_at`, `block_end`, `describe` and the flags lookahead share:
+
+- `64 e0 00 XY` rX = sreg Y, `64 e0 80 XY` Y = rX (0 reti, 1 rete, 3 rets, 5 psr, 6 cnum,
+  b icfg, c usp, d ssp, e sp; 40 pairs): ChoralRoot 0.21's `r2 = reti`.
+- Predicated blocks the table had only without an else part (`decode_if_block` knew the layout;
+  90440 block heads print as `if (...) {`; in family ea byte0 9x..bx are calls): Quest 0.21's
+  `1d ea 80 a6` `if ((r13 & r6) != 0) {` with 3 + 2 units.
+- `70 e0/f0 00 DS` rD = rev8(rS) (690 samples): Quest 0.21's `r8 = rev8(r0)`.
+- `d0 e9` register pairs at sp+off, `decode_pair_mem` (9701 samples): WaveLoop Kit's
+  `d[sp+1044] = r13_r12`.
+- `dc` `[++rB=rI]` / `de` `[rB++=rI]` with ec/ed/ee (3462 samples, route 32): base = bits(20,23),
+  index = bits(24,27), data = bits(28,31); bit16 store, bit17 signed load (ec: the register
+  form), a half store's bit17 the high half (`h[r9++=r0] = r0.h`). SLOOP 2.6 and ORBIT 0.7's
+  `b[r2++=r0] = r1`. All of the family goes to route 32: the table's class for that `.h` store
+  stepped the base by an immediate.
+
+`block_end` had decoded with the table alone, so a block holding a fallback-only instruction
+ended early; it counts through `decode_any` now. Every firmware that ran before is byte-identical
+(bare app and whole package), and the decoder audit's mismatch counts did not change.
+
+April OS was not a decoder gap: it keeps its samples at flash 0x74000 and waits at boot until it
+finds them. Past the image the XIP window now shows the flash chip for every firmware (erased:
+0xff), and a booted package's window, which covers flash 0x4000..0x93000 from the installed
+image, takes the chip's contents wherever the firmware erases or programs (`Soc::sync_xip`).
+
 ### Remaining exec gaps (known, traced)
 
 - goto/if branch-offset fields: printed = word offset (delta = 2*printed)

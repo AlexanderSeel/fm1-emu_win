@@ -282,40 +282,7 @@ impl Cpu {
             return Ok(slot);
         }
         self.decodes += 1;
-        // the add / subtract-with-carry family before the table: its corpus classes fit only
-        // the registers the corpora used (see carry_op_raw)
-        let decoded = match carry_op_raw(win) {
-            Some(entry) => Ok(fm1_isa::Instruction { addr: pc, raw: win & 0xffff_ffff, entry }),
-            None => fm1_isa::decode_win_cached(win, pc),
-        };
-        let insn = match decoded {
-            Ok(i) => i,
-            // 64-bit pair ops the corpora never showed (e.g. `r3_r2 >>>= 39`)
-            // share one raw layout; decode them without a table class
-            Err(_) if matches!((win >> 8) & 0xff, 0xe1 | 0xf1) && matches!(win & 0xff, 0xd0 | 0xd8 | 0xf8 | 0xfc | 0xf6) => {
-                fm1_isa::Instruction { addr: pc, raw: win, entry: &PAIR_OP_RAW }
-            }
-            // `d9 e8` / `d1 e8 <mask>`: push / pop of rets and a register mask; the table's
-            // classes match only the masks the corpora used (libm's sin pops {rets, r11-r8, r6-r4})
-            Err(_) if win & 0xffff == 0xe8d9 => fm1_isa::Instruction { addr: pc, raw: win & 0xffff_ffff, entry: &RETS_PUSH_MASK_CRAW },
-            Err(_) if win & 0xffff == 0xe8d1 => fm1_isa::Instruction { addr: pc, raw: win & 0xffff_ffff, entry: &RETS_POP_MASK_CRAW },
-            // 4-byte ALU forms decode_alu4 knows the layout of (`6c e8` `[R+#i] <<= #n`, `64 e8`
-            // `[R+#i] &= R`, ...): the table's classes fit only the offsets the corpora used
-            // (m6502's `[r0+24] <<= 1`, `[r1+-4] &= r0`)
-            Err(_) if decode_alu4(win & 0xffff_ffff).is_some() => {
-                fm1_isa::Instruction { addr: pc, raw: win & 0xffff_ffff, entry: &ALU4_CRAW }
-            }
-            // `d1..d7 ec`: word loads / stores at an offset or pre-incremented (route 18)
-            Err(_) if matches!(win & 0xff, 0xd1..=0xd7) && (win >> 8) & 0xff == 0xec => {
-                fm1_isa::Instruction { addr: pc, raw: win & 0xffff_ffff, entry: &WORD_MEM_CRAW }
-            }
-            // `d1..d7 ed/ee`: post-increment loads / stores `[R++=#i]` (route 19 decodes the
-            // fields; the classes fit only the corpus increments: `h[r4++=480] = r0`)
-            Err(_) if matches!(win & 0xff, 0xd1..=0xd7) && matches!((win >> 8) & 0xff, 0xec | 0xed | 0xee) => {
-                fm1_isa::Instruction { addr: pc, raw: win & 0xffff_ffff, entry: &POST_INC_CRAW }
-            }
-            Err(e) => return Err(CoreError::Decode(e)),
-        };
+        let insn = decode_any(win, pc).map_err(CoreError::Decode)?;
         let alu4 = if insn.entry.len == 4 { decode_alu4(insn.raw) } else { None };
         let bittest = if insn.entry.name.starts_with("if") { decode_bittest(insn.raw, insn.entry.len) } else { None };
         let route = route_of(&insn, &alu4, &bittest);
@@ -1856,14 +1823,14 @@ impl Cpu {
         for _ in 0..units {
             let lo = bus.read32(pc) as u64;
             let hi = bus.read32(pc + 4) as u64;
-            let Ok(insn) = fm1_isa::decode_win_cached((hi << 32) | lo, pc) else { return pc };
+            let Ok(insn) = decode_any((hi << 32) | lo, pc) else { return pc };
             pc += insn.entry.len as u32;
             if insn.entry.syntax.trim_end().ends_with('#') {
                 // a dual-issue pair (`x #` + the next instruction) is one unit
                 // (memset at 0x02042f0e: `{ r2 -= 1 #; b[r3++=1] = r1; goto }` = 2 units)
                 let lo = bus.read32(pc) as u64;
                 let hi = bus.read32(pc + 4) as u64;
-                if let Ok(second) = fm1_isa::decode_win_cached((hi << 32) | lo, pc) {
+                if let Ok(second) = decode_any((hi << 32) | lo, pc) {
                     pc += second.entry.len as u32;
                 }
                 continue;
@@ -2179,7 +2146,7 @@ impl Cpu {
                 };
             }
             27 if insn.entry.len == 4 => self.exec_raw(bus, RAW_POP_RETS_MASK, insn.raw as u32),
-            16 | 18 | 19 | 21 | 22 | 27 => self.exec_raw(bus, pre.route as u8, insn.raw as u32),
+            16 | 18 | 19 | 21 | 22 | 27 | 32 => self.exec_raw(bus, pre.route as u8, insn.raw as u32),
             17 =>
             {
                 // 4-byte offset loads/stores `R = [rB+#i]` / `[rB+#i] = R` with
@@ -2388,8 +2355,8 @@ impl Cpu {
         Ok(())
     }
 
-    /// The instructions decoded from the raw word alone (execute's routes 16, 18, 19, 21, 22
-    /// and 27, whose 4-byte form is RAW_POP_RETS_MASK): shared by `execute` and the `Fast::Raw` micro-op, so the two cannot drift.
+    /// The instructions decoded from the raw word alone (execute's routes 16, 18, 19, 21, 22,
+    /// 32 and 27, whose 4-byte form is RAW_POP_RETS_MASK): shared by `execute` and the `Fast::Raw` micro-op, so the two cannot drift.
     fn exec_raw<B: Bus>(&mut self, bus: &mut B, route: u8, raw: u32) {
         let raw = raw as u64;
         match route {
@@ -2493,6 +2460,22 @@ impl Cpu {
                     };
                 }
                 self.regs[b] = addr.wrapping_add(inc as u32);
+            }
+            32 =>
+            {
+                // `[++rB=rI]` / `[rB++=rI]` (see `idx_inc`); a load into the base register
+                // leaves the incremented base, as route 19
+                let Some(m) = idx_inc(raw) else { return };
+                let base = self.regs[m.b];
+                let next = base.wrapping_add(self.regs[m.i]);
+                let addr = if m.pre { next } else { base };
+                if m.store {
+                    let v = if m.high { self.regs[m.d] >> 16 } else { self.regs[m.d] };
+                    st_w(bus, m.w, addr, v);
+                } else {
+                    self.regs[m.d] = ld_w(bus, m.w, m.signed, addr);
+                }
+                self.regs[m.b] = next;
             }
             21 =>
             {
@@ -2630,6 +2613,136 @@ static PAIR_OP_RAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
     alt: &[],
     samples: &[],
     slots: &[],
+};
+
+/// Decode the instruction at `pc` from its 8-byte window: the table, and before it or after it
+/// the raw decoders of the families whose table classes fit only the corpus samples. `fetch_at`
+/// and `block_end` both decode through here, so a block's size counts the same instructions
+/// the core executes.
+fn decode_any(win: u64, pc: u32) -> Result<fm1_isa::Instruction, fm1_isa::DecodeError> {
+    // the add / subtract-with-carry family before the table: its corpus classes fit only
+    // the registers the corpora used (see carry_op_raw)
+    let decoded = match carry_op_raw(win) {
+        Some(entry) => Ok(fm1_isa::Instruction { addr: pc, raw: win & 0xffff_ffff, entry }),
+        None => fm1_isa::decode_win_cached(win, pc),
+    };
+    let raw = |entry| Ok(fm1_isa::Instruction { addr: pc, raw: win & 0xffff_ffff, entry });
+    match decoded {
+        Ok(i) => Ok(i),
+        // 64-bit pair ops the corpora never showed (e.g. `r3_r2 >>>= 39`)
+        // share one raw layout; decode them without a table class
+        Err(_) if matches!((win >> 8) & 0xff, 0xe1 | 0xf1) && matches!(win & 0xff, 0xd0 | 0xd8 | 0xf8 | 0xfc | 0xf6) => {
+            Ok(fm1_isa::Instruction { addr: pc, raw: win, entry: &PAIR_OP_RAW })
+        }
+        // `d9 e8` / `d1 e8 <mask>`: push / pop of rets and a register mask; the table's
+        // classes match only the masks the corpora used (libm's sin pops {rets, r11-r8, r6-r4})
+        Err(_) if win & 0xffff == 0xe8d9 => raw(&RETS_PUSH_MASK_CRAW),
+        Err(_) if win & 0xffff == 0xe8d1 => raw(&RETS_POP_MASK_CRAW),
+        // 4-byte ALU forms decode_alu4 knows the layout of (`6c e8` `[R+#i] <<= #n`, `64 e8`
+        // `[R+#i] &= R`, ...): the table's classes fit only the offsets the corpora used
+        // (m6502's `[r0+24] <<= 1`, `[r1+-4] &= r0`)
+        Err(_) if decode_alu4(win & 0xffff_ffff).is_some() => raw(&ALU4_CRAW),
+        // `d1..d7 ec`: word loads / stores at an offset or pre-incremented (route 18)
+        Err(_) if matches!(win & 0xff, 0xd1..=0xd7) && (win >> 8) & 0xff == 0xec => raw(&WORD_MEM_CRAW),
+        // `d1..d7 ed/ee`: post-increment loads / stores `[R++=#i]` (route 19 decodes the
+        // fields; the classes fit only the corpus increments: `h[r4++=480] = r0`)
+        Err(_) if matches!(win & 0xff, 0xd1..=0xd7) && matches!((win >> 8) & 0xff, 0xec | 0xed | 0xee) => {
+            raw(&POST_INC_CRAW)
+        }
+        // `64 e0 00 XY` / `64 e0 80 XY`: rX = special register Y / Y = rX; the classes fit
+        // only the pairs the corpora used (ChoralRoot 0.21's `r2 = reti`)
+        Err(_) if sreg_move_raw(win).is_some() => raw(sreg_move_raw(win).unwrap()),
+        // predicated blocks `if (rA op x) {` (route 14 decodes the fields): the classes fit
+        // only the block sizes the corpora used (Quest 0.21's `if ((r13 & r6) != 0) {` with an
+        // else part). In family ea, byte0 9x..bx are calls.
+        Err(_) if decode_if_block(win & 0xffff_ffff).is_some() && ((win >> 8) & 0xff != 0xea || win & 0x80 == 0) => {
+            raw(&IF_BLOCK_CRAW)
+        }
+        // `d0 e9`: register-pair loads / stores at sp+off (route 16, `decode_pair_mem`; all 9701
+        // corpus samples fit): the classes fit only the corpus offsets (`d[sp+1044] = r13_r12`)
+        Err(_) if win & 0xffff == 0xe9d0 => raw(&PAIR_SP_CRAW),
+        // `70 e0 00 DS` / `70 f0 00 DS`: rD = rev8(rS) (route 22; 690 corpus samples)
+        Err(_) if win & 0xff_ffff == 0x00_e070 => raw(&REV8_CRAW),
+        Err(_) if win & 0xff_ffff == 0x00_f070 => raw(&REV8_PAIR_CRAW),
+        // `dc` / `de` with ec/ed/ee: loads / stores that pre- or post-increment the base by a
+        // register (route 32, `idx_inc`): the classes fit only the corpus registers
+        // (SLOOP 2.6's `b[r2++=r0] = r1`)
+        Err(_) if idx_inc(win & 0xffff_ffff).is_some() => raw(&IDX_INC_CRAW),
+        Err(e) => Err(e),
+    }
+}
+
+/// `dc` `[++rB=rI]` / `de` `[rB++=rI]` loads and stores (byte1 ec word, ed half, ee byte):
+/// data = bits(28,31), base = bits(20,23), index = bits(24,27); bits(16,19): bit16 store,
+/// bit17 signed load (ec: bit17 set = this register form, clear = an immediate increment),
+/// bit17 of a half store = the high half (`h[r9++=r0] = r0.h`); bit19 (a shifted index, the
+/// d8 form's) never appears. All 3462 corpus samples fit.
+#[derive(Clone, Copy, Debug)]
+struct IdxInc { pre: bool, w: u8, store: bool, signed: bool, high: bool, d: usize, b: usize, i: usize }
+fn idx_inc(raw: u64) -> Option<IdxInc> {
+    let pre = match raw & 0xff { 0xdc => true, 0xde => false, _ => return None };
+    let w = match (raw >> 8) & 0xff { 0xec => 4u8, 0xed => 2, 0xee => 1, _ => return None };
+    let sub = (raw >> 16) & 0xf;
+    let (store, bit17) = (sub & 1 != 0, sub & 2 != 0);
+    if sub & 8 != 0 || (w == 4 && !bit17) || (w == 1 && store && bit17) {
+        return None;
+    }
+    Some(IdxInc {
+        pre,
+        w,
+        store,
+        signed: !store && w != 4 && bit17,
+        high: store && w == 2 && bit17,
+        d: ((raw >> 28) & 0xf) as usize,
+        b: ((raw >> 20) & 0xf) as usize,
+        i: ((raw >> 24) & 0xf) as usize,
+    })
+}
+static PAIR_SP_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "pair_sp_craw", syntax: "d[sp+#i] = R_R (raw)", len: 4, count: 0, mask: 0, match_: 0,
+    group: "load", alt: &[], samples: &[], slots: &[],
+};
+static REV8_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "rev8_craw", syntax: "R = rev8(R)", len: 4, count: 0, mask: 0, match_: 0,
+    group: "alu", alt: &[], samples: &[], slots: &[],
+};
+static REV8_PAIR_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "rev8_craw", syntax: "R = rev8(R)  #", len: 4, count: 0, mask: 0, match_: 0,
+    group: "alu", alt: &[], samples: &[], slots: &[],
+};
+static IDX_INC_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "idx_inc_craw", syntax: "[R++=R] = R (raw)", len: 4, count: 0, mask: 0, match_: 0,
+    group: "load", alt: &[], samples: &[], slots: &[],
+};
+
+/// `64 e0 00 XY` rX = Y and `64 e0 80 XY` Y = rX, Y a special register: 0 reti, 1 rete,
+/// 3 rets, 5 psr, 6 cnum, b icfg, c usp, d ssp, e sp (the corpora's 40 register / sreg pairs
+/// all fit; Y = 2, 4, 7..a and f never appear, and cnum is never written).
+fn sreg_move_raw(win: u64) -> Option<&'static fm1_isa::IsaEntry> {
+    if win & 0xffff != 0xe064 {
+        return None;
+    }
+    let write = match (win >> 16) & 0xff { 0x00 => false, 0x80 => true, _ => return None };
+    let i = match (win >> 24) & 0xf { 0 => 0, 1 => 1, 3 => 2, 5 => 3, 6 if !write => 4, 0xb => 5, 0xc => 6, 0xd => 7, 0xe => 8, _ => return None };
+    Some(if write { &SREG_WRITE_CRAW[i] } else { &SREG_READ_CRAW[i] })
+}
+const SREG_SLOTS: &[fm1_isa::SlotSpec] =
+    &[fm1_isa::SlotSpec { kind: fm1_isa::SlotKind::Imm, pieces: &[(28, 31)], mult: 0, adj: 0, hi: 0, lo: 0 }];
+macro_rules! sreg_entries {
+    ($($syntax:expr),*) => {
+        [$(fm1_isa::IsaEntry {
+            name: "sreg_mov_craw", syntax: $syntax, len: 4, count: 0, mask: 0, match_: 0, group: "misc",
+            alt: &[], samples: &[], slots: SREG_SLOTS,
+        }),*]
+    };
+}
+static SREG_READ_CRAW: [fm1_isa::IsaEntry; 9] = sreg_entries!(
+    "R = reti", "R = rete", "R = rets", "R = psr", "R = cnum", "R = icfg", "R = usp", "R = ssp", "R = sp");
+static SREG_WRITE_CRAW: [fm1_isa::IsaEntry; 9] = sreg_entries!(
+    "reti = R", "rete = R", "rets = R", "psr = R", "cnum = R", "icfg = R", "usp = R", "ssp = R", "sp = R");
+static IF_BLOCK_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "if_block_craw", syntax: "if (R op x) { (raw)", len: 4, count: 0, mask: 0, match_: 0,
+    group: "misc", alt: &[], samples: &[], slots: &[],
 };
 
 /// `b8 e0` / `b8 f0` (the dual-issue `#` form) with bits(16,19) = 0: `rD = rA + rB + c`,
@@ -3356,6 +3469,79 @@ mod tests {
     }
 
     #[test]
+    fn sreg_moves_any_register() {
+        // `64 e0 80 40` reti = r4, `64 e0 00 20` r2 = reti (ChoralRoot 0.21), `64 e0 80 13`
+        // rets = r1: the corpora had reti read into r0 and rets written from r0 only
+        let mut mem = vec![0u8; 0x100];
+        mem[..12].copy_from_slice(&[0x64, 0xe0, 0x80, 0x40, 0x64, 0xe0, 0x00, 0x20, 0x64, 0xe0, 0x80, 0x13]);
+        let mut ram = FlatRam::new(mem);
+        let mut cpu = Cpu::new(0);
+        cpu.regs[4] = 0x0201_2345;
+        cpu.regs[1] = 0x0200_0abc;
+        for _ in 0..3 {
+            cpu.step(&mut ram).unwrap();
+        }
+        assert_eq!(cpu.regs[2], 0x0201_2345, "r2 = reti");
+        assert_eq!(cpu.rets, 0x0200_0abc, "rets = r1");
+    }
+
+    #[test]
+    fn if_block_with_else() {
+        // `1d ea 80 a6` if ((r13 & r6) != 0) { 3 units } else { 2 units } (Quest 0.21), then
+        // `c0 21`..`c4 21` r0..r4 += 1 as the bodies and `c5 21` r5 += 1 after them
+        let mut mem = vec![0u8; 0x100];
+        mem[..4].copy_from_slice(&[0x1d, 0xea, 0x80, 0xa6]);
+        for r in 0..6u8 {
+            mem[4 + 2 * r as usize..6 + 2 * r as usize].copy_from_slice(&[0xc0 | r, 0x21]);
+        }
+        for (r13, want) in [(0x10u32, [1, 1, 1, 0, 0, 1]), (0x01, [0, 0, 0, 1, 1, 1])] {
+            let mut ram = FlatRam::new(mem.clone());
+            let mut cpu = Cpu::new(0);
+            cpu.regs[13] = r13;
+            cpu.regs[6] = 0x30;
+            while cpu.pc != 16 {
+                cpu.step(&mut ram).unwrap();
+            }
+            assert_eq!(cpu.regs[..6], want, "r13 = {r13:#x}");
+        }
+    }
+
+    #[test]
+    fn register_increment_accesses() {
+        // `de ee 21 10` b[r2++=r0] = r1 (SLOOP 2.6, ORBIT 0.7), `dc ec 02 11` r1 = [++r0=r1],
+        // `de ed 93 00` h[r9++=r0] = r0.h
+        let mut mem = vec![0u8; 0x100];
+        mem[..12].copy_from_slice(&[0xde, 0xee, 0x21, 0x10, 0xdc, 0xec, 0x02, 0x11, 0xde, 0xed, 0x93, 0x00]);
+        mem[0x68..0x6c].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        let mut ram = FlatRam::new(mem);
+        let mut cpu = Cpu::new(0);
+        (cpu.regs[0], cpu.regs[1], cpu.regs[2]) = (3, 0xab, 0x40);
+        cpu.step(&mut ram).unwrap();
+        assert_eq!((ram.read8(0x40), cpu.regs[2]), (0xab, 0x43), "post-increment byte store");
+        (cpu.regs[0], cpu.regs[1]) = (0x50, 0x18);
+        cpu.step(&mut ram).unwrap();
+        assert_eq!((cpu.regs[1], cpu.regs[0]), (0x1234_5678, 0x68), "pre-increment word load");
+        (cpu.regs[0], cpu.regs[9]) = (0x0002_0000, 0x70);
+        cpu.step(&mut ram).unwrap();
+        assert_eq!((ram.read16(0x70), cpu.regs[9]), (2, 0x2_0070), "high half store");
+    }
+
+    #[test]
+    fn sp_pair_store_and_rev8() {
+        // `d0 e9 15 c4` d[sp+1044] = r13_r12 (WaveLoop Kit), `70 e0 00 80` r8 = rev8(r0) (Quest 0.21)
+        let mut mem = vec![0u8; 0x600];
+        mem[..8].copy_from_slice(&[0xd0, 0xe9, 0x15, 0xc4, 0x70, 0xe0, 0x00, 0x80]);
+        let mut ram = FlatRam::new(mem);
+        let mut cpu = Cpu::new(0);
+        cpu.sp = 0x100;
+        (cpu.regs[12], cpu.regs[13], cpu.regs[0]) = (0x1111_1111, 0x2222_2222, 0x1122_3344);
+        cpu.step(&mut ram).unwrap();
+        assert_eq!((ram.read32(0x514), ram.read32(0x518)), (0x1111_1111, 0x2222_2222));
+        cpu.step(&mut ram).unwrap();
+        assert_eq!(cpu.regs[8], 0x4433_2211);
+    }
+
+    #[test]
     fn pair_multiply_accumulate() {
         // `fc e1 30 07` r1_r0 += r3 * r7 (u) (compiler-rt's wide multiply)
         let mut mem = vec![0u8; 0x100];
@@ -3649,10 +3835,7 @@ fn is_flag_producer(s: &str) -> bool {
 /// before one stays off the JIT (which does not model the flags) on the careful path.
 fn next_reads_flags<B: Bus>(bus: &mut B, pc: u32) -> bool {
     let win = (bus.read32(pc + 4) as u64) << 32 | bus.read32(pc) as u64;
-    if carry_op_raw(win).is_some() {
-        return true;
-    }
-    match fm1_isa::decode_win_cached(win, pc) {
+    match decode_any(win, pc) {
         Ok(i) => {
             let s = i.entry.syntax;
             s.contains("+ c") || s.contains("- !c") || s.contains("= psr") || s.contains("psr,") || s.contains("{psr")
@@ -3825,6 +4008,9 @@ pub struct LineX {
 fn route_of(insn: &Instruction, alu4: &Option<Alu4>, bittest: &Option<BitTest>) -> u16 {
     let name = insn.entry.name;
     match name {
+            // `[++R=R]` / `[R++=R]`, the table's classes too (one executed `h[r9++=r0] = r0.h`
+            // as an immediate increment); before route 19, whose `++=` test would take it so
+            _ if insn.entry.len == 4 && idx_inc(insn.raw).is_some() => 32,
             _ if bittest.is_some() => 0,
             _ if alu4.is_some() => 1,
             "nop" | "csync" | "sti_r" | "cli_r" => 2,
@@ -4130,7 +4316,7 @@ fn fast_raw(route: u16, insn: &Instruction, alu4: &Option<Alu4>, bittest: &Optio
         2 => Some(Fast::Nop),
         // (the arms read bits below 32 only; route 21's table-less form carries the whole window)
         27 if insn.entry.len == 4 => Some(Fast::Raw { route: RAW_POP_RETS_MASK, raw: raw as u32 }),
-        16 | 18 | 19 | 21 | 22 | 27 => Some(Fast::Raw { route: route as u8, raw: raw as u32 }),
+        16 | 18 | 19 | 21 | 22 | 27 | 32 => Some(Fast::Raw { route: route as u8, raw: raw as u32 }),
         26 if insn.entry.len == 4 => Some(Fast::PushMask { mask: ((raw >> 16) & 0xffff) as u16 }),
         28 if insn.entry.len == 4 => Some(Fast::PopMask { mask: ((raw >> 16) & 0xffff) as u16 }),
         26 => Some(Fast::PushRets { n: (raw & 0xf) as u8 }),
@@ -4549,7 +4735,7 @@ mod size_report {
 /// The same decode path as `Cpu::fetch_at` (without the predicated-block form, which needs the
 /// following instructions).
 pub fn describe(win: u64, pc: u32) -> Option<String> {
-    let insn = fm1_isa::decode_win_cached(win, pc).ok()?;
+    let insn = decode_any(win, pc).ok()?;
     let alu4 = if insn.entry.len == 4 { decode_alu4(insn.raw) } else { None };
     let bittest = if insn.entry.name.starts_with("if") { decode_bittest(insn.raw, insn.entry.len) } else { None };
     let route = route_of(&insn, &alu4, &bittest);
