@@ -56,6 +56,9 @@ themselves (`isa/`, `docs/isa-notes.md`) and checked against test programs built
 toolchain. On top of the CPU sit models of the chip's timers, interrupts, flash, the
 240×240 screen, the key matrix and encoders, the knobs, the audio output and the MIDI UART.
 Hot code is compiled, to AArch64 natively and to WebAssembly in the browser.
+How it was built and checked, step by step, is told in a technical report:
+[Emulating a Synthesizer Before It Arrives](https://joakimeriksson.github.io/fm1-emu/fm1-emu-report.pdf)
+(PDF, 8 pages).
 
 - `crates/`: `fm1-isa` (decoder tables), `fm1-core` (CPU and JITs), `fm1-soc` (the chip and
   the board), `fm1-live` (the native synth), `fm1-emu` (batch runner), `fm1-web` (the wasm

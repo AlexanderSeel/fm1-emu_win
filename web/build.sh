@@ -27,5 +27,5 @@ fi
 rm -rf "$OUT"
 mkdir -p "$OUT"
 cp target/wasm/wasm32-unknown-unknown/release/fm1_web.wasm "$OUT/"
-cp web/index.html web/main.js web/worklet.js web/jit.js web/fwsc.js web/firmwares.json "$OUT/"
+cp web/index.html web/main.js web/worklet.js web/jit.js web/fwsc.js web/firmwares.json web/fm1-emu-report.pdf "$OUT/"
 ls -la "$OUT" | grep -v "^total"
