@@ -305,7 +305,11 @@ impl Cpu {
             Err(_) if decode_alu4(win & 0xffff_ffff).is_some() => {
                 fm1_isa::Instruction { addr: pc, raw: win & 0xffff_ffff, entry: &ALU4_CRAW }
             }
-            // `d1..d7 ec/ed/ee`: post-increment loads / stores `[R++=#i]` (route 19 decodes the
+            // `d1..d7 ec`: word loads / stores at an offset or pre-incremented (route 18)
+            Err(_) if matches!(win & 0xff, 0xd1..=0xd7) && (win >> 8) & 0xff == 0xec => {
+                fm1_isa::Instruction { addr: pc, raw: win & 0xffff_ffff, entry: &WORD_MEM_CRAW }
+            }
+            // `d1..d7 ed/ee`: post-increment loads / stores `[R++=#i]` (route 19 decodes the
             // fields; the classes fit only the corpus increments: `h[r4++=480] = r0`)
             Err(_) if matches!(win & 0xff, 0xd1..=0xd7) && matches!((win >> 8) & 0xff, 0xec | 0xed | 0xee) => {
                 fm1_isa::Instruction { addr: pc, raw: win & 0xffff_ffff, entry: &POST_INC_CRAW }
@@ -2416,15 +2420,20 @@ impl Cpu {
                 // `[++rB=#i] = R` (446 corpus samples, 0 mismatches):
                 //   half/byte `58..5f ed/ee`: the post-increment field model
                 //   below, the base advanced before the access;
-                //   word `d0 ec` (bit17 set): store = bit16,
-                //   inc = 4*(bits(18,19) | bits(24,27)<<2 | bit0<<6 | bit1<<7)
+                //   word `d0..d7 ec`: store = bit16, bit17 = pre-increment (clear: a plain
+                //   offset, `[rB+-#i]`, no write-back), off = 4*sext9(bits(18,19) |
+                //   bits(24,27)<<2 | bit0<<6 | bit1<<7 | bit2<<8): the pair accesses' field
+                //   (27884 corpus samples, 0 mismatches; Felucca 1.6's `[r5+-128] = r3`)
                                 let w = match (raw >> 8) & 0xff { 0xec => 4u8, 0xed => 2, _ => 1 };
                 let d = ((raw >> 28) & 0xf) as usize;
                 let b = ((raw >> 20) & 0xf) as usize;
                 let f = (((raw >> 16) & 0xf) | (((raw >> 24) & 0xf) << 4)) as u32;
+                let word_off = w == 4 && (raw >> 17) & 1 == 0;
                 let (store, inc, signed) = if w == 4 {
-                    let o = ((raw >> 18) & 3) | (((raw >> 24) & 0xf) << 2) | ((raw & 1) << 6) | (((raw >> 1) & 1) << 7);
-                    ((raw >> 16) & 1 != 0, 4 * o as i32, false)
+                    let o = ((raw >> 18) & 3) | (((raw >> 24) & 0xf) << 2) | ((raw & 1) << 6) | (((raw >> 1) & 1) << 7)
+                        | (((raw >> 2) & 1) << 8);
+                    let o = if o & 0x100 != 0 { o as i32 - 0x200 } else { o as i32 };
+                    ((raw >> 16) & 1 != 0, 4 * o, false)
                 } else if w == 1 {
                     let inc = if raw & 1 != 0 { f as i32 - 256 } else { f as i32 }; // bit0 = bit 8 of a 9-bit two's complement (b[r4+-163] = 93-256)
                     ((raw >> 1) & 1 != 0, inc, (raw >> 2) & 1 != 0)
@@ -2434,7 +2443,9 @@ impl Cpu {
                     ((raw >> 16) & 1 != 0, inc, (raw >> 2) & 1 != 0)
                 };
                 let addr = self.regs[b].wrapping_add(inc as u32);
-                self.regs[b] = addr;
+                if !word_off {
+                    self.regs[b] = addr;
+                }
                 if store {
                     match w { 1 => bus.write8(addr, self.regs[d] as u8), 2 => bus.write16(addr, self.regs[d] as u16), _ => bus.write32(addr, self.regs[d]) }
                 } else {
@@ -2659,6 +2670,10 @@ static ALU4_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
 };
 static POST_INC_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
     name: "post_inc_craw", syntax: "[R++=#i] = R (raw)", len: 4, count: 0, mask: 0, match_: 0,
+    group: "load", alt: &[], samples: &[], slots: &[],
+};
+static WORD_MEM_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "word_mem_craw", syntax: "[R+#i] = R (word raw)", len: 4, count: 0, mask: 0, match_: 0,
     group: "load", alt: &[], samples: &[], slots: &[],
 };
 static RETS_PUSH_MASK_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
@@ -3319,6 +3334,28 @@ mod tests {
     }
 
     #[test]
+    fn word_negative_offsets() {
+        // `d7 ec 51 38` [r5+-128] = r3 (Felucca 1.6), `d5 ec 10 2e` r2 = [r1+-544],
+        // `d4 ec eb ef` [++r14=-776] = r14: byte0 bit 2 is the offset's sign
+        let mut mem = vec![0u8; 0x800];
+        mem[..12].copy_from_slice(&[0xd7, 0xec, 0x51, 0x38, 0xd5, 0xec, 0x10, 0x2e, 0xd4, 0xec, 0xeb, 0xef]);
+        mem[0x500..0x504].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        let mut ram = FlatRam::new(mem);
+        let mut cpu = Cpu::new(0);
+        cpu.regs[5] = 0x480;
+        cpu.regs[3] = 0xcafe_f00d;
+        cpu.step(&mut ram).unwrap();
+        assert_eq!(ram.read32(0x400), 0xcafe_f00d, "[r5+-128] = r3");
+        assert_eq!(cpu.regs[5], 0x480, "no write-back");
+        cpu.regs[1] = 0x720;
+        cpu.step(&mut ram).unwrap();
+        assert_eq!(cpu.regs[2], 0x1234_5678, "r2 = [r1+-544]");
+        cpu.regs[14] = 0x708;
+        cpu.step(&mut ram).unwrap();
+        assert_eq!(cpu.regs[14], 0x400, "pre-increment by -776");
+    }
+
+    #[test]
     fn pair_multiply_accumulate() {
         // `fc e1 30 07` r1_r0 += r3 * r7 (u) (compiler-rt's wide multiply)
         let mut mem = vec![0u8; 0x100];
@@ -3815,6 +3852,11 @@ fn route_of(insn: &Instruction, alu4: &Option<Alu4>, bittest: &Option<BitTest>) 
             _ if insn.entry.len == 4 && (insn.raw & 0xf8) == 0x50
                 && matches!((insn.raw >> 8) & 0xff, 0xec | 0xed | 0xee)
                 && has(insn.entry.syntax, "[R+") && !has(insn.entry.syntax, "[R+R") => 17,
+            // word accesses with a negative offset (`d4..d7 ec`): the table's classes fit only the
+            // corpus samples (`r_i_mov_r_3` had no slots)
+            _ if insn.entry.len == 4 && (insn.raw & 0xfc) == 0xd4 && (insn.raw >> 8) & 0xff == 0xec
+                && has(insn.entry.syntax, "[") => 18,
+            _ if insn.entry.name == "word_mem_craw" => 18,
             _ if insn.entry.len == 4 && (has(insn.entry.syntax, "[++R=#i]") || has(insn.entry.syntax, "[++R=-#i]"))
                 && matches!((insn.raw >> 8) & 0xff, 0xec | 0xed | 0xee)
                 && ((insn.raw & 0xf8) == 0x58 || (insn.raw & 0xff) == 0xd0) => 18,

@@ -395,6 +395,15 @@ shift / multiply, soft double) compare the emulator with the host.
   `[r1+-4] &= r0`) and to route 19 for the post-increment family `d1..d7 ec/ed/ee`
   (`h[r4++=480] = r0`).
 
+### Word accesses with negative offsets (2026-10-13)
+
+Felucca 1.6 halted on `d7 ec 51 38` `[r5+-128] = r3`: class `r_i_mov_r_3` (19 corpus samples)
+had no slots. The word family `d0..d7 ec` has one layout (27884 samples in the 25 listings,
+0 mismatches): store = bit16, bit17 = pre-increment `[++rB=#i]` (clear: a plain offset, no
+write-back), off = 4*sext9(bits(18,19) | bits(24,27)<<2 | bit0<<6 | bit1<<7 | bit2<<8), the
+pair accesses' field. `d4..d7 ec` (byte0 bit 2: negative offsets) and table misses in `d1..d7 ec`
+now go to route 18, which decodes it.
+
 ### Remaining exec gaps (known, traced)
 
 - goto/if branch-offset fields: printed = word offset (delta = 2*printed)
