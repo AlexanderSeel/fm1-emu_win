@@ -6,13 +6,22 @@
 import { fetchPackage } from "./fwsc.js";
 
 const CLOCKS = [60, 80, 100, 120, 160, 200, 240];
+// The device this page is for: the FM-1 (index.html) or the SMK-37 (smk37/index.html, <html
+// data-device="smk37">): its catalog, words and panel. A package says which board it runs on, and
+// the panel follows it (an SMK-37 package opened on the FM-1 page gets the SMK-37's).
+const DEVICE = document.documentElement.dataset.device === "smk37" ? "smk37" : "fm1";
+const DEV = DEVICE === "smk37"
+  ? { product: "M-VAVE SMK-37", board: 1, key: "smk37.", stock: "SMK-37 Pro_016.fwsc", stockFile: /^SMK-37 (Pro|Elite)_\d+( \(\d+\))?\.fwsc$/i,
+      other: { name: "FM-1", href: "../" } }
+  : { product: "M-VAVE FM-1", board: 0, key: "fm1.", stock: "FM-1.fwsc", stockFile: /^FM-1( \(\d+\))?\.fwsc$/i,
+      other: { name: "SMK-37", href: "smk37/" } };
 const params = new URLSearchParams(location.search);
 const stored = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
 const store = (k, v) => { try { localStorage.setItem(k, v); } catch { /* private mode */ } };
 
 const catalog = await (await fetch("firmwares.json")).json();
 const byId = new Map(catalog.firmwares.map((f) => [f.id, f]));
-let fw = byId.get(params.get("fw")) || byId.get(stored("fm1.fw")) || byId.get(catalog.default) || catalog.firmwares[0];
+let fw = byId.get(params.get("fw")) || byId.get(stored(DEV.key + "fw")) || byId.get(catalog.default) || catalog.firmwares[0];
 let mhz = Number(params.get("mhz") || stored("fm1.mhz") || 100);
 // the audio buffer: "interactive" (small: keys answer quickly) unless this device needed a larger
 // one ("playback", offered when the sound drops out with time to spare; ?latency= overrides)
@@ -33,11 +42,8 @@ const bankName = document.getElementById("bankname");
 const wasm = await (await fetch("fm1_web.wasm")).arrayBuffer();   // the worklet gets its own copy
 // (the panel's instance runs no machine: its JIT import is never called)
 const ui = (await WebAssembly.instantiate(wasm, { env: { fm1_jit_compile: () => 0 } })).instance.exports;
-const W = ui.panel_width(), H = ui.panel_height();
-canvas.width = W;
-canvas.height = H;
-// the synth's width follows the room left below the header and the bar (index.html's canvas rule)
-document.documentElement.style.setProperty("--aspect", String(W / H));
+// the panel drawn: 0 the FM-1's, 1 the SMK-37's (setBoard; the canvas takes its size)
+let W = 0, H = 0, board = -1;
 const fitPanel = () => document.documentElement.style.setProperty("--above",
   `${Math.round(canvas.parentElement.getBoundingClientRect().top + scrollY)}px`);
 {
@@ -49,10 +55,30 @@ fitPanel();
 
 let node = null;
 let frame = null;            // the latest LCD + LEDs from the audio thread
-const down = new Uint8Array(41);
-const encClicks = new Int32Array(7);
-const turning = new Uint32Array(8);
+const down = new Uint8Array(64);           // keys and buttons held (FM-1: matrix ids 0..40; SMK-37: keys 0..36, buttons 37..54)
+const encClicks = new Int32Array(8);
+const turning = new Uint32Array(9);
 let pot = 900;
+// SMK-37: its analog inputs as set (pads 0..15, faders 16..19, the pitch / mod wheel 20 / 21)
+const PITCH_REST = 535, MOD_REST = 629;
+const analog = new Uint16Array(23);
+analog[20] = PITCH_REST;
+analog[21] = MOD_REST;
+function setBoard(b) {
+  if (b === board) return;
+  board = b;
+  ui.panel_board(b);
+  W = ui.panel_width();
+  H = ui.panel_height();
+  canvas.width = W;
+  canvas.height = H;
+  // the synth's width follows the room left below the header and the bar (index.html's canvas rule)
+  document.documentElement.style.setProperty("--aspect", String(W / H));
+  document.documentElement.dataset.board = b ? "smk37" : "fm1";
+  down.fill(0);
+  encClicks.fill(0);
+}
+setBoard(DEV.board);
 
 // ---------------------------------------------------------------- firmware and clock
 for (const f of catalog.firmwares) fwSel.add(new Option(`${f.name} ${f.version}`, f.id));
@@ -68,6 +94,13 @@ const MIDI_NOTES = {
   choralroot: NO_NOTE, hortator: NO_NOTE, "sloop-alg": NO_NOTE, x0x: NO_NOTE,
 };
 const cards = new Map();
+// the FM-1 page: which entries have an SMK-37 build (that catalog names them)
+const twins = new Map();
+if (DEVICE === "fm1") {
+  try {
+    for (const s of (await (await fetch("smk37/firmwares.json")).json()).firmwares) if (s.fm1) twins.set(s.fm1, s.id);
+  } catch { /* (no SMK-37 catalog next to this page: no links) */ }
+}
 {
   const el = (tag, cls, ...kids) => {
     const e = document.createElement(tag);
@@ -89,17 +122,21 @@ const cards = new Map();
       scrollTo({ top: 0, behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
     });
     const links = el("div", "links");
-    if (f.byo) links.append(link(f.download, "download FM-1.fwsc"), link(f.repo, "notes"));
+    if (f.byo) links.append(link(f.download, `download ${DEV.stock}`), link(f.repo, "notes"));
     else {
       links.append(link(f.repo, "source"));
       if (f.installer) links.append(link(f.installer, "install"));
     }
+    // the same firmware on the other device (an SMK-37 build's `fm1`, or an FM-1 entry it names)
+    const twin = DEVICE === "smk37" ? f.fm1 : twins.get(f.id);
+    if (twin) links.append(link(`${DEV.other.href}?fw=${twin}`, `also on the ${DEV.other.name}`));
+    const by = [f.author + (f.base ? ` (${f.base})` : ""), f.porter && `SMK-37 port: ${f.porter}`, f.license].filter(Boolean).join(" · ");
     const card = el("li", "",
       el("div", "head", el("b", "", f.name), el("span", "dim", f.version), play),
-      el("div", "by", `${f.author} · ${f.license}`),
-      el("p", "what", f.byo ? "The firmware the FM-1 ships with: a DX7-style FM synth, both cores running. " +
+      el("div", "by", by),
+      el("p", "what", f.byo && DEVICE === "fm1" ? "The firmware the FM-1 ships with: a DX7-style FM synth, both cores running. " +
         "Bring your own copy (see below)." : f.about));
-    if (MIDI_NOTES[f.id]) card.append(el("div", "midi", MIDI_NOTES[f.id]));
+    if (DEVICE === "fm1" && MIDI_NOTES[f.id]) card.append(el("div", "midi", MIDI_NOTES[f.id]));
     card.append(links);
     list.append(card);
     cards.set(f.id, card);
@@ -154,7 +191,7 @@ let bank = null;                           // a DX7 32-voice bank for the stock 
 let loadedUrl = null;                      // the package the running machine came from
 
 function showFirmware() {
-  title.textContent = `M-VAVE FM-1 · ${fw.name} (emulated)`;
+  title.textContent = `${DEV.product} · ${fw.name} (emulated)`;
   for (const [id, card] of cards) {
     card.classList.toggle("on", id === fw.id);
     card.querySelector("button").textContent = id === fw.id ? "Selected" : "Play";
@@ -167,14 +204,15 @@ function showFirmware() {
   } else if (fw.byo) {
     const dl = document.createElement("a");
     dl.href = fw.download;
-    dl.textContent = "download FM-1.fwsc from M-VAVE";
+    dl.textContent = `download ${DEV.stock} from M-VAVE`;
     const doc = document.createElement("a");
     doc.href = fw.repo;
     doc.textContent = "how it runs";
     const have = packages.has(fw.id) ? " Your copy is kept in this browser; open another .fwsc to replace it." :
       " Then click \u201cOpen .fwsc\u2026\u201d (or drop the file on the synth); this browser keeps it for next time.";
     parts = [b, " · M-VAVE's own firmware. This page does not host it and cannot fetch it: ", dl, "." + have +
-      " It starts with a small patch bank of the emulator's own; \u201cDX7 bank\u2026\u201d loads a 32-voice .syx · ", doc];
+      (DEVICE === "fm1" ? " It starts with a small patch bank of the emulator's own; \u201cDX7 bank\u2026\u201d loads a 32-voice .syx · " :
+        " (Not playable yet: it boots, but its screen stays dark.) · "), doc];
   } else {
     const a = document.createElement("a");
     a.href = fw.repo;
@@ -199,7 +237,7 @@ showFirmware();
 fwSel.addEventListener("change", () => {
   fw = byId.get(fwSel.value) || localFw;
   loadedUrl = null;
-  store("fm1.fw", fw.id);
+  store(DEV.key + "fw", fw.id);
   showFirmware();
   fwSel.blur();                 // back to playing from the keyboard
   if (node) boot();
@@ -218,13 +256,13 @@ let localFw = null;
 async function openLocal(file) {
   if (!file) return;
   const mv = catalog.firmwares.find((f) => f.byo);
-  if (mv && (fw.byo || /^FM-1( \(\d+\))?\.fwsc$/i.test(file.name))) {
+  if (mv && (fw.byo || DEV.stockFile.test(file.name))) {
     const bytes = new Uint8Array(await file.arrayBuffer());
     packages.set(mv.id, { bytes, url: null });
     idb("put", mv.id, bytes);
     fw = mv;
     fwSel.value = mv.id;
-    store("fm1.fw", mv.id);
+    store(DEV.key + "fw", mv.id);
     loadedUrl = null;
     showFirmware();
     if (node) boot();
@@ -270,14 +308,16 @@ function draw() {
   if (frame) {
     new Uint16Array(mem(), ui.panel_lcd(), 240 * 240).set(frame.lcd);
     new Float32Array(mem(), ui.panel_leds(), 41).set(frame.leds);
+    if (frame.pads) for (let p = 0; p < 16; p++) ui.panel_set(5, p, frame.pads[p]);
   }
-  for (let i = 0; i < 41; i++) ui.panel_set(0, i, down[i]);
-  for (let i = 0; i < 7; i++) ui.panel_set(1, i, encClicks[i]);
+  for (let i = 0; i < 64; i++) ui.panel_set(0, i, down[i]);
+  for (let i = 0; i < 8; i++) ui.panel_set(1, i, encClicks[i]);
   ui.panel_set(2, 0, pot);
-  for (let i = 0; i < 8; i++) {
+  for (let i = 0; i < 9; i++) {
     ui.panel_set(3, i, turning[i]);
     if (turning[i]) turning[i]--;
   }
+  if (board === 1) for (let i = 0; i < 23; i++) ui.panel_set(4, i, analog[i]);
   const p = ui.panel_draw();
   const img = new ImageData(new Uint8ClampedArray(mem(), p, W * H * 4), W, H);
   ctx.putImageData(img, 0, 0);
@@ -299,9 +339,22 @@ function turn(i, clicks) {
 }
 function setPot(v) {
   pot = Math.max(0, Math.min(1023, Math.round(v)));
-  turning[7] = 10;
+  turning[7] = 10;                           // (the FM-1's knob 7: its pot; the SMK-37's K8)
   send({ type: "pot", value: pot });
 }
+// SMK-37: an analog input (a pad's force, a fader, a wheel)
+function setAnalog(i, v) {
+  v = Math.max(0, Math.min(1023, Math.round(v)));
+  if (analog[i] === v) return;
+  analog[i] = v;
+  send({ type: "analog", idx: i, value: v });
+}
+// SMK-37: the velocity of the next keys, as the time between a key's two contacts: 0 (softest)
+// .. 1 (hardest) -> 80 ms .. 2 ms (the stock curve: full below ~4 ms, the least above ~100 ms)
+function setVelocity(f) {
+  send({ type: "vel", us: Math.round(Math.exp(Math.log(80000) + (Math.log(2000) - Math.log(80000)) * Math.max(0, Math.min(1, f)))) });
+}
+const NKEY = 37, BTN0 = 37;
 
 // pointer: keys and buttons held while pressed (drag across keys: glissando), knobs dragged
 // up / down or scrolled, MASTER as a pot. Every pointer on its own, so on a touch screen
@@ -310,7 +363,7 @@ const at = (e) => {
   const r = canvas.getBoundingClientRect();
   return [(e.clientX - r.left) * (W / r.width), (e.clientY - r.top) * (H / r.height)];
 };
-const holds = new Uint8Array(41);          // pointers holding each key / button
+const holds = new Uint8Array(64);          // pointers holding each key / button
 function press(id) { if (holds[id]++ === 0) setKey(id, true); }
 function unpress(id) { if (holds[id] && --holds[id] === 0) setKey(id, false); }
 const pointers = new Map();                // pointerId -> { grab, lastY, acc, held }
@@ -319,27 +372,39 @@ canvas.addEventListener("pointerdown", (e) => {
   const p = { grab: ui.panel_hit(x, y), lastY: y, acc: 0, held: -1 };
   pointers.set(e.pointerId, p);
   canvas.setPointerCapture(e.pointerId);
-  if (p.grab >= 100) {
+  if (p.grab >= 100 && p.grab < 200) {
     p.held = p.grab - 100;
+    // SMK-37: a key hit further down sounds harder
+    if (board === 1 && p.held < NKEY) setVelocity(ui.panel_hit_y());
     press(p.held);
-  }
+  } else if (board === 1 && p.grab >= 200) slide(p, y);
 });
+// SMK-37: a pad pressed (harder the lower it is hit), a fader or a wheel dragged
+function slide(p, y) {
+  if (p.grab < 300) setAnalog(p.grab - 200, 700);
+  else if (p.grab < 400) setAnalog(16 + p.grab - 300, ui.panel_slide(p.grab - 300, y));
+  else setAnalog(p.grab === 400 ? 20 : 21, ui.panel_slide(p.grab === 400 ? 4 : 5, y));
+}
 canvas.addEventListener("pointermove", (e) => {
   const p = pointers.get(e.pointerId);
   if (!p || p.grab < 0) return;
   const [x, y] = at(e);
-  if (p.grab >= 100 && p.held >= 14) {
+  const keys = board === 1 ? [0, NKEY] : [14, 41];
+  if (p.grab >= 100 && p.grab < 200 && p.held >= keys[0] && p.held < keys[1]) {
     const h = ui.panel_hit(x, y);              // glissando over the note keys
-    if (h >= 114 && h - 100 !== p.held) {
+    if (h >= 100 + keys[0] && h < 100 + keys[1] && h - 100 !== p.held) {
       unpress(p.held);
       p.held = h - 100;
+      if (board === 1) setVelocity(ui.panel_hit_y());
       press(p.held);
     }
-  } else if (p.grab >= 0 && p.grab < 7) {
+  } else if (board === 1 && p.grab >= 300) {
+    slide(p, y);
+  } else if (p.grab >= 0 && p.grab < (board === 1 ? 8 : 7)) {
     p.acc += p.lastY - y;
     while (p.acc >= 12) { p.acc -= 12; turn(p.grab, 1); }
     while (p.acc <= -12) { p.acc += 12; turn(p.grab, -1); }
-  } else if (p.grab === 7) {
+  } else if (board === 0 && p.grab === 7) {
     setPot(pot + (p.lastY - y) * 4);
   }
   p.lastY = y;
@@ -348,6 +413,8 @@ const release = (e) => {
   const p = pointers.get(e.pointerId);
   if (!p) return;
   if (p.held >= 0) unpress(p.held);
+  if (board === 1 && p.grab >= 200 && p.grab < 216) setAnalog(p.grab - 200, 0);   // a pad let go
+  if (board === 1 && p.grab === 400) setAnalog(20, PITCH_REST);                   // the pitch wheel springs back
   pointers.delete(e.pointerId);
 };
 canvas.addEventListener("pointerup", release);
@@ -357,34 +424,50 @@ let wheelAcc = 0;
 canvas.addEventListener("wheel", (e) => {
   const [x, y] = at(e);
   const h = ui.panel_hit(x, y);
+  if (board === 1 && h >= 300 && h < 304) {          // SMK-37: a fader scrolled
+    e.preventDefault();
+    setAnalog(16 + h - 300, analog[16 + h - 300] - e.deltaY * 2);
+    return;
+  }
   if (h < 0 || h > 7) return;
   e.preventDefault();
-  if (h === 7) { setPot(pot - e.deltaY * 0.5); return; }
+  if (board === 0 && h === 7) { setPot(pot - e.deltaY * 0.5); return; }
   wheelAcc -= e.deltaY;
   while (wheelAcc >= 40) { wheelAcc -= 40; turn(h, 1); }
   while (wheelAcc <= -40) { wheelAcc += 40; turn(h, -1); }
 }, { passive: false });
 
 // computer keyboard: A W S E D F T G Y H U J K O L P ; ' = C4..F5, Z X OCT- OCT+, Space PLAY,
-// R REC, 1..0 FX SCL ENV LFO EDIT GLO HOME SAVE ARP SEQ, arrows / , . encoders
+// R REC, 1..0 FX SCL ENV LFO EDIT GLO HOME SAVE ARP SEQ, arrows / , . encoders. SMK-37: the same
+// notes (keys 12..29), Z X OCTAVE- / +, Space SEQ PLAY, R SEQ REC, 1..8 the top pads, arrows K1 / K2,
+// , . K3
 const PIANO = "awsedftgyhujkolp;'";
-const BUTTONS = { z: 0, x: 1, " ": 12, r: 13, 1: 2, 2: 3, 3: 4, 4: 5, 5: 6, 6: 7, 7: 8, 8: 9, 9: 10, 0: 11 };
+const BUTTONS = [
+  { z: 0, x: 1, " ": 12, r: 13, 1: 2, 2: 3, 3: 4, 4: 5, 5: 6, 6: 7, 7: 8, 8: 9, 9: 10, 0: 11 },
+  { z: BTN0 + 4, x: BTN0 + 5, " ": BTN0 + 16, r: BTN0 + 17 },
+];
 const ENC_KEYS = { ArrowLeft: [0, -1], ArrowRight: [0, 1], ArrowDown: [1, -1], ArrowUp: [1, 1], ",": [2, -1], ".": [2, 1] };
 function keyId(k) {
   const i = PIANO.indexOf(k.toLowerCase());
-  if (i >= 0) return 21 + i;
-  const b = BUTTONS[k.toLowerCase()];
+  if (i >= 0) return (board === 1 ? 12 : 21) + i;
+  const b = BUTTONS[board === 1 ? 1 : 0][k.toLowerCase()];
   return b === undefined ? -1 : b;
 }
+const padKey = (k) => (board === 1 && /^[1-8]$/.test(k) ? Number(k) - 1 : -1);
 addEventListener("keydown", (e) => {
   if (e.metaKey || e.ctrlKey || e.target instanceof HTMLSelectElement) return;
   if (ENC_KEYS[e.key]) { e.preventDefault(); turn(...ENC_KEYS[e.key]); return; }
+  const pad = padKey(e.key);
+  if (pad >= 0) { e.preventDefault(); if (!e.repeat) setAnalog(pad, 700); return; }
   const id = keyId(e.key);
   if (id < 0 || e.repeat) return;
   e.preventDefault();
+  if (board === 1 && id < NKEY) setVelocity(0.75);
   setKey(id, true);
 });
 addEventListener("keyup", (e) => {
+  const pad = padKey(e.key);
+  if (pad >= 0) { setAnalog(pad, 0); return; }
   const id = keyId(e.key);
   if (id >= 0) setKey(id, false);
 });
@@ -411,7 +494,23 @@ function midiMessage(e) {
   if (!d.length || !node) return;
   const bytes = Array.from(d);
   if (midiCh && bytes[0] >= 0x80 && bytes[0] < 0xf0) bytes[0] = (bytes[0] & 0xf0) | (midiCh - 1);
-  send({ type: "midi", bytes });
+  if (board === 1) {
+    // the SMK-37 has no MIDI in jack: notes C3..C6 play its keys (the velocity as the time between
+    // the contacts), the pitch bend and the mod wheel its wheels
+    const st = bytes[0] & 0xf0, k = bytes[1] - 48;
+    if ((st === 0x90 || st === 0x80) && k >= 0 && k < NKEY) {
+      const on = st === 0x90 && bytes[2] > 0;
+      if (on) setVelocity((bytes[2] - 1) / 126);
+      setKey(k, on);
+    } else if (st === 0xe0) {
+      const bend = ((bytes[2] << 7) | bytes[1]) - 8192;
+      setAnalog(20, PITCH_REST + (bend >= 0 ? bend / 8191 * (640 - PITCH_REST) : bend / 8192 * (PITCH_REST - 445)));
+    } else if (st === 0xb0 && bytes[1] === 1) {
+      setAnalog(21, MOD_REST - bytes[2] / 127 * (MOD_REST - 474));
+    }
+  } else {
+    send({ type: "midi", bytes });
+  }
   if (bytes[0] < 0xf8) {
     midiAct.classList.add("on");
     clearTimeout(midiActOff);
@@ -629,7 +728,11 @@ function onWorklet(e) {
     return;
   }
   if (m.type === "booted") {
-    if (m.seq === bootSeq) booting = 0;
+    if (m.seq === bootSeq) {
+      booting = 0;
+      setBoard(m.board);                     // (the package's board: an SMK-37 one opened here too)
+      if (m.board === 1) for (let i = 16; i < 22; i++) send({ type: "analog", idx: i, value: analog[i] });
+    }
     return;
   }
   if (m.type !== "frame" || booting) return;

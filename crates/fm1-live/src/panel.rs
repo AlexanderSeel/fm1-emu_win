@@ -9,19 +9,19 @@ pub const H: usize = 820;
 pub const LCD_X: usize = 370;
 pub const LCD_Y: usize = 42;
 
-const ROOM: u32 = 0x18191b;
-const BODY_TOP: u32 = 0x5e6166;
-const BODY_BOT: u32 = 0x4a4d52;
-const TRAY: u32 = 0x2b2c2f;
-const SILK: u32 = 0xc9c6bd;
-const BTN_TOP: u32 = 0x4b4e54;
-const BTN_BOT: u32 = 0x3b3d42;
-const BTN_INK: u32 = 0x9c9a94;
+pub const ROOM: u32 = 0x18191b;
+pub const BODY_TOP: u32 = 0x5e6166;
+pub const BODY_BOT: u32 = 0x4a4d52;
+pub const TRAY: u32 = 0x2b2c2f;
+pub const SILK: u32 = 0xc9c6bd;
+pub const BTN_TOP: u32 = 0x4b4e54;
+pub const BTN_BOT: u32 = 0x3b3d42;
+pub const BTN_INK: u32 = 0x9c9a94;
 const KEY_TOP: u32 = 0x6a5557;
 const KEY_BOT: u32 = 0x4f3f42;
 const KEY_LINE: u32 = 0x8f7c7e;
-const AMBER: u32 = 0xf2a33a;
-const GREEN: u32 = 0x62d36e;
+pub const AMBER: u32 = 0xf2a33a;
+pub const GREEN: u32 = 0x62d36e;
 
 /// What a point on the panel is.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -109,7 +109,7 @@ pub fn hit(x: f32, y: f32) -> Option<Ctl> {
 
 // ---------------------------------------------------------------- drawing --
 
-fn mix(a: u32, b: u32, t: f32) -> u32 {
+pub fn mix(a: u32, b: u32, t: f32) -> u32 {
     let t = t.clamp(0.0, 1.0);
     let ch = |s: u32| -> u32 {
         let x = ((a >> s) & 255) as f32;
@@ -119,15 +119,26 @@ fn mix(a: u32, b: u32, t: f32) -> u32 {
     ch(16) | ch(8) | ch(0)
 }
 
-fn put(buf: &mut [u32], x: i32, y: i32, c: u32, a: f32) {
-    if x >= 0 && y >= 0 && (x as usize) < W && (y as usize) < H && a > 0.0 {
-        let p = &mut buf[y as usize * W + x as usize];
+thread_local! {
+    /// The width of the canvas being drawn (each panel's `base` / `draw` sets its own).
+    static CANVAS_W: std::cell::Cell<usize> = const { std::cell::Cell::new(W) };
+}
+
+/// Draw on canvases `w` pixels wide from now on (the SMK-37 panel's is wider).
+pub fn canvas(w: usize) {
+    CANVAS_W.with(|c| c.set(w));
+}
+
+pub fn put(buf: &mut [u32], x: i32, y: i32, c: u32, a: f32) {
+    let w = CANVAS_W.with(|c| c.get());
+    if x >= 0 && y >= 0 && (x as usize) < w && (y as usize) < buf.len() / w && a > 0.0 {
+        let p = &mut buf[y as usize * w + x as usize];
         *p = mix(*p, c, a);
     }
 }
 
 /// Rounded rectangle with a vertical gradient, anti-aliased edges.
-fn rrect(buf: &mut [u32], x: f32, y: f32, w: f32, h: f32, r: f32, top: u32, bot: u32) {
+pub fn rrect(buf: &mut [u32], x: f32, y: f32, w: f32, h: f32, r: f32, top: u32, bot: u32) {
     for py in (y.floor() as i32 - 1)..=((y + h).ceil() as i32) {
         for px in (x.floor() as i32 - 1)..=((x + w).ceil() as i32) {
             let (fx, fy) = (px as f32 + 0.5, py as f32 + 0.5);
@@ -142,7 +153,7 @@ fn rrect(buf: &mut [u32], x: f32, y: f32, w: f32, h: f32, r: f32, top: u32, bot:
     }
 }
 
-fn disc(buf: &mut [u32], cx: f32, cy: f32, r: f32, f: impl Fn(f32, f32) -> u32) {
+pub fn disc(buf: &mut [u32], cx: f32, cy: f32, r: f32, f: impl Fn(f32, f32) -> u32) {
     for py in (cy - r - 1.0) as i32..=(cy + r + 1.0) as i32 {
         for px in (cx - r - 1.0) as i32..=(cx + r + 1.0) as i32 {
             let (dx, dy) = (px as f32 + 0.5 - cx, py as f32 + 0.5 - cy);
@@ -178,6 +189,7 @@ fn glyph(c: char) -> [u8; 5] {
         'Y' => [0x07, 0x08, 0x70, 0x08, 0x07], 'Z' => [0x61, 0x51, 0x49, 0x45, 0x43],
         '+' => [0x08, 0x08, 0x3E, 0x08, 0x08], '-' => [0x08, 0x08, 0x08, 0x08, 0x08],
         '/' => [0x20, 0x10, 0x08, 0x04, 0x02], '.' => [0x00, 0x60, 0x60, 0x00, 0x00],
+        '<' => [0x08, 0x14, 0x22, 0x41, 0x00], '>' => [0x00, 0x41, 0x22, 0x14, 0x08],
         _ => [0; 5],
     }
 }
@@ -205,6 +217,7 @@ pub fn text(buf: &mut [u32], cx: f32, y: f32, s: &str, scale: usize, color: u32)
 
 /// The parts that never change: body, trays, bezel, labels.
 pub fn base() -> Vec<u32> {
+    canvas(W);
     let mut b = vec![ROOM; W * H];
     rrect(&mut b, 14.0, 14.0, (W - 28) as f32, (H - 28) as f32, 30.0, BODY_TOP, BODY_BOT);
     // screen bezel
@@ -225,7 +238,7 @@ pub fn base() -> Vec<u32> {
     b
 }
 
-fn knob(buf: &mut [u32], cx: f32, cy: f32, r: f32, angle: f32, glow: f32) {
+pub fn knob(buf: &mut [u32], cx: f32, cy: f32, r: f32, angle: f32, glow: f32) {
     // shadow, knurled skirt, cap, pointer
     disc(buf, cx + 2.0, cy + 4.0, r + 2.0, |_, _| 0x26272a);
     if glow > 0.0 {
@@ -263,6 +276,7 @@ fn bright(f: f32) -> f32 {
 }
 
 pub fn draw(buf: &mut [u32], base: &[u32], st: &State) {
+    canvas(W);
     buf.copy_from_slice(base);
     // the LCD at 2x
     for y in 0..240 {

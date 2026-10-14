@@ -227,6 +227,8 @@ pub enum Action {
     Adc { ch: u8, value: u16 },
     /// One MIDI byte into the MIDI IN jack (UART1); it arrives a byte time after the one before.
     Midi { b: u8 },
+    /// SMK-37: the next keys' velocity, as microseconds between their two contacts.
+    Vel { us: u32 },
 }
 
 impl Default for Periph {
@@ -469,6 +471,7 @@ impl Periph {
                 }
             }
             Action::Adc { ch, value } if self.board == crate::Board::Smk37 => self.smk.set_analog(ch, value),
+            Action::Vel { us } => self.smk_vel = (self.hz as u128 * us as u128 / 1_000_000) as u64,
             Action::Adc { ch, value } => {
                 if (ch as usize) < 16 {
                     self.adc_value[ch as usize] = value.min(1023);

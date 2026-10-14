@@ -288,6 +288,9 @@ impl Soc {
             0x11d00..=0x11d1f => Region::Spi1,
             0x11e00..=0x11e1f => Region::Spi2,
             0x11800..=0x1183f => Region::Usb,
+            // the second USB PHY's pads as GPIO (the SMK-37's LED commons at 0x16A0C; the FM-1's
+            // stock firmware touches the block too, as before: unknown)
+            0x16a00..=0x16a1f if self.board == Board::Smk37 => Region::Usb,
             0x12100..=0x1212f => Region::Uart1,
             0x13100..=0x1311f => Region::Adc,
             0x13500..=0x1350f => Region::Crc,
@@ -710,7 +713,12 @@ impl Soc {
                 }
                 self.sfr_set(addr, value)
             }
-            Region::Usb => self.sfr_set(addr, value),
+            Region::Usb => {
+                if addr == 0x16a0c && self.board == Board::Smk37 {
+                    self.periph.smk.commons = value;
+                }
+                self.sfr_set(addr, value)
+            }
             Region::Uart1 => {
                 if !self.periph.write(addr, value) {
                     self.sfr_set(addr, value);

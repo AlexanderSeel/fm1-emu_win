@@ -27,6 +27,7 @@ use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use panel::{Ctl, ENCS, H, W};
 
 mod panel;
+mod panel_smk;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -525,9 +526,32 @@ fn shot(o: &Opts, ms: u64) {
         leds: &leds,
         turning: &[0, 0, 0, 0, 0, 0, 0, 0],
     };
-    let mut buf = vec![0u32; W * H];
-    panel::draw(&mut buf, &panel::base(), &st);
-    let mut ppm = format!("P6\n{W} {H}\n255\n").into_bytes();
+    let (pw, ph) = if m.soc.board == fm1_soc::Board::Smk37 { (panel_smk::W, panel_smk::H) } else { (W, H) };
+    let mut buf = vec![0u32; pw * ph];
+    if m.soc.board == fm1_soc::Board::Smk37 {
+        let p = &mut m.soc.periph.smk;
+        let leds = p.led_take();
+        let (pads, force, faders) = (p.pads, std::array::from_fn(|i| p.analog(i as u8)), std::array::from_fn(|i| p.analog(16 + i as u8)));
+        let mut sdown = [false; 64];
+        sdown[..55].copy_from_slice(&p.down);
+        let st = panel_smk::State {
+            lcd: &m.soc.lcd.fb,
+            enc_clicks: &[0; 8],
+            turning: &[0; 8],
+            down: &sdown,
+            leds: &leds,
+            pads: &pads,
+            pad_force: &force,
+            faders: &faders,
+            pitch: p.analog(fm1_soc::smk::ANALOG_PITCH),
+            modw: p.analog(fm1_soc::smk::ANALOG_MOD),
+        };
+        println!("SMK-37 button LEDs: {}", leds.iter().enumerate().filter(|(_, &f)| f > 0.01).map(|(k, f)| format!("{k}:{f:.2}")).collect::<Vec<_>>().join(" "));
+        panel_smk::draw(&mut buf, &panel_smk::base(), &st);
+    } else {
+        panel::draw(&mut buf, &panel::base(), &st);
+    }
+    let mut ppm = format!("P6\n{pw} {ph}\n255\n").into_bytes();
     for p in &buf {
         ppm.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, *p as u8]);
     }
@@ -644,6 +668,8 @@ fn main() {
     };
     let lcd = Arc::new(Mutex::new(vec![0u16; 240 * 240]));
     let leds = Arc::new(Mutex::new([0f32; 41]));
+    let pads = Arc::new(Mutex::new([0u32; 16]));
+    let board = m.soc.board;
     let status = Arc::new(Mutex::new(String::from("booting")));
     let quit = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel::<Action>();
@@ -651,7 +677,7 @@ fn main() {
 
     let audio_ok = _stream.is_some();
     let emu = {
-        let (ring, lcd, leds, status, quit) = (ring.clone(), lcd.clone(), leds.clone(), status.clone(), quit.clone());
+        let (ring, lcd, leds, pads, status, quit) = (ring.clone(), lcd.clone(), leds.clone(), pads.clone(), status.clone(), quit.clone());
         std::thread::spawn(move || {
             high_priority();
             let start = Instant::now();
@@ -695,7 +721,14 @@ fn main() {
                 }
                 if last_lcd.elapsed() >= Duration::from_millis(16) {
                     lcd.lock().unwrap().copy_from_slice(&m.soc.lcd.fb);
-                    *leds.lock().unwrap() = m.soc.periph.led_take();
+                    if m.soc.board == fm1_soc::Board::Smk37 {
+                        let mut l = [0f32; 41];
+                        l[..fm1_soc::smk::NLED].copy_from_slice(&m.soc.periph.smk.led_take());
+                        *leds.lock().unwrap() = l;
+                        *pads.lock().unwrap() = m.soc.periph.smk.pads;
+                    } else {
+                        *leds.lock().unwrap() = m.soc.periph.led_take();
+                    }
                     last_lcd = Instant::now();
                 }
                 if last_stat.elapsed() >= Duration::from_millis(500) {
@@ -717,6 +750,12 @@ fn main() {
         })
     };
 
+    if board == fm1_soc::Board::Smk37 {
+        window_smk(&o, &tx, &lcd, &leds, &pads, &status);
+        quit.store(true, Ordering::Relaxed);
+        let _ = emu.join();
+        return;
+    }
     let mut win = match Window::new(&format!("FM-1 · {} (emulated)", o.name), W, H, WindowOptions::default()) {
         Ok(w) => w,
         Err(e) => {
@@ -867,4 +906,170 @@ fn main() {
     }
     quit.store(true, Ordering::Relaxed);
     let _ = emu.join();
+}
+
+/// The SMK-37's window: its panel (panel_smk.rs), the mouse on its keys (velocity: how far down
+/// a key is hit), pads, faders, wheels and knobs; the computer keyboard as on the page.
+fn window_smk(o: &Opts, tx: &mpsc::Sender<Action>, lcd: &Mutex<Vec<u16>>, leds: &Mutex<[f32; 41]>, pads: &Mutex<[u32; 16]>, status: &Mutex<String>) {
+    use fm1_soc::smk::{ANALOG_MOD, ANALOG_PITCH, MOD_REST, PITCH_REST};
+    use panel_smk::Ctl as S;
+    let (w, h) = (panel_smk::W, panel_smk::H);
+    let mut win = match Window::new(&format!("SMK-37 · {} (emulated)", o.name), w, h, WindowOptions { resize: true, ..WindowOptions::default() }) {
+        Ok(w) => w,
+        Err(e) => return eprintln!("window: {e}"),
+    };
+    win.set_target_fps(60);
+    let base = panel_smk::base();
+    let mut buf = vec![0u32; w * h];
+    let btn0 = fm1_soc::smk::BTN0;
+    let (mut down, mut enc_clicks, mut turning) = ([false; 64], [0i32; 8], [0u32; 8]);
+    let mut analog = [0u16; 23];
+    analog[ANALOG_PITCH as usize] = PITCH_REST;
+    analog[ANALOG_MOD as usize] = MOD_REST;
+    let mut set_analog = |analog: &mut [u16; 23], i: usize, v: u16| {
+        if analog[i] != v {
+            analog[i] = v;
+            let _ = tx.send(Action::Adc { ch: i as u8, value: v });
+        }
+    };
+    let turn = |i: usize, clicks: i32, enc_clicks: &mut [i32; 8], turning: &mut [u32; 8]| {
+        enc_clicks[i] += clicks;
+        turning[i] = 10;
+        let _ = tx.send(Action::Enc { enc: i as u8, clicks });
+    };
+    // 0 (softest) .. 1 (hardest) -> 80 ms .. 2 ms between a key's two contacts
+    let vel = |f: f32| Action::Vel { us: (80_000f32.ln() + (2_000f32.ln() - 80_000f32.ln()) * f.clamp(0.0, 1.0)).exp() as u32 };
+    let (mut grab, mut was_pressed, mut last_y, mut drag_acc, mut scroll_acc) = (None, false, 0f32, 0f32, [0f32; 8]);
+    let mut last_title = Instant::now();
+    eprintln!("SMK-37: click the keys (lower = harder), pads, buttons; drag faders, wheels, knobs. A..' C4..F5, Z/X OCTAVE, Space SEQ PLAY, R SEQ REC, 1..8 pads, arrows K1/K2; Esc quits");
+    while win.is_open() && !win.is_key_down(Key::Escape) {
+        let pressed = win.get_mouse_down(MouseButton::Left);
+        if let Some((mx, my)) = win.get_mouse_pos(MouseMode::Clamp) {
+            // (the window may be resized: back to panel coordinates)
+            let (ww, wh) = win.get_size();
+            let (mx, my) = (mx * w as f32 / ww.max(1) as f32, my * h as f32 / wh.max(1) as f32);
+            if pressed && !was_pressed {
+                grab = panel_smk::hit(mx, my);
+                last_y = my;
+                drag_acc = 0.0;
+                match grab {
+                    Some(S::Key(_, f)) => { let _ = tx.send(vel(f)); }
+                    Some(S::Pad(p)) => set_analog(&mut analog, p, 700),
+                    _ => {}
+                }
+            }
+            if pressed {
+                match grab {
+                    Some(S::Key(k, _)) => {
+                        if let Some(S::Key(k2, f)) = panel_smk::hit(mx, my) {
+                            if k2 != k {
+                                let _ = tx.send(vel(f));
+                                grab = Some(S::Key(k2, f));
+                            }
+                        }
+                    }
+                    Some(S::Enc(i)) => {
+                        drag_acc += last_y - my;
+                        while drag_acc >= DRAG_PER_CLICK { drag_acc -= DRAG_PER_CLICK; turn(i, 1, &mut enc_clicks, &mut turning); }
+                        while drag_acc <= -DRAG_PER_CLICK { drag_acc += DRAG_PER_CLICK; turn(i, -1, &mut enc_clicks, &mut turning); }
+                    }
+                    Some(S::Fader(f)) => set_analog(&mut analog, 16 + f, panel_smk::fader_value(f, my)),
+                    Some(S::Pitch) => set_analog(&mut analog, ANALOG_PITCH as usize, panel_smk::wheel_value(true, my)),
+                    Some(S::Mod) => set_analog(&mut analog, ANALOG_MOD as usize, panel_smk::wheel_value(false, my)),
+                    _ => {}
+                }
+                last_y = my;
+            }
+            if let Some((_, dy)) = win.get_scroll_wheel() {
+                if let Some(S::Enc(i)) = panel_smk::hit(mx, my) {
+                    scroll_acc[i] += dy;
+                    while scroll_acc[i] >= 1.0 { scroll_acc[i] -= 1.0; turn(i, 1, &mut enc_clicks, &mut turning); }
+                    while scroll_acc[i] <= -1.0 { scroll_acc[i] += 1.0; turn(i, -1, &mut enc_clicks, &mut turning); }
+                }
+            }
+        }
+        if !pressed {
+            match grab {
+                Some(S::Pad(p)) => set_analog(&mut analog, p, 0),
+                Some(S::Pitch) => set_analog(&mut analog, ANALOG_PITCH as usize, PITCH_REST),
+                _ => {}
+            }
+            grab = None;
+        }
+        was_pressed = pressed;
+
+        // held keys and buttons: the computer keyboard (as on the page) and the mouse
+        let mut want = [false; 64];
+        let mut pad_keys = [false; 8];
+        for k in win.get_keys() {
+            if let Some(id) = piano(k) {
+                want[(id - 21 + 12) as usize] = true; // (piano() gives the FM-1's ids, C4 = 21)
+            }
+            let b = match k { Key::Z => Some(4), Key::X => Some(5), Key::Space => Some(16), Key::R => Some(17), _ => None };
+            if let Some(b) = b {
+                want[(btn0 + b) as usize] = true;
+            }
+            let pad = [Key::Key1, Key::Key2, Key::Key3, Key::Key4, Key::Key5, Key::Key6, Key::Key7, Key::Key8].iter().position(|&p| p == k);
+            if let Some(p) = pad {
+                pad_keys[p] = true;
+            }
+        }
+        for (p, &on) in pad_keys.iter().enumerate() {
+            if grab != Some(S::Pad(p)) {
+                set_analog(&mut analog, p, if on { 700 } else { 0 });
+            }
+        }
+        match grab {
+            Some(S::Key(id, _)) | Some(S::Btn(id)) => want[id as usize] = true,
+            _ => {}
+        }
+        for id in 0..55 {
+            if want[id] != down[id] {
+                if want[id] && id < 37 && !matches!(grab, Some(S::Key(k, _)) if k as usize == id) {
+                    let _ = tx.send(vel(0.75));
+                }
+                down[id] = want[id];
+                let _ = tx.send(Action::Key { id: id as u8, down: want[id] });
+            }
+        }
+        for k in win.get_keys_pressed(KeyRepeat::Yes) {
+            match k {
+                Key::Left => turn(0, -1, &mut enc_clicks, &mut turning),
+                Key::Right => turn(0, 1, &mut enc_clicks, &mut turning),
+                Key::Down => turn(1, -1, &mut enc_clicks, &mut turning),
+                Key::Up => turn(1, 1, &mut enc_clicks, &mut turning),
+                Key::Comma => turn(2, -1, &mut enc_clicks, &mut turning),
+                Key::Period => turn(2, 1, &mut enc_clicks, &mut turning),
+                _ => {}
+            }
+        }
+        for t in turning.iter_mut() {
+            *t = t.saturating_sub(1);
+        }
+        {
+            let fb = lcd.lock().unwrap();
+            let l = *leds.lock().unwrap();
+            let pc = *pads.lock().unwrap();
+            let st = panel_smk::State {
+                lcd: &fb,
+                enc_clicks: &enc_clicks,
+                turning: &turning,
+                down: &down,
+                leds: &std::array::from_fn(|k| l[k]),
+                pads: &pc,
+                pad_force: &std::array::from_fn(|p| analog[p]),
+                faders: &std::array::from_fn(|f| analog[16 + f]),
+                pitch: analog[ANALOG_PITCH as usize],
+                modw: analog[ANALOG_MOD as usize],
+            };
+            panel_smk::draw(&mut buf, &base, &st);
+        }
+        if win.update_with_buffer(&buf, w, h).is_err() {
+            break;
+        }
+        if last_title.elapsed() >= Duration::from_millis(500) {
+            win.set_title(&format!("SMK-37 · {} — {}", o.name, status.lock().unwrap()));
+            last_title = Instant::now();
+        }
+    }
 }

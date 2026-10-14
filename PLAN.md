@@ -494,6 +494,26 @@ wasm).
   its drivers want more of the board than the ports do.
 - Next: the front panel (native and the page), the catalog, button LEDs, MIDI out (UART1 TX on PC7).
 
+## 5.15 The SMK-37's page and panel (2026-10-14)
+
+- `fm1-live/src/panel_smk.rs` (shared with the page, as panel.rs): the SMK-37's front panel after
+  the kit's panel map: the wheels and six small buttons, the screen at 2x, K1..K8 over the 16 RGB
+  pads, four faders and twelve buttons, the 37 keys C3..C6 (1920 x 900). panel.rs's primitives
+  draw on any canvas width (`canvas`). The 19 button LEDs: the latched word's low bits while their
+  group's common (0x16A0C bits 17 / 18, mapped for the SMK-37 only: the FM-1's stock firmware
+  touches that block too) is on.
+- The page: one `main.js` for both devices (`<html data-device>`): its catalog, words, panel, and
+  a package's board switching the panel (an SMK-37 package opened on the FM-1 page gets the
+  SMK-37's). `web/smk37/` is the SMK-37's page (its own guide, preview card, catalog), the shared
+  files copied in by web/build.sh; `style.css` shared. On the SMK-37: a key hit lower plays harder
+  (2..80 ms between its contacts), pads, faders, wheels (the pitch wheel springs back), a MIDI
+  keyboard on its keys and wheels (it has no MIDI in jack). Cards link "also on the FM-1 / SMK-37".
+- `tools/smk37_catalog.mjs` builds `web/smk37/firmwares.json` from genkigenki's install page (its
+  FW list and cards), FM-1 twins found by upstream repository; `tools/readme_firmwares.mjs` keeps
+  both README tables. `web/smoke_smk37.mjs` in CI: GHOULBOX's SMK-37 build, a key sounds.
+- fm1-live opens an SMK-37 package in an SMK-37 window (`window_smk`; not tried by hand yet);
+  `Action::Vel` carries a key velocity.
+
 ## 6. Phase 5 — Boot & integration
 
 - Boot stock firmware to a stable idle/main-loop state.

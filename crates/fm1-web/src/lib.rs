@@ -18,6 +18,8 @@ use std::collections::VecDeque;
 
 #[path = "../../fm1-live/src/panel.rs"]
 mod panel;
+#[path = "../../fm1-live/src/panel_smk.rs"]
+mod panel_smk;
 
 const RAM_BASE: u32 = 0x01c0_0000;
 const RAM_SIZE: usize = 1 << 20;
@@ -68,6 +70,7 @@ static mut JIT_PER_RENDER: u32 = 0;
 static mut OUT_L: [f32; 1024] = [0.0; 1024];
 static mut OUT_R: [f32; 1024] = [0.0; 1024];
 static mut LEDS: [f32; 41] = [0.0; 41];
+static mut PADS: [u32; 16] = [0; 16];
 static mut INSNS: u64 = 0;
 
 #[allow(static_mut_refs)]
@@ -179,19 +182,60 @@ pub extern "C" fn fm1_lcd() -> *const u16 {
     machine().map_or(std::ptr::null(), |m| m.soc.lcd.fb.as_ptr())
 }
 
-/// The LEDs' on-fractions since the last call (41 floats).
+/// The LEDs' on-fractions since the last call (41 floats; SMK-37: its 19 button LEDs first).
 #[no_mangle]
 pub extern "C" fn fm1_leds() -> *const f32 {
     #[allow(static_mut_refs)]
     unsafe {
         if let Some(m) = machine() {
-            LEDS = m.soc.periph.led_take();
+            if m.soc.board == fm1_soc::Board::Smk37 {
+                LEDS = [0.0; 41];
+                LEDS[..fm1_soc::smk::NLED].copy_from_slice(&m.soc.periph.smk.led_take());
+            } else {
+                LEDS = m.soc.periph.led_take();
+            }
         }
         LEDS.as_ptr()
     }
 }
 
-/// A key or button (matrix id 0..40) down / up.
+/// The board the running package is for: 0 the FM-1, 1 the SMK-37 (fm1_soc::smk).
+#[no_mangle]
+pub extern "C" fn fm1_board() -> u32 {
+    machine().map_or(0, |m| (m.soc.board == fm1_soc::Board::Smk37) as u32)
+}
+
+/// An analog input: on the SMK-37 `idx` is fm1_soc::smk's ANALOG_* (pads 0..15, faders 16..19,
+/// the pitch and mod wheels 20, 21, the pedal 22); on the FM-1 an ADC channel.
+#[no_mangle]
+pub extern "C" fn fm1_analog(idx: u32, value: u32) {
+    if let Some(m) = machine() {
+        m.soc.periph.apply(&Action::Adc { ch: idx as u8, value: value.min(1023) as u16 });
+    }
+}
+
+/// The SMK-37's key velocity: microseconds between a key's two contacts (less is harder; the
+/// stock curve gives the most below ~4 ms, the least above ~100 ms).
+#[no_mangle]
+pub extern "C" fn fm1_velocity(us: u32) {
+    if let Some(m) = machine() {
+        m.soc.periph.smk_vel = (m.soc.periph.hz as u128 * us as u128 / 1_000_000) as u64;
+    }
+}
+
+/// The SMK-37's pad colours (16 x 0xRRGGBB) from its last LED frame.
+#[no_mangle]
+pub extern "C" fn fm1_pads() -> *const u32 {
+    #[allow(static_mut_refs)]
+    unsafe {
+        if let Some(m) = machine() {
+            PADS = m.soc.periph.smk.pads;
+        }
+        PADS.as_ptr()
+    }
+}
+
+/// A key or button (matrix id 0..40; SMK-37: keys 0..36, buttons 37..54) down / up.
 #[no_mangle]
 pub extern "C" fn fm1_key(id: u32, down: u32) {
     if let Some(m) = machine() {
@@ -246,19 +290,42 @@ static mut PANEL_BASE: Vec<u32> = Vec::new();
 static mut PANEL_BUF: Vec<u32> = Vec::new();
 static mut PANEL_LCD: Vec<u16> = Vec::new();
 static mut PANEL_LEDS: [f32; 41] = [0.0; 41];
-static mut PANEL_DOWN: [bool; 41] = [false; 41];
-static mut PANEL_ENC: [i32; 7] = [0; 7];
-static mut PANEL_TURN: [u32; 8] = [0; 8];
+static mut PANEL_DOWN: [bool; 64] = [false; 64];
+static mut PANEL_ENC: [i32; 8] = [0; 8];
+static mut PANEL_TURN: [u32; 9] = [0; 9];
 static mut PANEL_POT: u16 = 900;
+/// Which panel the page draws: 0 the FM-1's, 1 the SMK-37's.
+static mut PANEL_BOARD: u32 = 0;
+/// SMK-37: the analog inputs as set (fm1_soc::smk's ANALOG_* indices) and the pads' colours
+static mut PANEL_ANALOG: [u16; 23] = [0; 23];
+static mut PANEL_PADS: [u32; 16] = [0; 16];
+/// how far down the key `panel_hit` found was hit (0 top .. 1 bottom)
+static mut PANEL_HIT_Y: f32 = 0.0;
+
+/// Draw the FM-1's panel (0) or the SMK-37's (1) from now on.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn panel_board(b: u32) {
+    unsafe {
+        if PANEL_BOARD != b {
+            PANEL_BOARD = b;
+            PANEL_BASE = Vec::new();
+            if b == 1 {
+                PANEL_ANALOG[fm1_soc::smk::ANALOG_PITCH as usize] = fm1_soc::smk::PITCH_REST;
+                PANEL_ANALOG[fm1_soc::smk::ANALOG_MOD as usize] = fm1_soc::smk::MOD_REST;
+            }
+        }
+    }
+}
 
 #[no_mangle]
 pub extern "C" fn panel_width() -> u32 {
-    panel::W as u32
+    if unsafe { PANEL_BOARD } == 1 { panel_smk::W as u32 } else { panel::W as u32 }
 }
 
 #[no_mangle]
 pub extern "C" fn panel_height() -> u32 {
-    panel::H as u32
+    if unsafe { PANEL_BOARD } == 1 { panel_smk::H as u32 } else { panel::H as u32 }
 }
 
 /// Where the page writes the LCD frame (240*240 RGB565) before `panel_draw`.
@@ -285,10 +352,13 @@ pub extern "C" fn panel_leds() -> *mut f32 {
 pub extern "C" fn panel_set(kind: u32, i: u32, v: i32) {
     unsafe {
         match kind {
-            0 if i < 41 => PANEL_DOWN[i as usize] = v != 0,
-            1 if i < 7 => PANEL_ENC[i as usize] = v,
+            0 if i < 64 => PANEL_DOWN[i as usize] = v != 0,
+            1 if i < 8 => PANEL_ENC[i as usize] = v,
             2 => PANEL_POT = v.clamp(0, 1023) as u16,
-            3 if i < 8 => PANEL_TURN[i as usize] = v.max(0) as u32,
+            3 if i < 9 => PANEL_TURN[i as usize] = v.max(0) as u32,
+            // SMK-37: an analog input as set (ANALOG_* index), a pad's colour
+            4 if i < 23 => PANEL_ANALOG[i as usize] = v.clamp(0, 1023) as u16,
+            5 if i < 16 => PANEL_PADS[i as usize] = v as u32,
             _ => {}
         }
     }
@@ -299,22 +369,40 @@ pub extern "C" fn panel_set(kind: u32, i: u32, v: i32) {
 #[allow(static_mut_refs)]
 pub extern "C" fn panel_draw() -> *const u8 {
     unsafe {
+        let smk = PANEL_BOARD == 1;
         if PANEL_BASE.is_empty() {
-            PANEL_BASE = panel::base();
-            PANEL_BUF = vec![0; panel::W * panel::H];
+            PANEL_BASE = if smk { panel_smk::base() } else { panel::base() };
+            PANEL_BUF = vec![0; PANEL_BASE.len()];
         }
         if PANEL_LCD.is_empty() {
             PANEL_LCD = vec![0; 240 * 240];
         }
-        let st = panel::State {
-            lcd: &PANEL_LCD,
-            enc_clicks: &PANEL_ENC,
-            pot: PANEL_POT,
-            down: &PANEL_DOWN,
-            leds: &PANEL_LEDS,
-            turning: &PANEL_TURN,
-        };
-        panel::draw(&mut PANEL_BUF, &PANEL_BASE, &st);
+        if smk {
+            let a = &PANEL_ANALOG;
+            let st = panel_smk::State {
+                lcd: &PANEL_LCD,
+                enc_clicks: &PANEL_ENC,
+                turning: &[PANEL_TURN[0], PANEL_TURN[1], PANEL_TURN[2], PANEL_TURN[3], PANEL_TURN[4], PANEL_TURN[5], PANEL_TURN[6], PANEL_TURN[7]],
+                down: &PANEL_DOWN,
+                leds: &std::array::from_fn(|k| PANEL_LEDS[k]),
+                pads: &PANEL_PADS,
+                pad_force: &std::array::from_fn(|p| a[p]),
+                faders: &std::array::from_fn(|f| a[16 + f]),
+                pitch: a[fm1_soc::smk::ANALOG_PITCH as usize],
+                modw: a[fm1_soc::smk::ANALOG_MOD as usize],
+            };
+            panel_smk::draw(&mut PANEL_BUF, &PANEL_BASE, &st);
+        } else {
+            let st = panel::State {
+                lcd: &PANEL_LCD,
+                enc_clicks: &std::array::from_fn(|i| PANEL_ENC[i]),
+                pot: PANEL_POT,
+                down: &std::array::from_fn(|i| PANEL_DOWN[i]),
+                leds: &PANEL_LEDS,
+                turning: &std::array::from_fn(|i| PANEL_TURN[i]),
+            };
+            panel::draw(&mut PANEL_BUF, &PANEL_BASE, &st);
+        }
         // 0RGB -> RGBA bytes in place (little endian: R G B A)
         for p in PANEL_BUF.iter_mut() {
             let (r, g, b) = ((*p >> 16) & 255, (*p >> 8) & 255, *p & 255);
@@ -325,9 +413,26 @@ pub extern "C" fn panel_draw() -> *const u8 {
 }
 
 /// What is under the pointer: -1 nothing, 0..6 an encoder (index into the panel's list), 7 the
-/// pot, 100 + id a button or key (matrix id).
+/// pot, 100 + id a button or key (matrix id). SMK-37: 0..7 K1..K8, 100 + id a key (0..36, how
+/// far down in `panel_hit_y`) or a button (37..54), 200 + p a pad, 300 + f a fader, 400 / 401 the
+/// pitch / mod wheel.
 #[no_mangle]
 pub extern "C" fn panel_hit(x: f32, y: f32) -> i32 {
+    if unsafe { PANEL_BOARD } == 1 {
+        return match panel_smk::hit(x, y) {
+            Some(panel_smk::Ctl::Enc(i)) => i as i32,
+            Some(panel_smk::Ctl::Btn(id)) => 100 + id as i32,
+            Some(panel_smk::Ctl::Key(id, f)) => {
+                unsafe { PANEL_HIT_Y = f };
+                100 + id as i32
+            }
+            Some(panel_smk::Ctl::Pad(p)) => 200 + p as i32,
+            Some(panel_smk::Ctl::Fader(f)) => 300 + f as i32,
+            Some(panel_smk::Ctl::Pitch) => 400,
+            Some(panel_smk::Ctl::Mod) => 401,
+            None => -1,
+        };
+    }
     match panel::hit(x, y) {
         Some(panel::Ctl::Enc(i)) => i as i32,
         Some(panel::Ctl::Pot) => 7,
@@ -336,8 +441,28 @@ pub extern "C" fn panel_hit(x: f32, y: f32) -> i32 {
     }
 }
 
-/// The matrix encoder of panel encoder `i` (SELECT, ALGO, PRESET, K1..K4 order of the panel).
+/// The matrix encoder of panel encoder `i` (SELECT, ALGO, PRESET, K1..K4 order of the panel;
+/// SMK-37: K1..K8 are encoders 0..7).
 #[no_mangle]
 pub extern "C" fn panel_enc_id(i: u32) -> u32 {
+    if unsafe { PANEL_BOARD } == 1 {
+        return i;
+    }
     panel::ENCS.get(i as usize).map_or(0, |e| e.1 as u32)
+}
+
+/// How far down the last key `panel_hit` found was hit, 0 (top) .. 1 (bottom).
+#[no_mangle]
+pub extern "C" fn panel_hit_y() -> f32 {
+    unsafe { PANEL_HIT_Y }
+}
+
+/// SMK-37: the reading for a fader (0..3) or a wheel (4 pitch, 5 mod) at panel y.
+#[no_mangle]
+pub extern "C" fn panel_slide(i: u32, y: f32) -> u32 {
+    match i {
+        0..=3 => panel_smk::fader_value(i as usize, y) as u32,
+        4 => panel_smk::wheel_value(true, y) as u32,
+        _ => panel_smk::wheel_value(false, y) as u32,
+    }
 }

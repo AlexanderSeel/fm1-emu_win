@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en" data-device="smk37">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>SMK-37 Emulator</title>
+<meta name="description" content="The M-VAVE SMK-37 keyboard emulated in the browser, running the community firmwares ported to it from the FM-1: the same chip, its keys, pads, faders, wheels and screen in WebAssembly.">
+<meta property="og:type" content="website">
+<meta property="og:title" content="SMK-37 Emulator">
+<meta property="og:description" content="The M-VAVE SMK-37 keyboard emulated in the browser, running the community firmwares ported to it from the FM-1: the same chip, its keys, pads, faders, wheels and screen in WebAssembly.">
+<meta property="og:url" content="https://joakimeriksson.github.io/fm1-emu/smk37/">
+<meta property="og:image" content="https://joakimeriksson.github.io/fm1-emu/smk37/og.png">
+<meta property="og:image:width" content="1280">
+<meta property="og:image:height" content="640">
+<meta property="og:image:alt" content="The emulated SMK-37 with its 37 keys, 16 RGB pads, faders and wheels, running a community firmware">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1 id="title">M-VAVE SMK-37 (emulated)</h1>
+    <nav class="devices" aria-label="Device"><a href="../">FM-1</a><span aria-current="page">SMK-37</span></nav>
+    <span id="status">click Start to boot</span>
+    <p class="runs">Runs an SMK-37 emulator in a WASM virtual machine: the FM-1's chip with the SMK-37's keys, pads,
+      faders and wheels.</p>
+  </header>
+  <div class="bar">
+    <label>Firmware <select id="fw" aria-label="Firmware"></select></label>
+    <label>Clock <select id="mhz" aria-label="Emulated clock"></select></label>
+    <label id="midiin" title="A MIDI keyboard plays the SMK-37's keys (notes C3..C6, with velocity) and its wheels (pitch bend, mod wheel)">MIDI keyboard
+      <select id="midi" aria-label="MIDI input"><option value="">off</option><option value="*">all inputs</option></select>
+      <span id="midiact" aria-hidden="true"></span></label>
+    <label id="midichl" hidden>Channel <select id="midich" aria-label="MIDI channel"><option value="0">as sent</option></select></label>
+    <label class="file">Open .fwsc… <input type="file" id="open"></label>
+    <label class="file" hidden>DX7 bank… <input type="file" id="bank"></label>
+    <span id="bankname" class="dim" hidden></span>
+    <span id="about"></span>
+  </div>
+  <div id="perfwarn" role="alert" hidden>
+    <p id="perfwarn-text"></p>
+    <div class="acts">
+      <button type="button" id="perfwarn-fix" class="primary"></button>
+      <button type="button" id="perfwarn-copy" title="A short text about this device and how it kept up, to paste into a bug report">Copy a report</button>
+      <button type="button" id="perfwarn-close" aria-label="Dismiss">✕</button>
+    </div>
+  </div>
+  <div class="stage">
+    <canvas id="panel" aria-label="SMK-37 front panel"></canvas>
+    <button id="start">Start</button>
+  </div>
+  <p class="rotate">Turn the phone sideways for a bigger keyboard.</p>
+  <p class="hint">
+    <span class="keyb"><kbd>A</kbd>…<kbd>'</kbd> play C4–F5</span>
+    <span class="keyb"><kbd>Z</kbd> <kbd>X</kbd> octave</span>
+    <span class="keyb"><kbd>Space</kbd> SEQ PLAY</span>
+    <span class="keyb"><kbd>1</kbd>…<kbd>8</kbd> pads</span>
+    <span class="keyb">a key clicked lower plays harder</span>
+    <span class="touch">Play chords with several fingers · drag faders, wheels and knobs</span>
+    <a class="more" href="#guide">How to use it, the firmwares ↓</a>
+  </p>
+
+  <div class="guide" id="guide">
+    <nav class="toc span" aria-label="On this page">
+      <a href="#start-here">Quick start</a>
+      <a href="#playing">Playing</a>
+      <a href="#midi-in">MIDI keyboard</a>
+      <a href="#firmwares">Firmwares</a>
+      <a href="#stock">M-VAVE's own firmware</a>
+      <a href="#how">How it works</a>
+      <a href="#limits">Known limits</a>
+      <a href="#credits">Source and credits</a>
+    </nav>
+
+    <section id="start-here" class="span" aria-labelledby="h-start">
+      <h2 id="h-start">What this is</h2>
+      <p class="lead">The M-VAVE SMK-37 is a 37-key keyboard with 16 RGB pads, 8 knobs, 4 faders, pitch and mod
+        wheels and a colour screen. Inside it is the FM-1's chip, a JieLi AC791N, with the same flash layout, audio and
+        update path; only the panel is wired differently. So the FM-1's community firmwares can be ported to it, and
+        <a href="https://github.com/genkigenki/fm1-to-smk37">genkigenki's fm1-to-smk37 kit</a> has done so for these.
+        This page runs them unchanged on an emulated SMK-37, the same update packages you would install on a real one.</p>
+      <ol class="steps">
+        <li><b>Pick a firmware</b>Snoop37 (SLOOP) is the default. Each is downloaded from
+          <a href="https://genkigenki.github.io/smk37/">genkigenki's install page</a> when you start it. The
+          <a href="#firmwares">list below</a> says what each one does.</li>
+        <li><b>Press Start</b>A browser only plays sound after a click. Changing the firmware or the clock later
+          reboots the keyboard.</li>
+        <li><b>Play</b>Use the computer keyboard, the mouse or a touch screen, or a MIDI keyboard
+          (<a href="#midi-in">MIDI keyboard</a>). The status line shows the clock, the emulated CPU's speed and
+          the load on the audio thread.</li>
+      </ol>
+      <p>The SMK-37 Pro, SMK-37 Elite, MKE-P37 and Donner Starrykey 37 Play share this hardware; the packages here
+        are the SMK-37 Pro builds.</p>
+    </section>
+
+    <section id="playing" aria-labelledby="h-play">
+      <h2 id="h-play">Playing</h2>
+      <h3>Computer keyboard</h3>
+      <div class="piano" role="img" aria-label="Computer keys and the notes they play: A C4, W C sharp 4, S D4, E D sharp 4, D E4, F F4, T F sharp 4, G G4, Y G sharp 4, H A4, U A sharp 4, J B4, K C5, O C sharp 5, L D5, P D sharp 5, semicolon E5, apostrophe F5">
+        <span class="b" style="grid-column-start:2">W<i>C♯4</i></span>
+        <span class="b" style="grid-column-start:4">E<i>D♯4</i></span>
+        <span class="b" style="grid-column-start:8">T<i>F♯4</i></span>
+        <span class="b" style="grid-column-start:10">Y<i>G♯4</i></span>
+        <span class="b" style="grid-column-start:12">U<i>A♯4</i></span>
+        <span class="b" style="grid-column-start:16">O<i>C♯5</i></span>
+        <span class="b" style="grid-column-start:18">P<i>D♯5</i></span>
+        <span class="w" style="grid-column-start:1">A<i>C4</i></span>
+        <span class="w" style="grid-column-start:3">S<i>D4</i></span>
+        <span class="w" style="grid-column-start:5">D<i>E4</i></span>
+        <span class="w" style="grid-column-start:7">F<i>F4</i></span>
+        <span class="w" style="grid-column-start:9">G<i>G4</i></span>
+        <span class="w" style="grid-column-start:11">H<i>A4</i></span>
+        <span class="w" style="grid-column-start:13">J<i>B4</i></span>
+        <span class="w" style="grid-column-start:15">K<i>C5</i></span>
+        <span class="w" style="grid-column-start:17">L<i>D5</i></span>
+        <span class="w" style="grid-column-start:19">;<i>E5</i></span>
+        <span class="w" style="grid-column-start:21">'<i>F5</i></span>
+      </div>
+      <ul class="map" aria-label="Buttons, pads and knobs">
+        <li><kbd>Z</kbd> OCTAVE−</li><li><kbd>X</kbd> OCTAVE+</li><li><kbd>Space</kbd> SEQ PLAY</li><li><kbd>R</kbd> SEQ REC</li>
+        <li><kbd>1</kbd>…<kbd>8</kbd> the top row of pads</li>
+        <li><kbd>←</kbd><kbd>→</kbd> K1</li><li><kbd>↓</kbd><kbd>↑</kbd> K2</li><li><kbd>,</kbd><kbd>.</kbd> K3</li>
+      </ul>
+      <p class="dim">What each button, pad and knob does is up to the firmware: its card's source link says.</p>
+      <h3>Mouse and touch</h3>
+      <ul>
+        <li>Click a key, or drag across the keys for a glissando. A key hit near its far end plays harder: the
+          emulator closes the key's second contact sooner, which is how the SMK-37 measures velocity.</li>
+        <li>Press a pad to hit it. Drag a fader, or scroll over it. The pitch wheel springs back when you let go; the
+          mod wheel stays.</li>
+        <li>Drag a knob up or down, or scroll over it.</li>
+        <li>On a touch screen every finger counts. On a phone, turn it sideways.</li>
+      </ul>
+    </section>
+
+    <section id="midi-in" aria-labelledby="h-midi">
+      <h2 id="h-midi">MIDI keyboard</h2>
+      <p>The SMK-37 has no MIDI in jack, so a MIDI keyboard plays its keys instead: notes C3–C6 press the matching
+        key with the note's velocity, the pitch bend moves the pitch wheel and the mod wheel the mod wheel.
+        Chrome, Edge and Firefox have Web MIDI; Safari has none.</p>
+      <ol>
+        <li>Connect the keyboard.</li>
+        <li>Choose it under <b>MIDI keyboard</b>, or choose “all inputs”, and allow MIDI access when asked.</li>
+      </ol>
+    </section>
+
+    <section id="firmwares" class="span" aria-labelledby="h-fw">
+      <h2 id="h-fw">The firmwares</h2>
+      <p>Every firmware on <a href="https://genkigenki.github.io/smk37/">genkigenki's SMK-37 install page</a>: SMK-37
+        builds of FM-1 firmwares, ported with the fm1-to-smk37 kit, and firmwares written for the SMK-37. Each is
+        downloaded from there when you start it. “also on the FM-1” opens the FM-1 build on the FM-1 page.</p>
+      <ul class="cards" id="fwlist"></ul>
+    </section>
+
+    <section id="stock" aria-labelledby="h-stock">
+      <h2 id="h-stock">M-VAVE's own firmware</h2>
+      <p>The firmware the SMK-37 ships with unpacks and boots here, but its screen stays dark: its drivers use more of
+        the board than the community firmwares do, and that part of the emulator is not done. To try it, download
+        <code>SMK-37 Pro_016.fwsc</code> from
+        <a href="https://yms-file-store.oss-cn-hongkong.aliyuncs.com/software/firmware/SMK-37Pro/SMK-37%20Pro_016.fwsc">M-VAVE</a>,
+        choose “M-VAVE stock firmware” and click <b>Open .fwsc…</b>.</p>
+    </section>
+
+    <section id="limits" aria-labelledby="h-limits">
+      <h2 id="h-limits">Known limits</h2>
+      <ul>
+        <li><b>Not checked against a real SMK-37.</b> The panel's wiring follows the fm1-to-smk37 kit's hardware
+          map, whose facts were verified on a unit or read from the stock firmware; this emulator has not met one.</li>
+        <li><b>Speed.</b> As on the FM-1 page: the status line shows the load, and a device that can't keep up gets
+          a warning with a lower clock.</li>
+        <li><b>MIDI out</b> (the TRS jack) and USB MIDI are not emulated.</li>
+        <li><b>M-VAVE's own firmware</b> does not run yet (above).</li>
+      </ul>
+    </section>
+
+    <section id="how" aria-labelledby="h-how">
+      <h2 id="h-how">How it works</h2>
+      <p>The same emulator as the <a href="../">FM-1 page</a>, written in Rust and running as WebAssembly in the
+        browser's audio thread, with the SMK-37's panel wired in: a 16×8 key matrix driven by four shift registers
+        (37 keys with two contacts each for velocity, 18 buttons, 8 encoders), three analog multiplexers for the pads,
+        faders and wheels, and 16 RGB pads whose colour frames share the screen's SPI bus. Each package says which
+        board it is for, so an SMK-37 package opened on the FM-1 page gets this panel.</p>
+      <p>How the emulator was built and checked: <a href="../fm1-emu-report.pdf">Emulating a Synthesizer Before It
+        Arrives</a> (PDF).</p>
+    </section>
+
+    <section id="credits" aria-labelledby="h-credits">
+      <h2 id="h-credits">Source and credits</h2>
+      <p>The emulator's source:
+        <a href="https://github.com/joakimeriksson/fm1-emu">github.com/joakimeriksson/fm1-emu</a>.</p>
+      <p>The SMK-37's hardware map and the ports: genkigenki's
+        <a href="https://github.com/genkigenki/fm1-to-smk37">fm1-to-smk37</a> and
+        <a href="https://genkigenki.github.io/smk37/">SMK-37 install page</a>. The firmwares are their authors' work,
+        under the licences on each card.</p>
+    </section>
+  </div>
+  <footer>
+    SMK-37 emulator · <a href="https://github.com/joakimeriksson/fm1-emu">source</a> ·
+    firmwares from <a href="https://genkigenki.github.io/smk37/">genkigenki.github.io/smk37</a> · no firmware is hosted on this page
+  </footer>
+</main>
+<script type="module" src="main.js"></script>
+</body>
+</html>

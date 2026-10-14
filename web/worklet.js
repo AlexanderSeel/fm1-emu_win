@@ -49,6 +49,8 @@ class Fm1 extends AudioWorkletProcessor {
         else if (m.type === "enc") this.x.fm1_enc(m.enc, m.clicks);
         else if (m.type === "pot") this.x.fm1_pot(m.value);
         else if (m.type === "midi") for (const b of m.bytes) this.x.fm1_midi(b);
+        else if (m.type === "analog") this.x.fm1_analog(m.idx, m.value);   // SMK-37: pads, faders, wheels
+        else if (m.type === "vel") this.x.fm1_velocity(m.us);             // SMK-37: the next keys' velocity
       }
     };
   }
@@ -81,7 +83,8 @@ class Fm1 extends AudioWorkletProcessor {
     this.calls = 0;
     this.busy = 0;                      // ms spent emulating since the last frame message
     this.worst = 0;                     // the longest quantum among them
-    this.port.postMessage({ type: "booted", seq: m.seq });
+    this.board = x.fm1_board();         // 0 the FM-1, 1 the SMK-37 (the package says which)
+    this.port.postMessage({ type: "booted", seq: m.seq, board: this.board });
   }
 
   process(_inputs, outputs) {
@@ -110,8 +113,9 @@ class Fm1 extends AudioWorkletProcessor {
       // the screen and the LEDs, copied out of wasm memory (the page has its own instance)
       const lcd = new Uint16Array(x.memory.buffer, x.fm1_lcd(), 240 * 240).slice();
       const leds = new Float32Array(x.memory.buffer, x.fm1_leds(), 41).slice();
+      const pads = this.board ? new Uint32Array(x.memory.buffer, x.fm1_pads(), 16).slice() : null;
       this.port.postMessage({ type: "frame", lcd, leds, ms: x.fm1_ms(), minsns: x.fm1_minsns(),
-        short: this.short, halted: x.fm1_halted(), jit: this.jit,
+        short: this.short, halted: x.fm1_halted(), jit: this.jit, pads,
         // the audio thread's time: busy ms over these 11 quanta of n frames, and the worst one
         busy: this.busy, worst: this.worst, quanta: 11, frames: n }, [lcd.buffer, leds.buffer]);
       this.busy = 0;

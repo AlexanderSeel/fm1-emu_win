@@ -16,6 +16,8 @@
 //! * analog: three 8:1 muxes addressed by the latched word's bits 5..3, on ADC channels 1 (mux
 //!   A: the top pads 0..7), 8 (mux B: the bottom pads 8..15) and 2 (mux C: the faders, the pitch
 //!   and mod wheels, the pedal jack, the battery). `Action::Adc` sets them by `ANALOG_*` index.
+//! * 19 button LEDs: the word's low 16 bits (active low), in two groups whose commons are bits
+//!   17 and 18 of 0x16A0C (the second USB PHY's pads as GPIO; low = on), one group per frame.
 //! * 16 RGB pad LEDs (WS2812, GRB) on SPI1 group B (IOMAP_CON1 bit 4 set; group A is the LCD):
 //!   one SPI byte per LED bit, 0xF0 = 1, 0xC0 = 0, after a run of zero bytes.
 
@@ -62,6 +64,13 @@ pub const MOD_REST: u16 = 629;
 const PAD_ADDR: [usize; 8] = [3, 0, 1, 2, 4, 6, 7, 5];
 const FADER_ADDR: [usize; 4] = [3, 0, 1, 2];
 
+/// The button LEDs (LED k = button k; 18 a spare): group, bit in the word (docs/01 5.5).
+const LEDS: [(u8, u8); 19] = [
+    (0, 12), (1, 2), (0, 0), (1, 0), (0, 13), (1, 13), (0, 2), (0, 1), (0, 9), (0, 8), (0, 11), (0, 10), (1, 1),
+    (1, 9), (1, 8), (1, 10), (1, 12), (1, 14), (1, 11),
+];
+pub const NLED: usize = 19;
+
 /// The pad LED chain: pad p is LED `PAD_SLOT[p]` in the chain.
 const PAD_SLOT: [usize; NPAD] = [0, 15, 14, 13, 12, 11, 10, 9, 1, 2, 3, 4, 5, 6, 7, 8];
 
@@ -78,6 +87,11 @@ pub struct Panel {
     pub pad_frames: u64,
     /// what each mux (A, B, C) shows on each address
     analog: [[u16; 8]; 3],
+    /// 0x16A0C (the LED groups' commons)
+    pub commons: u32,
+    /// latches with each LED lit, and with its group on, since `led_take`
+    led_lit: [u32; NLED],
+    group_on: [u32; 2],
 }
 
 impl Default for Panel {
@@ -90,6 +104,9 @@ impl Default for Panel {
             pads: [0; NPAD],
             pad_frames: 0,
             analog: [[0; 8], [0; 8], [0, 0, 0, 0, PITCH_REST, MOD_REST, 985, 640]],
+            commons: u32::MAX,
+            led_lit: [0; NLED],
+            group_on: [0; 2],
         }
     }
 }
@@ -100,9 +117,44 @@ impl Panel {
         self.sr = (self.sr >> 8) | (b as u32) << 24;
     }
 
-    /// PA1's rising edge: the chain's outputs follow.
+    /// PA1's rising edge: the chain's outputs follow; the LEDs of the group whose common is on
+    /// light where their bit is low.
     pub fn latch(&mut self) {
         self.latched = self.sr;
+        for g in 0..2 {
+            if self.commons >> (17 + g) & 1 == 0 {
+                self.group_on[g] += 1;
+                for (k, &(lg, bit)) in LEDS.iter().enumerate() {
+                    if lg as usize == g && self.latched >> bit & 1 == 0 {
+                        self.led_lit[k] += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Each button LED's lit fraction (of its group's time) since the last call.
+    pub fn led_take(&mut self) -> [f32; NLED] {
+        let mut out = [0f32; NLED];
+        for (k, &(g, _)) in LEDS.iter().enumerate() {
+            let on = self.group_on[g as usize];
+            out[k] = if on == 0 { 0.0 } else { self.led_lit[k] as f32 / on as f32 };
+        }
+        self.led_lit = [0; NLED];
+        self.group_on = [0; 2];
+        out
+    }
+
+    /// The reading of analog input `idx` (`ANALOG_*`).
+    pub fn analog(&self, idx: u8) -> u16 {
+        match idx as usize {
+            p @ 0..=15 => self.analog[p / 8][PAD_ADDR[p % 8]],
+            f @ 16..=19 => self.analog[2][FADER_ADDR[f - 16]],
+            20 => self.analog[2][4],
+            21 => self.analog[2][5],
+            22 => self.analog[2][6],
+            _ => 0,
+        }
     }
 
     /// Key or button `id` pressed or let go at `now`; a key's second contact closes `vel`

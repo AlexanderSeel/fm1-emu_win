@@ -47,6 +47,11 @@ jobs:
       - name: Test the emulator page
         run: node web/smoke.mjs _site
 
+      # The SMK-37 page's wasm boots an SMK-37 build (GHOULBOX, from genkigenki's install page)
+      # as the SMK-37 board, and a key on its keybed sounds.
+      - name: Test the SMK-37 page
+        run: node web/smoke_smk37.mjs _site
+
       # The SID player's wasm boots the player firmware with the page's own tune pack.
       - name: Test the FM-1 SID player page
         run: node fm1-sid/web/smoke.mjs _site/fm1-sid
