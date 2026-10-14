@@ -2559,6 +2559,17 @@ impl Cpu {
                 }
                 self.regs[b] = addr.wrapping_add(inc as u32);
             }
+            33 =>
+            {
+                // `d4 e9`: a word at sp + off, loaded or stored (the micro-op's own rule)
+                let (r, off) = (((raw >> 28) & 0xf) as usize, ((raw >> 16) & 0xffe) as u32);
+                let addr = self.sp.wrapping_add(off);
+                if raw & 0x1_0000 != 0 {
+                    bus.write32(addr, self.regs[r]);
+                } else {
+                    self.regs[r] = bus.read32(addr);
+                }
+            }
             32 =>
             {
                 // `[++rB=rI]` / `[rB++=rI]` (see `idx_inc`); a load into the base register
@@ -2736,6 +2747,14 @@ fn decode_any(win: u64, pc: u32) -> Result<fm1_isa::Instruction, fm1_isa::Decode
         // classes match only the masks the corpora used (libm's sin pops {rets, r11-r8, r6-r4})
         Err(_) if win & 0xffff == 0xe8d9 => raw(&RETS_PUSH_MASK_CRAW),
         Err(_) if win & 0xffff == 0xe8d1 => raw(&RETS_POP_MASK_CRAW),
+        // `d5 e8 <mask>`: `{pc, mask} = [sp++]`, a return popping a register mask (route 28;
+        // all 54 corpus samples fit): the classes match only the corpus masks (Vector37's
+        // `{pc, r11-r6, r4}`)
+        Err(_) if win & 0xffff == 0xe8d5 => raw(&PC_POP_MASK_CRAW),
+        // `d4 e9 <rrrr oooo oooo ooos>`: `rR = [sp+off]` / `[sp+off] = rR`, off = bits 1..11 (a
+        // word offset), s = store (route 33; all 20620 corpus samples fit): the classes fit only
+        // the corpus offsets (ObervaVe's `r3 = [sp+2384]`)
+        Err(_) if win & 0xffff == 0xe9d4 => raw(&SP_WORD_CRAW),
         // 4-byte ALU forms decode_alu4 knows the layout of (`6c e8` `[R+#i] <<= #n`, `64 e8`
         // `[R+#i] &= R`, ...): the table's classes fit only the offsets the corpora used
         // (m6502's `[r0+24] <<= 1`, `[r1+-4] &= r0`)
@@ -2766,6 +2785,13 @@ fn decode_any(win: u64, pc: u32) -> Result<fm1_isa::Instruction, fm1_isa::Decode
         // register (route 32, `idx_inc`): the classes fit only the corpus registers
         // (SLOOP 2.6's `b[r2++=r0] = r1`)
         Err(_) if idx_inc(win & 0xffff_ffff).is_some() => raw(&IDX_INC_CRAW),
+        // `4x ff 00 AB oo oo`: `if (rA op rB) goto`, a 16-bit half-word offset from the next
+        // instruction (route 13, `decode_cmp_rr_branch`; all 3004 corpus samples fit): the
+        // classes fit only the corpus offsets (Snoop37's `if (r4 < r3) goto -8996`, further back
+        // than any the corpora had). Byte 2: 0 (bit 7, the float compare, never seen this way).
+        Err(_) if (win >> 8) & 0xff == 0xff && (win & 0xff) >> 4 == 4 && (win >> 16) & 0xff == 0 => {
+            Ok(fm1_isa::Instruction { addr: pc, raw: win & 0xffff_ffff_ffff, entry: &CMP_RR_BRANCH6_CRAW })
+        }
         Err(e) => Err(e),
     }
 }
@@ -2807,6 +2833,10 @@ static REV8_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
 static REV8_PAIR_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
     name: "rev8_craw", syntax: "R = rev8(R)  #", len: 4, count: 0, mask: 0, match_: 0,
     group: "alu", alt: &[], samples: &[], slots: &[],
+};
+static CMP_RR_BRANCH6_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "if_r_op_r_goto_i_craw", syntax: "if (R op R) goto #i (raw)", len: 6, count: 0, mask: 0, match_: 0,
+    group: "branch", alt: &[], samples: &[], slots: &[],
 };
 static IDX_INC_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
     name: "idx_inc_craw", syntax: "[R++=R] = R (raw)", len: 4, count: 0, mask: 0, match_: 0,
@@ -2890,6 +2920,14 @@ static WORD_MEM_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
 static RETS_PUSH_MASK_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
     name: "sp_mov_rets_mask_craw", syntax: "[--sp] = {rets, R*4}", len: 4, count: 0, mask: 0, match_: 0,
     group: "stack", alt: &[], samples: &[], slots: &[],
+};
+static PC_POP_MASK_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "pc_mask_mov_sp_craw", syntax: "{pc, R*4} = [sp++]", len: 4, count: 0, mask: 0, match_: 0,
+    group: "stack", alt: &[], samples: &[], slots: &[],
+};
+static SP_WORD_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "sp_word_craw", syntax: "R = [sp+#i] (raw)", len: 4, count: 0, mask: 0, match_: 0,
+    group: "load", alt: &[], samples: &[], slots: &[],
 };
 static RETS_POP_MASK_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
     name: "rets_mask_mov_sp_craw", syntax: "{rets, R*4} = [sp++]", len: 4, count: 0, mask: 0, match_: 0,
@@ -4161,7 +4199,8 @@ fn route_of(insn: &Instruction, alu4: &Option<Alu4>, bittest: &Option<BitTest>) 
             "rets_r_1_mov_sp" | "rets_r_2_mov_sp" | "rets_r_3_mov_sp"
             | "rets_r_4_mov_sp" | "rets_r_6_mov_sp" | "rets_r_8_mov_sp" | "rets_mask_mov_sp_craw" => 27,
             "pc_r_1_mov_sp" | "pc_r_2_mov_sp" | "pc_r_3_mov_sp"
-            | "pc_r_4_mov_sp" | "pc_r_mov_sp" => 28,
+            | "pc_r_4_mov_sp" | "pc_r_mov_sp" | "pc_mask_mov_sp_craw" => 28,
+            "sp_word_craw" => 33,
             "rep_i_r" | "rep_i_i" => 29,
             n if n.starts_with("fpu_") => ROUTE_FPU,
             _ => ROUTE_SYNTAX,
@@ -4417,6 +4456,10 @@ fn fast_raw(route: u16, insn: &Instruction, alu4: &Option<Alu4>, bittest: &Optio
         16 | 18 | 19 | 21 | 22 | 27 | 32 => Some(Fast::Raw { route: route as u8, raw: raw as u32 }),
         26 if insn.entry.len == 4 => Some(Fast::PushMask { mask: ((raw >> 16) & 0xffff) as u16 }),
         28 if insn.entry.len == 4 => Some(Fast::PopMask { mask: ((raw >> 16) & 0xffff) as u16 }),
+        33 => {
+            let (r, off) = (((raw >> 28) & 0xf) as u8, ((raw >> 16) & 0xffe) as u32);
+            Some(if raw & 0x1_0000 != 0 { Fast::StWSp { s: r, off } } else { Fast::LdWSp { d: r, off } })
+        }
         26 => Some(Fast::PushRets { n: (raw & 0xf) as u8 }),
         28 => Some(Fast::PopPc { n: (raw & 0xf) as u8 }),
         15 => Some(Fast::Ext {

@@ -1,7 +1,8 @@
 //! FM-1 update packages (.fwsc) and the flash they become, for running M-VAVE's stock
 //! firmware (community firmwares only need their app.bin: web/fwsc.js).
 //!
-//! The format is web/fwsc.js's (see there): 20 masked header blocks naming the flash image;
+//! The format is web/fwsc.js's (see there): masked header blocks naming the flash image (20, or
+//! more in SMK-37 packages: `container`);
 //! in it a JLFS directory of masked 32-byte heads, and the app area (from 0x4000), scrambled
 //! per 32 bytes with the chip key. `unpack` returns the flash as the updater writes it (what
 //! the SPI side reads) and the app area unscrambled (what the CPU sees through XIP, where the
@@ -59,6 +60,9 @@ fn head(b: &[u8], o: usize) -> Head {
 }
 
 pub struct Unpacked {
+    /// The package's identity, as its header blocks' markers spell it (`FM-1_015`,
+    /// `SMK-37 Pro_016`): which product it is for.
+    pub identity: String,
     /// The flash image byte for byte as the updater writes it.
     pub raw: Vec<u8>,
     /// The app area unscrambled, from its start: the XIP window's contents.
@@ -76,13 +80,40 @@ impl Unpacked {
     }
 }
 
+/// The header of a package: blocks of 0x30 bytes whose last byte is a marker, `identity[i] +
+/// i + 1` while the identity lasts and 0x7D after it (fm1-to-smk37 docs/02, 2.2). FM-1
+/// packages have 20 blocks; SMK-37 Pro v016 has 36 (14 identity characters, 22 x 0x7D): blocks
+/// are counted while i < 20 or the marker is 0x7D. Returns the count and the identity.
+pub fn container(file: &[u8]) -> (usize, String) {
+    let marker = |i: usize| file.get(i * 0x30 + 0x2f).copied();
+    let mut n = 0;
+    while let Some(m) = marker(n) {
+        if n >= 20 && m != 0x7d {
+            break;
+        }
+        n += 1;
+    }
+    // the identity: the markers up to the run of 0x7D that ends the header
+    let mut end = n;
+    while end > 0 && marker(end - 1) == Some(0x7d) {
+        end -= 1;
+    }
+    let identity = (0..end).filter_map(|i| marker(i).map(|m| m.wrapping_sub(i as u8 + 1) as char)).collect();
+    (n, identity)
+}
+
 /// The flash image inside a package, as stored.
 pub fn raw_flash(file: &[u8]) -> Result<Vec<u8>, String> {
-    if file.len() < 20 * 0x30 {
+    raw_flash_n(file, container(file).0)
+}
+
+/// The flash image, the header taken as `blocks` blocks.
+fn raw_flash_n(file: &[u8], blocks: usize) -> Result<Vec<u8>, String> {
+    if file.len() < blocks * 0x30 || blocks < 20 {
         return Err("too short for an FM-1 update package (.fwsc)".into());
     }
-    let mut hdr = Vec::with_capacity(20 * 0x2f);
-    for i in 0..20 {
+    let mut hdr = Vec::with_capacity(blocks * 0x2f);
+    for i in 0..blocks {
         hdr.extend_from_slice(&file[i * 0x30..i * 0x30 + 0x2f]);
     }
     unmask(&mut hdr[..0x40], 0xffff);
@@ -97,9 +128,13 @@ pub fn raw_flash(file: &[u8]) -> Result<Vec<u8>, String> {
         let mut e = hdr[at..at + 0x50].to_vec();
         unmask(&mut e, 0xffff);
         if u16le(&e, 0) == 0 {
-            let off = u32le(&e, 8) as usize + 20 * (0x30 - 0x2f);
+            // offsets count in the file without its markers; 36 blocks (0x6C0 bytes) reach into
+            // the image at 0x400, so the markers come out of the image's start too
+            let off = u32le(&e, 8) as usize;
             let len = u32le(&e, 12) as usize;
-            return file.get(off..off + len).map(|s| s.to_vec()).ok_or("truncated package".into());
+            let mut stream = hdr.clone();
+            stream.extend_from_slice(&file[blocks * 0x30..]);
+            return stream.get(off..off + len).map(|s| s.to_vec()).ok_or("truncated package".into());
         }
     }
     Err("no flash image in the package".into())
@@ -132,17 +167,34 @@ fn unscramble(buf: &mut [u8], from: usize, len: usize, base: usize, key: u16) {
 }
 
 pub fn unpack(file: &[u8]) -> Result<Unpacked, String> {
-    let raw = raw_flash(file)?;
+    let (blocks, identity) = container(file);
+    // (a data byte past the header can read as 0x7D: then the counted header is too long and
+    // nothing in the image checks out; 20 blocks is the fallback, as installers do)
+    match unpack_n(file, blocks) {
+        Err(_) if blocks != 20 => unpack_n(file, 20),
+        r => r,
+    }
+    .map(|u| Unpacked { identity, ..u })
+}
+
+fn unpack_n(file: &[u8], blocks: usize) -> Result<Unpacked, String> {
+    let raw = raw_flash_n(file, blocks)?;
     let mut flash = raw.clone();
     let (mut key, mut area) = (None, None);
+    // (an isd_config.ini whose CRC does not check: SMK-37 stock packages store wrong CRCs for
+    // their small resource files, fm1-to-smk37 docs/02 2.2; taken when no checked one is found)
+    let mut key_unchecked = None;
     let mut o = 32;
     while o + 32 <= flash.len() {
         unmask(&mut flash[o..o + 32], 0xffff);
         let h = head(&flash, o);
-        if h.name == "isd_config.ini" && h.offset + 34 <= flash.len()
-            && crc16(&flash[h.offset..h.offset + 32]) == u16le(&flash, h.offset + 32)
-        {
-            key = Some(chip_key(&flash[h.offset..h.offset + 32]));
+        if h.name == "isd_config.ini" && h.offset + 34 <= flash.len() {
+            let k = chip_key(&flash[h.offset..h.offset + 32]);
+            if crc16(&flash[h.offset..h.offset + 32]) == u16le(&flash, h.offset + 32) {
+                key = Some(k);
+            } else {
+                key_unchecked = Some(k);
+            }
         }
         if h.name == "app_dir_head" && h.flags == 0x81 && area.is_none() {
             area = Some(h.offset);
@@ -152,7 +204,7 @@ pub fn unpack(file: &[u8]) -> Result<Unpacked, String> {
         }
         o += 32;
     }
-    let (Some(key), Some(area)) = (key, area) else {
+    let (Some(key), Some(area)) = (key.or(key_unchecked), area) else {
         return Err("no chip key or app area in the flash image".into());
     };
     let first = ((area + 32 + 31) & !31) - area;
@@ -178,7 +230,31 @@ pub fn unpack(file: &[u8]) -> Result<Unpacked, String> {
     if !dir.iter().any(|h| h.name == "app.bin") {
         return Err("no app.bin in the app area".into());
     }
-    Ok(Unpacked { raw, xip: flash[area..].to_vec(), area, dir })
+    Ok(Unpacked { identity: String::new(), raw, xip: flash[area..].to_vec(), area, dir })
+}
+
+/// The SMK-37's factory calibration record (USRTRIM, flash 0xC1000; fm1-to-smk37 docs/01, 2.1):
+/// 16 pad and 37 key velocity curves and a pedal curve, 5 rising points each, and the marker
+/// `trimdat\0` at +0x224. A real unit carries its own; with none, the stock firmware writes
+/// these defaults over the sector and ports fall back to them in RAM. Fills a blank record.
+pub fn smk_trim_fill_defaults(flash: &mut [u8]) {
+    const AT: usize = 0xc1000;
+    if flash.len() < AT + 0x22c || flash[AT + 0x224..AT + 0x22c] == *b"trimdat\0" {
+        return;
+    }
+    let mut put = |o: usize, v: &[u16]| {
+        for (i, x) in v.iter().enumerate() {
+            flash[AT + o + 2 * i..AT + o + 2 * i + 2].copy_from_slice(&x.to_le_bytes());
+        }
+    };
+    for p in 0..16 {
+        put(0x08 + p * 10, &[50, 550, 720, 850, 950]);
+    }
+    for k in 0..37 {
+        put(0xa8 + k * 10, &[5, 640, 800, 920, 980]);
+    }
+    put(0x21a, &[20, 850, 920, 980, 1010]);
+    flash[AT + 0x224..AT + 0x22c].copy_from_slice(b"trimdat\0");
 }
 
 /// The patch bank inside the USR area: 128 voices of 128 bytes (DX7 VMEM, a packed voice
@@ -312,4 +388,26 @@ pub fn usr_load_syx(flash: &mut [u8], usr: usize, syx: &[u8], first: usize) -> R
         }
     }
     Ok(n)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A header of `n` blocks whose markers spell `id` (then 0x7D), followed by data.
+    fn header(id: &str, n: usize) -> Vec<u8> {
+        let mut f = vec![0u8; n * 0x30 + 0x100];
+        for i in 0..n {
+            f[i * 0x30 + 0x2f] = id.as_bytes().get(i).map_or(0x7d, |&c| c.wrapping_add(i as u8 + 1));
+        }
+        // the byte after the header (block n's marker position) must not read as 0x7D
+        f[n * 0x30 + 0x2f] = 0x12;
+        f
+    }
+
+    #[test]
+    fn container_counts_blocks_and_reads_the_identity() {
+        assert_eq!(container(&header("FM-1_015", 20)), (20, "FM-1_015".to_string()));
+        assert_eq!(container(&header("SMK-37 Pro_016", 36)), (36, "SMK-37 Pro_016".to_string()));
+    }
 }

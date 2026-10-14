@@ -34,8 +34,8 @@ struct Machine {
 }
 
 impl Machine {
-    /// `stock_flash`: M-VAVE's firmware, whose flash chip and boot parameters come along.
-    fn new(image: Vec<u8>, entry: u32, mhz: u32, stock_flash: Option<&[u8]>) -> Self {
+    /// `stock`: a package's flash (its chip and boot parameters come along) and board.
+    fn new(image: Vec<u8>, entry: u32, mhz: u32, stock: Option<(&[u8], fm1_soc::Board)>) -> Self {
         let mut soc = Soc::new(RAM_SIZE, image);
         soc.periph.hz = mhz as u64 * 1_000_000;
         soc.periph.skip_idle = true;
@@ -46,8 +46,8 @@ impl Machine {
         let params = RAM_BASE + 0x7fc00;
         soc.write32(params, params + 0x40);
         cpu.regs[0] = params;
-        if let Some(f) = stock_flash {
-            cpu.regs[0] = fm1_soc::stock_boot(&mut soc, f, params);
+        if let Some((f, board)) = stock {
+            cpu.regs[0] = fm1_soc::stock_boot(&mut soc, f, params, board);
         }
         Machine { cpu, cpu1: None, soc, pending_tick: false, audio: VecDeque::new(), halted: false }
     }
@@ -103,7 +103,7 @@ pub extern "C" fn fm1_boot_fwsc(ptr: *mut u8, len: u32, syx: *mut u8, syx_len: u
     let bank = (syx_len != 0).then(|| unsafe { Vec::from_raw_parts(syx, syx_len as usize, syx_len as usize) });
     match fm1_soc::stock_from_package(&pkg, bank.as_deref()) {
         Ok(st) => {
-            unsafe { M = Some(Machine::new(st.xip, st.entry, mhz, Some(&st.flash))) };
+            unsafe { M = Some(Machine::new(st.xip, st.entry, mhz, Some((&st.flash, st.board)))) };
             0
         }
         Err(_) => 1,

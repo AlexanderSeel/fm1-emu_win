@@ -30,6 +30,7 @@ mod lcd;
 pub mod machine;
 pub mod periph;
 mod ram;
+pub mod smk;
 mod spiflash;
 
 pub use lcd::{write_bmp, Lcd};
@@ -84,7 +85,30 @@ enum Region {
 }
 
 /// The SoC bus: XIP flash + data RAM + modeled peripherals + a logged stub.
+/// The board around the chip: the FM-1's panel, or the SMK-37's (SMK-37 Pro / Elite, MKE-P37
+/// and Starrykey 37 Play share one: fm1-to-smk37 docs/01-hardware.md). Same chip, flash
+/// layout, audio and update path; the panel's wiring differs (smk.rs).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Board {
+    #[default]
+    Fm1,
+    Smk37,
+}
+
+impl Board {
+    /// The board a package is for, from its identity (`FM-1_015`, `SMK-37 Pro_016`, ...).
+    pub fn of_identity(id: &str) -> Board {
+        let u = id.to_ascii_uppercase();
+        if ["SMK", "MKE", "STARRYKEY"].iter().any(|p| u.starts_with(p)) {
+            Board::Smk37
+        } else {
+            Board::Fm1
+        }
+    }
+}
+
 pub struct Soc {
+    pub board: Board,
     pub xip: Vec<u8>,
     pub ram: Ram,
     pub lcd: Lcd,
@@ -153,6 +177,7 @@ impl Soc {
     /// `ram_size` in bytes; `xip` = the app binary mapped at XIP_BASE.
     pub fn new(ram_size: usize, xip: Vec<u8>) -> Self {
         Self {
+            board: Board::Fm1,
             xip,
             ram: Ram::new(ram_size),
             ovl: Ram::new(512 * 1024),
@@ -172,6 +197,15 @@ impl Soc {
             xip_flash: true,
             gpio_writes: std::env::var("FM1_GPIO_TRACE").ok().map(|_| Default::default()),
             unknown_log: Vec::new(),
+        }
+    }
+
+    /// Wire the chip into `board`'s panel (and its flash chip's id).
+    pub fn set_board(&mut self, board: Board) {
+        self.board = board;
+        self.periph.board = board;
+        if board == Board::Smk37 {
+            self.flash.jedec = [0xeb, 0x60, 0x14];
         }
     }
 
@@ -286,9 +320,10 @@ impl Soc {
             }
             0x11d04 => self.sfr_set(addr, value), // BAUD
             0x11d08 => {
-                // BUF: single byte, D/C = PC8 state
-                let pc = self.sfr_get(0x50080);
-                self.lcd.feed(value as u8, pc & 0x100 != 0);
+                // BUF: single byte, D/C = PC8 state (SMK-37: PB5; its group B is the pad LEDs)
+                if let Some(dc) = self.lcd_dc() {
+                    self.lcd.feed(value as u8, dc);
+                }
                 self.sfr_set(addr, value);
                 self.spi1_done();
             }
@@ -296,17 +331,30 @@ impl Soc {
             0x11d10 => {
                 // CNT: DMA `value` bytes from RAM[ADR] through the panel
                 let adr = self.sfr_get(0x11d0c);
-                let pc = self.sfr_get(0x50080);
                 let n = value.min(0x40000);
                 // the DMA source is a bus address (RAM, SRAM or XIP)
                 let bytes: Vec<u8> = (0..n).map(|i| self.read8(adr.wrapping_add(i))).collect();
-                for b in bytes {
-                    self.lcd.feed(b, pc & 0x100 != 0);
+                match self.lcd_dc() {
+                    Some(dc) => {
+                        for b in bytes {
+                            self.lcd.feed(b, dc);
+                        }
+                    }
+                    None => self.periph.smk.pad_frame(&bytes),
                 }
                 self.sfr_set(addr, 0);
                 self.spi1_done();
             }
             _ => self.sfr_set(addr, value),
+        }
+    }
+
+    /// Where SPI1's bytes go: the LCD with its D/C pin's state (FM-1: PC8; SMK-37: PB5, while
+    /// IOMAP_CON1 bit 4 picks pin group A), or None: the SMK-37's pad LEDs (group B).
+    fn lcd_dc(&mut self) -> Option<bool> {
+        match self.board {
+            Board::Fm1 => Some(self.sfr_get(0x50080) & 0x100 != 0),
+            Board::Smk37 => (self.sfr_get(0x51020) & 0x10 == 0).then(|| self.sfr_get(0x50040) & 0x20 != 0),
         }
     }
 
@@ -717,24 +765,33 @@ pub struct Stock {
     pub xip: Vec<u8>,
     pub flash: Vec<u8>,
     pub entry: u32,
+    /// The board the package is for (its identity), with its identity.
+    pub board: Board,
+    pub identity: String,
 }
 
 pub fn stock_from_package(pkg: &[u8], syx: Option<&[u8]>) -> Result<Stock, String> {
     let u = fwsc::unpack(pkg)?;
+    let board = Board::of_identity(&u.identity);
     let mut flash = fwsc::full_flash(&u.raw, FLASH_SIZE);
-    if let Some(usr) = fwsc::usr_offset(&u) {
+    if board == Board::Smk37 {
+        // a unit's factory calibration record, with the stock defaults
+        fwsc::smk_trim_fill_defaults(&mut flash);
+    }
+    if let Some(usr) = fwsc::usr_offset(&u).filter(|_| board == Board::Fm1) {
         fwsc::usr_fill_defaults(&mut flash, usr);
         if let Some(b) = syx {
             fwsc::usr_load_syx(&mut flash, usr, b, 0)?;
         }
     }
     let app = u.entry("app.bin").map(|h| h.offset).unwrap_or(0x120);
-    Ok(Stock { xip: u.xip, flash, entry: XIP_BASE + app as u32 })
+    Ok(Stock { xip: u.xip, flash, entry: XIP_BASE + app as u32, board, identity: u.identity })
 }
 
-/// Ready a Soc for the stock firmware: its flash chip, and the SPL's boot parameters at
-/// `params`. Returns the value for r0.
-pub fn stock_boot(soc: &mut Soc, flash: &[u8], params: u32) -> u32 {
+/// Ready a Soc for a package's firmware: its board, its flash chip, and the SPL's boot
+/// parameters at `params`. Returns the value for r0.
+pub fn stock_boot(soc: &mut Soc, flash: &[u8], params: u32, board: Board) -> u32 {
+    soc.set_board(board);
     soc.flash.load(flash);
     soc.xip_flash = true;
     write_boot_info(soc, params, flash)

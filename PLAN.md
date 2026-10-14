@@ -463,6 +463,37 @@ In Chrome, Melodee at 240 MHz went from ~122% of the audio thread (dropouts) to 
   blocks; the same count would let it, with the flag check in its inline stores); careful pairs
   (a pair head whose second instruction reads its result) stay interpreted in both JITs.
 
+## 5.14 The SMK-37 board: its community ports run (2026-10-14)
+
+M-VAVE's SMK-37 (Pro / Elite, MKE-P37, Donner Starrykey 37 Play) has the FM-1's chip, flash layout,
+audio and update path; only the panel's wiring differs. genkigenki's fm1-to-smk37 kit documents it
+(docs/01-hardware.md: each fact verified on a unit or read from the stock firmware) and has ported
+14 firmwares (genkigenki.github.io/smk37). `Board::{Fm1, Smk37}` picks the wiring, from the package's
+identity (`SMK-37 Pro_016`); every FM-1 path is unchanged (all firmwares byte-identical, native and
+wasm).
+
+- `fm1-soc/src/smk.rs`: the 16 x 8 matrix (four 595s by SPI2, a 32-bit word latched on PA1; rows on
+  PA2, PA5-7, PA9, PH6, PH8, PH9): 37 keys with two contacts (the second closes `smk_vel` after the
+  first: the velocity), 18 buttons, 8 encoders; three 8:1 analog muxes on ADC 1 / 8 / 2 (pads,
+  faders, wheels, pedal, battery) addressed by the word's bits 5..3; the 16 RGB pad LEDs (WS2812
+  frames on SPI1 group B, GRB). SPI1 group A is the LCD with D/C on PB5. Flash id EB 60 14 and a
+  default calibration record (USRTRIM, `trimdat`).
+- The map's matrix codes are in the reference port's column numbering: it reads a column's rows
+  before latching the next word, so code column c is the word selecting c - 1. Taken literally the
+  keys came out scrambled (k0 played A#3: its contacts read as k1's first and k10's second).
+- Packages: the header has as many blocks as its markers say (36 for SMK-37 Pro v016) and spells
+  the identity; 36 blocks reach into the image at 0x400, whose start then loses its markers too.
+  Stock SMK packages store wrong CRCs for their small files: an unchecked isd_config.ini is taken.
+- Three decoder gaps (the corpora's offsets / masks): `4x ff 00 AB oo oo` register-compare branches
+  with a 16-bit offset (route 13; 3004 corpus samples), `d5 e8` pops of pc and a register mask
+  (route 28; 54), `d4 e9` word loads / stores at sp + off (new route 33; 20620).
+- All 14 ports boot, draw and play (Snoop37, X0X, FoMni, GHOULBOX, ORBIT, AMB, ChoralRoot, Rainbow,
+  MAKU, Makkuro37, ObervaVe, Polly, Vector37, Winamp); 37 keys checked as a chromatic scale on
+  GHOULBOX; Snoop37's splash animates the pads. Snoop37's idle sound is its boot jingle.
+- M-VAVE's own SMK-37 firmware unpacks and runs but stays black (90% of its time in one interrupt):
+  its drivers want more of the board than the ports do.
+- Next: the front panel (native and the page), the catalog, button LEDs, MIDI out (UART1 TX on PC7).
+
 ## 6. Phase 5 — Boot & integration
 
 - Boot stock firmware to a stable idle/main-loop state.

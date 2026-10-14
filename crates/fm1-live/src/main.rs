@@ -168,7 +168,7 @@ impl Machine {
         soc.write32(params, params + 0x40);
         cpu.regs[0] = params;
         if let Some(st) = &stock {
-            cpu.regs[0] = fm1_soc::stock_boot(&mut soc, &st.flash, params);
+            cpu.regs[0] = fm1_soc::stock_boot(&mut soc, &st.flash, params, st.board);
         }
         let skip_log = std::env::var("FM1_SKIP_LOG").ok().map(|_| Default::default());
         let blocks = std::env::var("FM1_NO_BLOCKS").is_err();
@@ -417,7 +417,12 @@ fn script_keys(m: &mut Machine) -> bool {
             }
             let id = rest;
             let (id, down) = match id.trim().strip_suffix('^') { Some(i) => (i, false), None => (id.trim(), true) };
-            if let (Ok(t), Ok(id)) = (t.trim().parse::<u64>(), id.parse::<u8>()) {
+            // a number, or a name on this board's panel (FM-1: `PLAY`, `C4`; SMK-37: `seqplay`, `k12`)
+            let id = id.parse::<u8>().ok().or_else(|| match m.soc.board {
+                fm1_soc::Board::Smk37 => fm1_soc::smk::key_id(id),
+                fm1_soc::Board::Fm1 => fm1_soc::periph::key_id(id),
+            });
+            if let (Ok(t), Some(id)) = (t.trim().parse::<u64>(), id) {
                 let at = m.soc.periph.cycle_of_ms(t);
                 m.soc.periph.script.push_back((at, Action::Key { id, down }));
             }
@@ -507,6 +512,11 @@ fn shot(o: &Opts, ms: u64) {
     }
     let fr: Vec<String> = (0..41).filter(|&i| leds[i] > 0.0).map(|i| format!("{i}:{:.3}", leds[i])).collect();
     println!("LED on-fractions: {}", fr.join(" "));
+    if m.soc.board == fm1_soc::Board::Smk37 {
+        let p = &m.soc.periph.smk;
+        let pads: Vec<String> = p.pads.iter().map(|c| format!("{c:06x}")).collect();
+        println!("SMK-37 pads ({} frames): {}", p.pad_frames, pads.join(" "));
+    }
     let st = panel::State {
         lcd: &m.soc.lcd.fb,
         enc_clicks: &[0, 0, 0, 3, -2, 0, 5],

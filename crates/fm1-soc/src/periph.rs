@@ -204,9 +204,16 @@ pub struct Periph {
     led_last: u64,
     led_since: u64,
     pub keys_down: [bool; 41],
-    enc_state: [u8; 7],
-    enc_pending: [i32; 7],
-    enc_next: [u64; 7],
+    enc_state: [u8; 8],
+    enc_pending: [i32; 8],
+    enc_next: [u64; 8],
+    /// The panel around the chip: the FM-1's (above), or the SMK-37's (`smk`).
+    pub board: crate::Board,
+    pub smk: crate::smk::Panel,
+    /// SMK-37: cycles between a key's first and second contact (its velocity; less is harder).
+    pub smk_vel: u64,
+    /// SMK-37: the ADC's last conversion (taken when it starts, from the mux then latched).
+    adc_sample: u16,
     /// Scheduled front-panel actions: (cycle, action).
     pub script: VecDeque<(u64, Action)>,
 }
@@ -279,9 +286,13 @@ impl Default for Periph {
             led_last: 0,
             led_since: 0,
             keys_down: [false; 41],
-            enc_state: [0; 7],
-            enc_pending: [0; 7],
-            enc_next: [0; 7],
+            enc_state: [0; 8],
+            enc_pending: [0; 8],
+            enc_next: [0; 8],
+            board: crate::Board::Fm1,
+            smk: crate::smk::Panel::default(),
+            smk_vel: CPU_HZ / 1000 * 3,
+            adc_sample: 0,
             script: VecDeque::new(),
         }
     }
@@ -337,7 +348,9 @@ impl Periph {
     }
 
     fn enc_step(&self) -> u64 {
-        self.hz / 500 // contacts move one quadrature state every 2 ms
+        // contacts move one quadrature state every 2 ms (SMK-37: 4 ms, the port's decoder takes a
+        // state once it has held for two 1.6 ms scan frames)
+        if self.board == crate::Board::Smk37 { self.hz / 250 } else { self.hz / 500 }
     }
 
     /// The next cycle at which something timed happens.
@@ -350,7 +363,7 @@ impl Periph {
         if let Some((at, _)) = self.script.front() {
             n = n.min(*at);
         }
-        for i in 0..7 {
+        for i in 0..8 {
             if self.enc_pending[i] != 0 {
                 n = n.min(self.enc_next[i]);
             }
@@ -415,7 +428,7 @@ impl Periph {
                 self.uart_update();
             }
         }
-        for i in 0..7 {
+        for i in 0..8 {
             if self.enc_pending[i] != 0 && self.cycles >= self.enc_next[i] {
                 let s = self.enc_state[i] as i32;
                 self.enc_state[i] = ((s + self.enc_pending[i].signum()) & 3) as u8;
@@ -439,12 +452,15 @@ impl Periph {
         self.next_due = 0;
         match *a {
             Action::Key { id, down } => {
-                if (id as usize) < 41 {
+                if self.board == crate::Board::Smk37 {
+                    self.smk.key(id, down, self.cycles, self.smk_vel);
+                } else if (id as usize) < 41 {
                     self.keys_down[id as usize] = down;
                 }
             }
             Action::Enc { enc, clicks } => {
-                if (enc as usize) < 7 {
+                let n = if self.board == crate::Board::Smk37 { crate::smk::NENC } else { 7 };
+                if (enc as usize) < n {
                     // one detent = one full quadrature cycle (4 transitions);
                     // clockwise runs the Gray sequence backwards (Felucca
                     // flips the stock decoder's sign: + = clockwise)
@@ -452,6 +468,7 @@ impl Periph {
                     self.enc_next[enc as usize] = self.cycles;
                 }
             }
+            Action::Adc { ch, value } if self.board == crate::Board::Smk37 => self.smk.set_analog(ch, value),
             Action::Adc { ch, value } => {
                 if (ch as usize) < 16 {
                     self.adc_value[ch as usize] = value.min(1023);
@@ -667,6 +684,7 @@ impl Periph {
             // (Felucca's `|= 0x40` read-modify-write must keep it); the stock scan's "skip
             // while bit 4" passes because its IRQ 24 handler writes CON = 0x40, then 0.
             0x13100 => (self.adc_con & !0x80) | if self.adc_done { 0x80 } else { 0 },
+            0x13104 if self.board == crate::Board::Smk37 => self.adc_sample as u32,
             0x13104 => self.adc_value[((self.adc_con >> 8) & 0xf) as usize] as u32,
             // the latch's set word reads the pending bits; its clear word reads 0: the stock
             // IRQ 122 handler acknowledges with `[0x1EEF1A4] |= 4`, and a read-back of every
@@ -696,6 +714,8 @@ impl Periph {
             0x12124 => self.uart.rxcnt,
             0x12110 => self.uart.otcnt,
             0x12128 => self.uart.hrxcnt,
+            0x50004 if self.board == crate::Board::Smk37 => self.smk_pa_in(),
+            0x501c4 if self.board == crate::Board::Smk37 => self.smk_ph_in(),
             0x50004 => self.pa_in(),
             0x50044 => self.pb_in(),
             _ => return None,
@@ -769,6 +789,11 @@ impl Periph {
                     if v & 0x10 != 0 {
                         self.adc_done = true;
                         self.adc_irq = v & 0x20 != 0;
+                        // SMK-37: sampled now, from the mux address latched now
+                        if self.board == crate::Board::Smk37 {
+                            let ch = (v >> 8) & 0xf;
+                            self.adc_sample = self.smk.adc(ch).unwrap_or(self.adc_value[ch as usize]);
+                        }
                     } else {
                         self.adc_done = false;
                         self.adc_irq = false;
@@ -833,6 +858,14 @@ impl Periph {
                 self.uart_update();
                 return false;
             }
+            0x50000 if self.board == crate::Board::Smk37 => {
+                // PA1's rising edge latches the 595 chain (SPI2 shifts it)
+                if self.pa_out & 2 == 0 && v & 2 != 0 {
+                    self.smk.latch();
+                }
+                self.pa_out = v;
+            }
+            0x501c0 if self.board == crate::Board::Smk37 => self.ph_out = v,
             0x50000 => {
                 self.led_credit();
                 self.pa_write(v);
@@ -921,6 +954,9 @@ impl Periph {
     /// the matrix columns this way; Felucca bit-bangs SER/SRCLK on PA4/PA3). RCLK (PA1)
     /// still latches.
     pub fn sr_shift_byte(&mut self, b: u8) {
+        if self.board == crate::Board::Smk37 {
+            return self.smk.spi2_byte(b);
+        }
         for bit in (0..8).rev() {
             self.sr_shift = (self.sr_shift << 1) | ((b >> bit) & 1) as u16;
         }
@@ -970,6 +1006,28 @@ impl Periph {
         // row 0 = PA0, rows 1-4 = PA5..PA8; everything else reads as pulled up
         let low = (r & 1) | ((r & 0x1e) << 4);
         (self.pa_out | 0xffff) & !low
+    }
+
+    /// SMK-37: the matrix rows closed in the latched column(s).
+    fn smk_rows(&self) -> u32 {
+        self.smk.rows(self.cycles, |i| {
+            let (a, b) = GRAY[self.enc_state[i] as usize];
+            (a != 0, b != 0)
+        })
+    }
+
+    /// SMK-37 rows 0..4 on PA2, PA5..PA7, PA9 (pulled up: low = closed).
+    fn smk_pa_in(&self) -> u32 {
+        let r = self.smk_rows();
+        let low = (r & 1) << 2 | (r & 0xe) << 4 | (r & 0x10) << 5;
+        (self.pa_out | 0xffff) & !low
+    }
+
+    /// SMK-37 rows 5..7 on PH6, PH8, PH9.
+    fn smk_ph_in(&self) -> u32 {
+        let r = self.smk_rows();
+        let low = (r & 0x20) << 1 | (r & 0xc0) << 2;
+        (self.ph_out | 0xffff) & !low
     }
 
     fn pb_in(&self) -> u32 {

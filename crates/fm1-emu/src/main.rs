@@ -278,7 +278,7 @@ fn main() -> ExitCode {
         cpu.regs[0] = fm1_soc::write_boot_info(&mut soc, params, f);
     }
     if let Some(st) = &stock {
-        cpu.regs[0] = fm1_soc::stock_boot(&mut soc, &st.flash, params);
+        cpu.regs[0] = fm1_soc::stock_boot(&mut soc, &st.flash, params, st.board);
     }
     if let Some(ms) = args.ms {
         args.steps = soc.periph.cycle_of_ms(ms);
