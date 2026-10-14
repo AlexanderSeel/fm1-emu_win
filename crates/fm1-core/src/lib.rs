@@ -97,6 +97,25 @@ fn ram_code<B: Bus>(bus: &mut B, pc: u32) -> Option<&'static [u8]> {
     Some(unsafe { std::slice::from_raw_parts(m.ram.add(off as usize), (m.ram_len - off) as usize) })
 }
 
+/// a == b (equal lengths). RAM blocks are checked against memory on every entry: in wasm,
+/// 8 bytes at a time, since its `memcmp` (compiler_builtins) goes a byte at a time (a fifth of
+/// Melodee's time in the browser: its audio code runs from RAM); natively the platform's
+/// `memcmp` is faster than this loop (Melodee 16% slower with it).
+#[inline]
+fn same_bytes(a: &[u8], b: &[u8]) -> bool {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let (a8, b8) = (a.chunks_exact(8), b.chunks_exact(8));
+        let (ra, rb) = (a8.remainder(), b8.remainder());
+        let w = |c: &[u8]| u64::from_le_bytes(c.try_into().unwrap());
+        a8.zip(b8).all(|(x, y)| w(x) == w(y)) && ra.iter().zip(rb).all(|(x, y)| x == y)
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        a == b
+    }
+}
+
 /// CPU architectural state.
 #[derive(Debug, Default)]
 pub struct Cpu {
@@ -551,7 +570,7 @@ impl Cpu {
     fn ram_block_current<B: Bus>(&self, bus: &mut B, id: usize) -> bool {
         let (pc, ..) = self.blocks[id];
         match (self.bbytes.get(id).and_then(|b| b.as_deref()), ram_code(bus, pc)) {
-            (Some(was), Some(now)) => now.len() >= was.len() && &now[..was.len()] == was,
+            (Some(was), Some(now)) => now.len() >= was.len() && same_bytes(&now[..was.len()], was),
             _ => false,
         }
     }

@@ -1,7 +1,8 @@
 // Speed of the WebAssembly build: [FM1_FW=image.xip.bin | FM1_FWSC=package.fwsc] node web/bench.mjs [mhz] [seconds] [out.raw]
+// (FM1_WASM=file.wasm: another build than target/wasm's, for A/B comparisons)
 import { readFileSync } from "node:fs";
 const mhz = +(process.argv[2] || 120), secs = +(process.argv[3] || 6);
-const wasm = readFileSync(new URL("../target/wasm/wasm32-unknown-unknown/release/fm1_web.wasm", import.meta.url));
+const wasm = readFileSync(process.env.FM1_WASM || new URL("../target/wasm/wasm32-unknown-unknown/release/fm1_web.wasm", import.meta.url));
 const { jitImports } = await import("./jit.js");
 let x;
 const { instance } = await WebAssembly.instantiate(wasm, { env: jitImports(() => x) });
