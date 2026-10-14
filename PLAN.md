@@ -413,6 +413,56 @@ byte time (320 us); at most a second's worth wait (a USB keyboard can send faste
 - The catalog's packages can be found by a `manifest` (ORBIT's manifest.json, FiMba-1's
   latest.json) or `embedded` in the installer page (April OS's base64 `DEFAULT_FIRMWARE`).
 
+## 5.13 Speed pass 2: RAM code in the browser; the page says when a device can't keep up (2026-10-14)
+
+Android users found the page too slow. Melodee was the one firmware under real time in wasm
+(0.95x at 240 MHz): its audio code runs from RAM, and compiled code ran 3.3 instructions per
+entry there (others 16-21): a wasm region took a RAM block only as its start, every RAM block
+was compared with memory on every entry, and wasm's memcmp goes a byte at a time.
+
+Real-time factor at 240 MHz in the wasm build (node), before -> after (interleaved A/B):
+
+| Melodee | stock V13 | X0X | Felucca | GHOULBOX | others |
+|---|---|---|---|---|---|
+| 0.90x -> 2.47x | ~3.0x -> 3.7x | 1.58x -> 1.68x | +4% | ~0 | within noise (+-3%) |
+
+In Chrome, Melodee at 240 MHz went from ~122% of the audio thread (dropouts) to ~39%.
+
+- RAM keeps a flag per 4-byte word of code blocks were built from (`Ram::mark_code`, through
+  `Bus::code_mark`) and counts writes to flagged words (`Bus::code_writes`). In the wasm build a
+  RAM block is compared with memory only when that count moved since it was last found current
+  (`Cpu::ram_block_ok`); the comparison itself goes 8 bytes at a time there (natively the
+  platform memcmp is faster than that loop). Natively nothing changes: the AArch64 JIT's inline
+  stores do not look at the flags, so the count is not used there.
+- wasm regions now include RAM blocks: each region keeps its RAM blocks and the count they were
+  checked at, and is checked again on entry when it moved (`wasm_region_ok`; a changed one is
+  dropped and its blocks compile anew). Inline stores to a flagged word take the bus, and a write
+  that moved the count leaves the region right after the instruction.
+- Words, not 256-byte pages: no difference measured, but the stock firmware's cpu1 keeps data
+  near its RAM code. What made stock 2x slower at first was cpu1's idle probe: it runs a block
+  at a time to find its polling loop's start again, and compiled code, limited only by the tick
+  horizon, now ran past it through the region. Compiled code now also keeps the caller's
+  instruction budget (whole blocks: the first always, more while they fit), as the interpreter.
+- Compiled in wasm instead of the helper (`h_op`): `PushRets` / `PopPc` (function prologue and
+  epilogue: ~20% of stock cpu1's instructions went through the helper), `MemA4`, `BitExt`,
+  `BitIns`, `Mov2`, `Mov2I`, `cli`. The helper calls left: `sti` / `icfg` (the interrupt
+  window), FOp (NaN payloads must match), Tb, Raw routes.
+- Tried and dropped: wasm SIMD (`+simd128`) and binaryen `wasm-opt -O3`: both within noise.
+- Checks: every firmware's wasm audio byte-identical to before (21 + stock, 4-6 s at 240 MHz),
+  native audio byte-identical (`tools/bench_all.sh` REF), JIT == interpreter == per step.
+  (Melodee's per-step run differs as before this pass: it runs both cores.)
+- `web/bench.mjs` takes `FM1_WASM=file.wasm` for A/B runs of two builds.
+- The page measures how it keeps up: the worklet times each quantum's emulation, the status
+  line shows the load (its share of the audio thread), and the audio clock's drift against the
+  wall clock (`getOutputTimestamp`) shows dropouts. Three seconds of either after warm-up bring
+  up a warning with the fix: the highest clock that fits (load x 1.25), or a larger audio
+  buffer (`latencyHint: "playback"`, remembered) when it drops out with time to spare; "Copy a
+  report" gives device, browser, audio setup and load for a bug report. Chrome's CPU throttling
+  does not reach the audio thread; `?mhz=700` overloads it for a test.
+- Next: Melodee is still the slowest natively (1.4x: the AArch64 JIT does not chain into RAM
+  blocks; the same count would let it, with the flag check in its inline stores); careful pairs
+  (a pair head whose second instruction reads its result) stay interpreted in both JITs.
+
 ## 6. Phase 5 — Boot & integration
 
 - Boot stock firmware to a stable idle/main-loop state.

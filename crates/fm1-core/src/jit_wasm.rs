@@ -45,14 +45,17 @@ pub(crate) const REGION_OPS: usize = 384;
 #[derive(Clone, Copy)]
 enum Entry {
     Cold(u32),
-    /// table index of the region's function, this block's index in it
-    In(u32, u32),
+    /// table index of the region's function, this block's index in it, the region's number
+    In(u32, u32, u32),
     No,
 }
 
 /// JIT state kept in the Cpu (per block id).
 pub struct Jit {
     state: Vec<Entry>,
+    /// Per region: its blocks over RAM, and the bus's count of code-word writes when they were
+    /// last all found current (`Cpu::wasm_region_ok`); a region found stale is dropped.
+    pub(crate) rinfo: Vec<(Box<[usize]>, u64)>,
     pub regions: u32,
     pub bytes: usize,
 }
@@ -65,7 +68,7 @@ impl std::fmt::Debug for Jit {
 
 impl Jit {
     pub fn new() -> Option<Jit> {
-        Some(Jit { state: Vec::new(), regions: 0, bytes: 0 })
+        Some(Jit { state: Vec::new(), rinfo: Vec::new(), regions: 0, bytes: 0 })
     }
 
     fn at(&mut self, id: usize) -> &mut Entry {
@@ -75,11 +78,11 @@ impl Jit {
         &mut self.state[id]
     }
 
-    /// Block `id`'s compiled code (function, start index); else counts the run, and true says the
-    /// block just became hot (form its region and `install` it, or `refuse`).
-    pub(crate) fn lookup(&mut self, id: usize) -> (Option<(u32, u32)>, bool) {
+    /// Block `id`'s compiled code (function, start index, region); else counts the run, and true
+    /// says the block just became hot (form its region and `install` it, or `refuse`).
+    pub(crate) fn lookup(&mut self, id: usize) -> (Option<(u32, u32, u32)>, bool) {
         match *self.at(id) {
-            Entry::In(f, k) => (Some((f, k)), false),
+            Entry::In(f, k, r) => (Some((f, k, r)), false),
             Entry::No => (None, false),
             Entry::Cold(c) if c + 1 < HOT => {
                 *self.at(id) = Entry::Cold(c + 1);
@@ -90,8 +93,9 @@ impl Jit {
     }
 
     /// Compile a region (blocks with their ids; the first is the hot one) and install it: every
-    /// block not yet in a region gets this one. False: it could not be compiled.
-    pub(crate) fn install<B: Bus>(&mut self, blocks: &[(usize, u32, Vec<crate::BOp>)], mem: &JitMem) -> bool {
+    /// block not yet in a region gets this one. `ver`: the bus's count of code-word writes, its
+    /// RAM blocks having just been found current. False: it could not be compiled.
+    pub(crate) fn install<B: Bus>(&mut self, blocks: &[(usize, u32, Vec<crate::BOp>)], mem: &JitMem, ver: u64) -> bool {
         COMPILE_BUDGET.fetch_sub(1, Ordering::Relaxed);
         let m = compile::<B>(blocks, mem);
         // SAFETY: a plain byte slice; the host copies it before returning
@@ -101,12 +105,25 @@ impl Jit {
         }
         self.regions += 1;
         self.bytes += m.len();
+        let r = self.rinfo.len() as u32;
+        let ram = blocks.iter().filter(|b| !(0x0200_0000..0x0400_0000).contains(&b.1)).map(|b| b.0).collect();
+        self.rinfo.push((ram, ver));
         for (k, (id, ..)) in blocks.iter().enumerate() {
             if !matches!(*self.at(*id), Entry::In(..)) {
-                *self.at(*id) = Entry::In(f, k as u32);
+                *self.at(*id) = Entry::In(f, k as u32, r);
             }
         }
         true
+    }
+
+    /// Region `r` ran from RAM that has changed: its blocks are hot again, to be compiled anew.
+    pub(crate) fn drop_region(&mut self, r: u32) {
+        for e in self.state.iter_mut() {
+            if matches!(*e, Entry::In(_, _, q) if q == r) {
+                *e = Entry::Cold(0);
+            }
+        }
+        self.rinfo[r as usize].0 = Box::new([]);
     }
 
     /// Block `id` stays interpreted.
@@ -117,6 +134,7 @@ impl Jit {
     /// Forget every compiled block (the block table was rebuilt; the table slots stay in use).
     pub fn reset(&mut self) {
         self.state.clear();
+        self.rinfo.clear();
     }
 }
 
@@ -133,13 +151,14 @@ pub struct Ctx {
     brk: u32,
 }
 
-/// Run compiled code: returns the instructions executed; cpu.pc is set.
+/// Run compiled code: returns the instructions executed; cpu.pc is set. At most `cap`
+/// instructions, as far as whole blocks go (the caller's budget, as the interpreter keeps it).
 ///
 /// # Safety
 /// `f` must come from `Jit::entry` for this bus type and memory map.
-pub(crate) unsafe fn run<B: Bus>(f: u32, start: u32, cpu: &mut Cpu, bus: &mut B, extra: u32) -> u32 {
+pub(crate) unsafe fn run<B: Bus>(f: u32, start: u32, cpu: &mut Cpu, bus: &mut B, extra: u32, cap: u32) -> u32 {
     // instructions this call may run: their ticks ((k - 1) + extra) must all fit tick_room
-    let limit = (bus.tick_room() + 1).saturating_sub(extra as u64).min(1 << 30) as u32;
+    let limit = (bus.tick_room() + 1).saturating_sub(extra as u64).min(1 << 30).min(cap as u64) as u32;
     let mut ctx = Ctx { cpu: cpu as *mut Cpu, bus: bus as *mut B as *mut (), extra, synced: 0, brk: 0 };
     // SAFETY: on wasm32 a function pointer is its index in the function table, where the host
     // installed this block's `run` with exactly this signature
@@ -186,12 +205,15 @@ extern "C" fn h_write<B: Bus>(ctx: *mut Ctx, addr: u32, v: u32, idx: u32, w: u32
     let ctx = unsafe { &mut *ctx };
     let bus = unsafe { &mut *(ctx.bus as *mut B) };
     unsafe { sync(ctx, bus, idx) };
+    let code = bus.code_writes();
     match w {
         1 => bus.write8(addr, v as u8),
         2 => bus.write16(addr, v as u16),
         _ => bus.write32(addr, v),
     }
-    if bus.next_tick_due() {
+    // (a write to a word of RAM code: this region may include what it changed, so leave; the
+    // next entry checks the region against memory)
+    if bus.next_tick_due() || bus.code_writes() != code {
         ctx.brk = 1;
     }
 }
@@ -601,7 +623,8 @@ impl Gen<'_> {
         self.end();
     }
 
-    /// store(w) of local val at guest address local addr: inline RAM, else the bus.
+    /// store(w) of local val at guest address local addr: inline RAM, else the bus (and so is a
+    /// store to a word of RAM code: the bus counts it, see `Bus::code_writes`).
     fn store(&mut self, w: u8, idx: u32) {
         let mem = *self.mem;
         self.get(L_ADDR);
@@ -620,6 +643,12 @@ impl Gen<'_> {
         }
         self.if_();
         self.get(L_OFF);
+        self.i32c(2);
+        self.op(I32_SHR_U);
+        self.mem_op(I32_LOAD8_U, 0, mem.ram_code as u32);
+        self.op(I32_EQZ);
+        self.if_();
+        self.get(L_OFF);
         self.get(L_VAL);
         match w {
             4 => self.mem_op(I32_STORE, 2, mem.ram as u32),
@@ -627,13 +656,21 @@ impl Gen<'_> {
             _ => self.mem_op(I32_STORE8, 0, mem.ram as u32),
         }
         self.op(ELSE);
+        self.store_bus(w, idx);
+        self.end();
+        self.op(ELSE);
+        self.store_bus(w, idx);
+        self.end();
+    }
+
+    /// the bus's write of local val at local addr
+    fn store_bus(&mut self, w: u8, idx: u32) {
         self.get(L_CTX);
         self.get(L_ADDR);
         self.get(L_VAL);
         self.idx(idx);
         self.i32c(w as u32);
         self.call_ind(TY_WRITE, self.h_write);
-        self.end();
     }
 
     /// local addr = base + off
@@ -781,6 +818,75 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
                 g.get(L_CPU);
                 g.alu(op);
                 g.mem_op(I32_STORE, 2, off_reg(d));
+            }
+            Fast::MemA4 { b, off, op, rk, rv } => {
+                // [R + off] = [R + off] op rhs: one read and one write, as the interpreter
+                g.rhs(rk, rv);
+                g.addr(Base::Reg(b), off as u32);
+                g.load(4, false, idx);
+                g.get(L_VAL);
+                g.set(L_A);
+                g.alu(op);
+                g.set(L_VAL);
+                g.store(4, idx);
+                bus_used = true;
+            }
+            Fast::BitExt { d, s, p, l, signed } => {
+                let (p, l) = (p as u32 & 31, l as u32 & 31);
+                g.get(L_CPU);
+                g.ld_reg(s);
+                g.i32c(p);
+                g.op(I32_SHR_U);
+                if signed {
+                    if l != 0 {
+                        g.i32c(32 - l);
+                        g.op(I32_SHL);
+                        g.i32c(32 - l);
+                        g.op(I32_SHR_S);
+                    }
+                } else {
+                    g.i32c(if l == 0 { u32::MAX } else { (1u32 << l).wrapping_sub(1) });
+                    g.op(I32_AND);
+                }
+                g.mem_op(I32_STORE, 2, off_reg(d));
+            }
+            Fast::BitIns { d, s, p, l } => {
+                let (p, l) = (p as u32 & 31, l as u32 & 31);
+                let mask = if l == 0 { u32::MAX } else { (1u32 << l).wrapping_sub(1) };
+                g.get(L_CPU);
+                g.ld_reg(d);
+                g.i32c(!(mask << p));
+                g.op(I32_AND);
+                g.ld_reg(s);
+                g.i32c(mask);
+                g.op(I32_AND);
+                g.i32c(p);
+                g.op(I32_SHL);
+                g.op(I32_OR);
+                g.mem_op(I32_STORE, 2, off_reg(d));
+            }
+            Fast::SetIe { on: false } => {
+                // `cli` (`sti` goes through the helper: it opens the bus's interrupt window)
+                g.get(L_CPU);
+                g.i32c(0);
+                g.mem_op(I32_STORE8, 0, offset_of!(Cpu, ie) as u32);
+            }
+            Fast::Mov2 { dh, dl, sh, sl } => {
+                // both read before either is written
+                g.ld_reg(sh);
+                g.set(L_A);
+                g.ld_reg(sl);
+                g.set(L_B);
+                g.st_reg_from(dh, L_A);
+                g.st_reg_from(dl, L_B);
+            }
+            Fast::Mov2I { dh, dl, v } => {
+                g.get(L_CPU);
+                g.i32c(v);
+                g.mem_op(I32_STORE, 2, off_reg(dl));
+                g.get(L_CPU);
+                g.i32c(((v as i32) >> 31) as u32);
+                g.mem_op(I32_STORE, 2, off_reg(dh));
             }
             Fast::Ext { d, s, part, signed } => {
                 g.get(L_CPU);
@@ -974,6 +1080,53 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
             }
             Fast::PopRet => {
                 // pc = [sp]; sp += 4
+                g.ld_field(off_sp());
+                g.set(L_ADDR);
+                g.load(4, false, idx);
+                g.get(L_CPU);
+                g.get(L_ADDR);
+                g.i32c(4);
+                g.op(I32_ADD);
+                g.mem_op(I32_STORE, 2, off_sp());
+                g.exit_local(L_VAL, count);
+                ended = true;
+            }
+            Fast::PushRets { n } => {
+                // a function's prologue, as the interpreter: rets, then r_top .. r_bot, each at
+                // sp -= 4 (a helper call between them sees the same sp)
+                let n = n as i32;
+                let (top, bot) = (n.max(3), n.min(4));
+                for r in std::iter::once(-1i32).chain((bot..=top).rev()) {
+                    g.ld_field(off_sp());
+                    g.i32c(4);
+                    g.op(I32_SUB);
+                    g.set(L_ADDR);
+                    g.st_field_from(off_sp(), L_ADDR);
+                    if r < 0 {
+                        g.ld_field(off_rets());
+                    } else {
+                        g.ld_reg(r as u8);
+                    }
+                    g.set(L_VAL);
+                    g.store(4, idx);
+                }
+                bus_used = true;
+            }
+            Fast::PopPc { n } => {
+                // its epilogue: r_bot .. r_top = [sp++] each, then pc = [sp++]
+                let n = n as i32;
+                let (top, bot) = (n.max(3), n.min(4));
+                for r in bot..=top {
+                    g.ld_field(off_sp());
+                    g.set(L_ADDR);
+                    g.load(4, false, idx);
+                    g.st_reg_from(r as u8, L_VAL);
+                    g.get(L_CPU);
+                    g.get(L_ADDR);
+                    g.i32c(4);
+                    g.op(I32_ADD);
+                    g.mem_op(I32_STORE, 2, off_sp());
+                }
                 g.ld_field(off_sp());
                 g.set(L_ADDR);
                 g.load(4, false, idx);

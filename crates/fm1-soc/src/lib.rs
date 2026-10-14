@@ -406,10 +406,17 @@ impl Bus for Soc {
             ram: self.ram.as_mut_ptr(),
             ram_base: RAM_BASE,
             ram_len: self.ram.len() as u32,
+            ram_code: self.ram.code_ptr(),
             xip: self.xip.as_ptr(),
             xip_base: XIP_BASE,
             xip_len: self.xip.len() as u32,
         })
+    }
+    fn code_writes(&self) -> Option<u64> {
+        Some(self.ram.code_writes)
+    }
+    fn code_mark(&mut self, lo: u32, hi: u32) {
+        self.ram.mark_code(lo.wrapping_sub(RAM_BASE), hi.wrapping_sub(RAM_BASE));
     }
     #[inline]
     fn tick_room(&self) -> u64 {

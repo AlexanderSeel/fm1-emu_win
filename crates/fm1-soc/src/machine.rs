@@ -49,6 +49,12 @@ impl Bus for Core1Bus<'_> {
     fn jit_mem(&mut self) -> Option<fm1_core::JitMem> {
         self.soc.jit_mem()
     }
+    fn code_writes(&self) -> Option<u64> {
+        self.soc.code_writes()
+    }
+    fn code_mark(&mut self, lo: u32, hi: u32) {
+        self.soc.code_mark(lo, hi)
+    }
     fn tick_room(&self) -> u64 {
         self.budget.saturating_sub(1)
     }

@@ -32,6 +32,8 @@ pub struct JitMem {
     pub ram: *mut u8,
     pub ram_base: u32,
     pub ram_len: u32,
+    /// RAM's code-word flags (the wasm JIT's inline stores; not used here)
+    pub ram_code: *const u8,
     pub xip: *const u8,
     pub xip_base: u32,
     pub xip_len: u32,

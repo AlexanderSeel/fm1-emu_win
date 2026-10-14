@@ -34,6 +34,9 @@ pub struct JitMem {
     pub ram: *mut u8,
     pub ram_base: u32,
     pub ram_len: u32,
+    /// RAM's code-word flags, one byte per 4 bytes (`Bus::code_writes`): the wasm JIT's inline
+    /// stores go to the bus for a flagged word.
+    pub ram_code: *const u8,
     pub xip: *const u8,
     pub xip_base: u32,
     pub xip_len: u32,
@@ -83,6 +86,13 @@ pub trait Bus {
     /// Interrupts may have just been unmasked (`sti`, `icfg = R`): with one pending, the run
     /// loop must look before the next instruction, as it does after a slow-path instruction.
     fn irq_window(&mut self) {}
+    /// Writes so far to RAM words marked as code (`code_mark`), when the bus counts them: while
+    /// the count stays the same, no block built from RAM can have changed. (None: compare.)
+    fn code_writes(&self) -> Option<u64> {
+        None
+    }
+    /// RAM bytes lo..hi hold code a block was built from: count writes to them from now on.
+    fn code_mark(&mut self, _lo: u32, _hi: u32) {}
 }
 
 /// The RAM from `pc` to its end, when the bus can show it (its JIT memory map), and pc is in it.
@@ -194,10 +204,15 @@ pub struct Cpu {
     bmap: Vec<u32>,
     /// Per block: for one over RAM code, the bytes it was built from. RAM can change (code
     /// copied in, overlays), so such a block is checked against memory before every entry
-    /// and rebuilt when they differ; compiled code never chains into one (`jit_body_at`).
+    /// and rebuilt when they differ; the AArch64 JIT never chains into one (`jit_body_at`), the
+    /// wasm JIT's regions include them, checked on entry (`wasm_region_ok`).
     /// The stock firmware's synth renders on cpu1 from RAM: without blocks it ran a step at
     /// a time.
     bbytes: Vec<Option<Box<[u8]>>>,
+    /// Per block over RAM, in the wasm build: the bus's count of code-word writes when the block
+    /// was last found current (`ram_block_ok`: the same count, no compare).
+    #[cfg(target_arch = "wasm32")]
+    bver: Vec<u64>,
     /// FM1_NO_RAM_BLOCKS: RAM code a step at a time (the reference)
     no_ram_blocks: bool,
     /// Instructions per execute route (index 31 = the micro-op fast path),
@@ -432,11 +447,13 @@ impl Cpu {
                         self.wjit = jit_wasm::Jit::new().map(Box::new);
                     }
                     let code = match self.wjit.as_mut().map(|j| j.lookup(id)) {
-                        Some((Some(c), _)) => Some(c),
+                        // (a region with RAM blocks runs only while they are what memory holds)
+                        Some((Some((f, at, r)), _)) => self.wasm_region_ok(bus, r).then_some((f, at)),
                         Some((None, true)) => {
                             // hot: compile its region (it runs from the next visit on)
                             let region = self.wasm_region(bus, id);
-                            let ok = !region.is_empty() && self.wjit.as_mut().is_some_and(|j| j.install::<B>(&region, &mem));
+                            let ver = bus.code_writes().unwrap_or(u64::MAX);
+                            let ok = !region.is_empty() && self.wjit.as_mut().is_some_and(|j| j.install::<B>(&region, &mem, ver));
                             if !ok {
                                 if let Some(j) = self.wjit.as_mut() {
                                     j.refuse(id);
@@ -449,8 +466,12 @@ impl Cpu {
                     if let Some((code, at)) = code {
                         let extra = if n == 0 { 0 } else { 1 };
                         sync!();
+                        // (the budget as the interpreter keeps it: this block whole, the region's
+                        // next ones while they fit. cpu1's idle probe runs a block at a time to
+                        // find its polling loop's start again; compiled RAM code ran past it)
+                        let cap = budget.saturating_sub(n).max(len);
                         // SAFETY: code was compiled for this bus type and memory map
-                        let k = unsafe { jit_wasm::run(code, at, self, bus, extra) };
+                        let k = unsafe { jit_wasm::run(code, at, self, bus, extra, cap) };
                         if k > 0 {
                             n += k;
                             pc = self.pc;
@@ -515,7 +536,7 @@ impl Cpu {
             let id = self.bmap[(pc >> 1) as usize & (self.bmap.len() - 1)];
             if id != 0 {
                 let (bpc, start, len) = self.blocks[id as usize - 1];
-                if bpc == pc && (xip || self.ram_block_current(bus, id as usize - 1)) {
+                if bpc == pc && (xip || self.ram_block_ok(bus, id as usize - 1)) {
                     // (len 0: remembered that the first instruction here needs `step`)
                     return Ok(if len == 0 { None } else { Some((id as usize - 1, start, len)) });
                 }
@@ -524,10 +545,37 @@ impl Cpu {
         self.build_block(bus, pc)
     }
 
-    /// The region of hot block `id` for the wasm JIT: it and the XIP blocks reachable from it over
-    /// fixed edges (breadth first), each as its plain prefix (up to the first careful op). A
-    /// block over RAM is entered only through `block_at`, which checks its bytes first: one is a
-    /// region's start or not in it.
+    /// Are region `r`'s blocks over RAM (if any) still what memory holds? Unchanged when the bus's
+    /// count of code-word writes is the one they were last found current at; else each is checked
+    /// (`ram_block_ok`), and a region with one that changed is dropped.
+    #[cfg(target_arch = "wasm32")]
+    fn wasm_region_ok<B: Bus>(&mut self, bus: &mut B, r: u32) -> bool {
+        let Some(j) = self.wjit.as_ref() else { return false };
+        let (ids, ver) = &j.rinfo[r as usize];
+        if ids.is_empty() {
+            return true;
+        }
+        let Some(w) = bus.code_writes() else { return false };
+        if *ver == w {
+            return true;
+        }
+        let ids = ids.clone();
+        let ok = ids.iter().all(|&id| self.ram_block_ok(bus, id));
+        if let Some(j) = self.wjit.as_mut() {
+            if ok {
+                j.rinfo[r as usize].1 = w;
+            } else {
+                j.drop_region(r);
+            }
+        }
+        ok
+    }
+
+    /// The region of hot block `id` for the wasm JIT: it and the blocks reachable from it over
+    /// fixed edges (breadth first), each as its plain prefix (up to the first careful op). Blocks
+    /// over RAM join only when the bus counts writes to code words (`wasm_region_ok` then checks
+    /// them all on entry; a write to one leaves the region): else one is a region's start or not
+    /// in it, entered only through `block_at`, which checks its bytes first.
     #[cfg(target_arch = "wasm32")]
     fn wasm_region<B: Bus>(&mut self, bus: &mut B, id: usize) -> Vec<(usize, u32, Vec<BOp>)> {
         let mut out: Vec<(usize, u32, Vec<BOp>)> = Vec::new();
@@ -538,7 +586,7 @@ impl Cpu {
             if out.len() >= jit_wasm::REGION_BLOCKS || total >= jit_wasm::REGION_OPS {
                 break;
             }
-            if !seen.insert(pc) || (!out.is_empty() && !(0x0200_0000..0x0400_0000).contains(&pc)) {
+            if !seen.insert(pc) || (!out.is_empty() && !(0x0200_0000..0x0400_0000).contains(&pc) && bus.code_writes().is_none()) {
                 continue;
             }
             let Ok(Some((bid, start, len))) = self.block_at(bus, pc) else { continue };
@@ -563,6 +611,26 @@ impl Cpu {
             out.push((bid, pc, ops));
         }
         out
+    }
+
+    /// Is RAM block `id` still built from what memory holds now? In the wasm build, by the bus's
+    /// count of writes to code words when it keeps one: the same count as when the block was last
+    /// found current, nothing has changed; else the bytes are compared. (Natively the AArch64
+    /// JIT's inline stores go past that count: the bytes are compared every time.)
+    #[inline]
+    fn ram_block_ok<B: Bus>(&mut self, bus: &mut B, id: usize) -> bool {
+        #[cfg(target_arch = "wasm32")]
+        if let Some(w) = bus.code_writes() {
+            if self.bver[id] == w {
+                return true;
+            }
+            let ok = self.ram_block_current(bus, id);
+            if ok {
+                self.bver[id] = w;
+            }
+            return ok;
+        }
+        self.ram_block_current(bus, id)
     }
 
     /// Is RAM block `id` still built from what memory holds now?
@@ -600,6 +668,8 @@ impl Cpu {
             self.bops.clear();
             self.blocks.clear();
             self.bbytes.clear();
+            #[cfg(target_arch = "wasm32")]
+            self.bver.clear();
             self.bmap.iter_mut().for_each(|x| *x = 0);
             #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
             if let Some(j) = self.jit.as_mut() {
@@ -647,9 +717,18 @@ impl Cpu {
         let len = self.bops.len() as u32 - start;
         self.blocks.push((pc, start, len));
         // a RAM block keeps its bytes (6 more: an instruction's window reaches past its length)
-        let bytes = if xip { None } else { ram_code(bus, pc).map(|m| m[..((p - pc) as usize + 6).min(m.len())].into()) };
+        let bytes: Option<Box<[u8]>> = if xip { None } else { ram_code(bus, pc).map(|m| m[..((p - pc) as usize + 6).min(m.len())].into()) };
+        if let Some(b) = &bytes {
+            // (its pages are watched from now on: writes to them are counted)
+            bus.code_mark(pc, pc + b.len() as u32);
+        }
         self.bbytes.resize(self.blocks.len() - 1, None);
         self.bbytes.push(bytes);
+        #[cfg(target_arch = "wasm32")]
+        {
+            self.bver.resize(self.blocks.len() - 1, u64::MAX);
+            self.bver.push(bus.code_writes().unwrap_or(u64::MAX));
+        }
         let slot = (pc >> 1) as usize & ((1 << BITS) - 1);
         self.bmap[slot] = self.blocks.len() as u32;
         Ok(if len == 0 { None } else { Some((self.blocks.len() - 1, start, len)) })
