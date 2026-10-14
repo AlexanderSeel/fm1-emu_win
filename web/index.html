@@ -56,6 +56,16 @@
   .file:focus-within { outline: 2px solid var(--amber); outline-offset: 1px; }
   .file input { position: absolute; width: 1px; height: 1px; opacity: 0; }
   #about b { color: var(--ink); font-weight: 600; }
+  /* the device can't keep up: what happens and the fix, between the controls and the synth */
+  #perfwarn { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; justify-content: space-between;
+              border: 1px solid var(--amber); border-radius: 10px; background: #2a2116; padding: 9px 12px; }
+  #perfwarn[hidden] { display: none; }
+  #perfwarn p { margin: 0; flex: 1 1 320px; min-width: 0; }
+  #perfwarn .acts { display: flex; gap: 8px; align-items: center; }
+  #perfwarn button { font: inherit; color: var(--ink); background: var(--well); border: 1px solid var(--line);
+                     border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+  #perfwarn button.primary { background: var(--amber); border-color: var(--amber); color: #2a1a03; font-weight: 600; }
+  #perfwarn button[hidden] { display: none; }
   a { color: var(--ink); }
   a:focus-visible, button:focus-visible, summary:focus-visible { outline: 2px solid var(--amber); outline-offset: 2px; }
   #midiact { width: 8px; height: 8px; border-radius: 50%; background: var(--line); }
@@ -151,6 +161,14 @@
     <label class="file" title="A DX7 32-voice bank for M-VAVE's firmware">DX7 bank… <input type="file" id="bank"></label>
     <span id="bankname" class="dim"></span>
     <span id="about"></span>
+  </div>
+  <div id="perfwarn" role="alert" hidden>
+    <p id="perfwarn-text"></p>
+    <div class="acts">
+      <button type="button" id="perfwarn-fix" class="primary"></button>
+      <button type="button" id="perfwarn-copy" title="A short text about this device and how it kept up, to paste into a bug report">Copy a report</button>
+      <button type="button" id="perfwarn-close" aria-label="Dismiss">✕</button>
+    </div>
   </div>
   <div class="stage">
     <canvas id="panel" aria-label="FM-1 front panel"></canvas>
@@ -295,8 +313,10 @@
       <h2 id="h-limits">Known limits</h2>
       <ul>
         <li><b>Speed.</b> The real FM-1 runs at 240 MHz. The page starts at 100 MHz, which keeps slower machines in
-          real time. If the status line's count of short audio quanta keeps climbing, the emulator is falling
-          behind: pick a lower clock.</li>
+          real time. The status line shows the load: the share of the audio thread's time the emulator takes. When
+          a device can't keep up and the sound breaks up, the page says so and offers a lower clock, or a larger
+          audio buffer when the emulator has time to spare. "Copy a report" there gives a short text about the
+          device to paste into a bug report.</li>
         <li><b>Safari</b> has no Web MIDI, so no MIDI in there.</li>
         <li><b>MIDI goes in only.</b> The page sends no MIDI out.</li>
         <li><b>M-VAVE's MIDI channel 2</b> is what the emulator shows; it has not been checked on a real FM-1.</li>

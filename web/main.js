@@ -14,6 +14,9 @@ const catalog = await (await fetch("firmwares.json")).json();
 const byId = new Map(catalog.firmwares.map((f) => [f.id, f]));
 let fw = byId.get(params.get("fw")) || byId.get(stored("fm1.fw")) || byId.get(catalog.default) || catalog.firmwares[0];
 let mhz = Number(params.get("mhz") || stored("fm1.mhz") || 100);
+// the audio buffer: "interactive" (small: keys answer quickly) unless this device needed a larger
+// one ("playback", offered when the sound drops out with time to spare; ?latency= overrides)
+let latency = params.get("latency") || stored("fm1.latency") || "interactive";
 
 const canvas = document.getElementById("panel");
 const ctx = canvas.getContext("2d");
@@ -453,6 +456,127 @@ midiChSel.addEventListener("change", () => {
   store("fm1.midich", midiCh);
 });
 
+// ---------------------------------------------------------------- is the device keeping up?
+// Two measures, per second: the load (the share of the audio thread's time the emulation takes,
+// timed in the worklet; over ~100% and the sound must break up) and the drift of the audio
+// clock against the wall clock (getOutputTimestamp: the output falls behind when quanta come
+// late, also with a load below 100% when the buffer is too small for this device's hiccups).
+// Some seconds of either, once the JIT has warmed up, bring up a warning that offers the fix.
+const warnBox = document.getElementById("perfwarn");
+const perf = {
+  reset() {
+    this.busy = 0; this.span = 0; this.worst = 0;
+    this.secs = 0; this.bad = 0; this.drops = 0; this.loads = []; this.drift = 0;
+    this.stamp = null; this.mips = 0; this.dismissed = false;
+    warnBox.hidden = true;
+  },
+  add(m) {
+    this.busy += m.busy;
+    this.span += (m.quanta * m.frames) / 44.1;     // ms of audio those quanta stand for
+    if (m.worst > this.worst) this.worst = m.worst;
+  },
+  load() { return this.loads.length ? this.loads[this.loads.length - 1] : 0; },
+  loadText() { return this.loads.length ? `${Math.round(100 * this.load())}%` : "…"; },
+  // once a second: close the window, judge it
+  second(mips, m) {
+    this.mips = mips;
+    if (this.span > 0) this.loads.push(this.busy / this.span);
+    if (this.loads.length > 30) this.loads.shift();
+    this.busy = 0; this.span = 0;
+    const ts = ac.getOutputTimestamp?.();
+    let drift = 0;
+    if (ts && ts.contextTime > 0) {
+      if (this.stamp) {
+        const wall = (ts.performanceTime - this.stamp.performanceTime) / 1000;
+        if (wall > 0.5) drift = 1 - (ts.contextTime - this.stamp.contextTime) / wall;
+      }
+      this.stamp = ts;
+    }
+    this.drift = drift;
+    if (++this.secs <= 3 || m.halted) return;      // (the first seconds: booting, compiling)
+    const over = this.load() > 0.95, late = drift > 0.02;
+    if (late) this.drops++;
+    this.bad = over || late ? this.bad + 1 : 0;
+    if (this.bad >= 3 && warnBox.hidden && !this.dismissed) this.warn(over);
+  },
+  warn(over) {
+    const load = this.load();
+    const lower = CLOCKS.filter((c) => c < mhz && c <= mhz * 0.8 / Math.max(load, 0.01));
+    const pick = lower.length ? lower[lower.length - 1] : CLOCKS.find((c) => c < mhz);
+    const text = document.getElementById("perfwarn-text");
+    const fix = document.getElementById("perfwarn-fix");
+    fix.hidden = false;
+    if (over && pick) {
+      text.textContent = `This device can't run ${fw.name} at ${mhz} MHz in real time (it needs ${Math.round(100 * load)}% ` +
+        `of the audio thread), so the sound breaks up. Most firmwares play fine at a lower clock.`;
+      fix.textContent = `Use ${pick} MHz`;
+      fix.onclick = () => { setClock(pick); };
+    } else if (over) {
+      text.textContent = `Even at ${mhz} MHz this device can't run ${fw.name} in real time (it needs ` +
+        `${Math.round(100 * load)}% of the audio thread), so the sound breaks up. A faster device or the desktop version will play it.`;
+      fix.hidden = true;
+    } else if (latency !== "playback") {
+      text.textContent = `The sound drops out although the emulator has time to spare (load ${Math.round(100 * load)}%): ` +
+        `this device's audio buffer is too small for it. A larger one adds a little delay to the keys.`;
+      fix.textContent = "Use a larger audio buffer";
+      fix.onclick = () => { setLatency("playback"); };
+    } else {
+      text.textContent = `The sound drops out on this device, even with the larger audio buffer (load ${Math.round(100 * load)}%).`;
+      fix.hidden = true;
+    }
+    warnBox.hidden = false;
+  },
+  // for a bug report: what the device is and how it kept up
+  report() {
+    const r = (v, d = 0) => (Number.isFinite(v) ? v.toFixed(d) : "?");
+    const loads = this.loads.map((l) => Math.round(100 * l));
+    return [
+      `FM-1 emulator report (${location.origin}${location.pathname})`,
+      `firmware: ${fw.id} ${fw.version || ""} · clock ${mhz} MHz · JIT ${params.get("jit") === "0" ? "off" : "on"}`,
+      `browser: ${navigator.userAgent}`,
+      `cores: ${navigator.hardwareConcurrency ?? "?"} · memory: ${navigator.deviceMemory ?? "?"} GB`,
+      `audio: ${ac ? `${ac.sampleRate} Hz, buffer "${latency}", base latency ${r(1000 * (ac.baseLatency ?? NaN), 1)} ms, ` +
+        `output latency ${r(1000 * (ac.outputLatency ?? NaN), 1)} ms` : "not started"}`,
+      `load (last ${loads.length} s): ${loads.join(" ")}% · worst quantum since boot ${r(this.worst, 1)} ms of ${r(128 / 44.1, 1)}`,
+      `audio clock drift: ${r(100 * this.drift, 1)}% · seconds with drops: ${this.drops} · ${r(this.mips)} M instructions/s`,
+      `short audio quanta: ${frame?.short ?? "?"}`,
+    ].join("\n");
+  },
+};
+document.getElementById("perfwarn-copy").addEventListener("click", async (e) => {
+  const b = e.currentTarget;
+  try {
+    await navigator.clipboard.writeText(perf.report());
+    b.textContent = "Copied";
+  } catch {
+    prompt("Copy this report:", perf.report());     // (no clipboard access: let them copy it)
+  }
+  setTimeout(() => { b.textContent = "Copy a report"; }, 2000);
+});
+document.getElementById("perfwarn-close").addEventListener("click", () => {
+  warnBox.hidden = true;
+  perf.dismissed = true;
+});
+function setClock(c) {
+  mhz = c;
+  if (![...mhzSel.options].some((o) => Number(o.value) === c)) mhzSel.add(new Option(`${c} MHz`, c));
+  mhzSel.value = c;
+  store("fm1.mhz", c);
+  showFirmware();
+  boot();
+}
+async function setLatency(l) {
+  latency = l;
+  store("fm1.latency", l);
+  // a larger buffer needs a new audio context: rebuild the graph, boot again
+  node.port.onmessage = null;
+  node.disconnect();
+  await ac.close();
+  await startAudio();
+  await boot();
+  await ac.resume();
+}
+
 // ---------------------------------------------------------------- audio: start on a click
 let ac = null, last = null, bootSeq = 0, booting = 0;
 
@@ -481,41 +605,55 @@ async function boot() {
   frame = null;
   last = null;
   booting = seq;                                   // (frames of the old machine still on their way)
+  perf.reset();
   node.port.postMessage({ type: "boot", seq, wasm: wasm.slice(0), package: got.bytes.slice().buffer,
     syx: bank ? bank.slice().buffer : null, mhz, jit: params.get("jit") !== "0" });
   status.textContent = `booting ${f.name}…`;
 }
 
-startBtn.addEventListener("click", async () => {
-  startBtn.disabled = true;
-  status.textContent = "starting audio…";
-  ac = new AudioContext({ sampleRate: 44100, latencyHint: "interactive" });
+// the audio graph: a context with the chosen buffer, the emulator's worklet node in it
+async function startAudio() {
+  ac = new AudioContext({ sampleRate: 44100, latencyHint: latency });
   await ac.audioWorklet.addModule("worklet.js");
   node = new AudioWorkletNode(ac, "fm1", { numberOfInputs: 0, outputChannelCount: [2] });
   node.connect(ac.destination);
-  node.port.onmessage = (e) => {
-    const m = e.data;
-    if (m.type === "error") {
-      status.textContent = `${fw.name}: ${m.message}`;
-      return;
-    }
-    if (m.type === "booted") {
-      if (m.seq === bootSeq) booting = 0;
-      return;
-    }
-    if (m.type !== "frame" || booting) return;
-    frame = m;
-    const now = performance.now();
-    if (!last || now - last.t > 1000) {
-      const mips = last ? (m.minsns - last.minsns) / ((now - last.t) / 1000) : 0;
-      status.textContent = m.halted ? `${fw.name}: the emulated CPU halted` :
-        `${fw.name} · ${mhz} MHz · ${mips.toFixed(0)} M instructions/s · ${(m.ms / 1000).toFixed(1)} s · ` +
-        `${m.short} short audio quanta`;
-      // (hover: the JIT's work in the audio thread)
-      status.title = m.jit ? `JIT: ${m.jit.regions} regions compiled, ${m.jit.failed} failed${m.jit.error ? ` (${m.jit.error})` : ""}` : "";
-      last = { t: now, minsns: m.minsns };
-    }
-  };
+  node.port.onmessage = onWorklet;
+  perf.reset();
+}
+
+// what the audio thread sends: the screen and LEDs with its timing, boot and error news
+function onWorklet(e) {
+  const m = e.data;
+  if (m.type === "error") {
+    status.textContent = `${fw.name}: ${m.message}`;
+    return;
+  }
+  if (m.type === "booted") {
+    if (m.seq === bootSeq) booting = 0;
+    return;
+  }
+  if (m.type !== "frame" || booting) return;
+  frame = m;
+  perf.add(m);
+  const now = performance.now();
+  if (!last || now - last.t > 1000) {
+    const mips = last ? (m.minsns - last.minsns) / ((now - last.t) / 1000) : 0;
+    perf.second(mips, m);
+    status.textContent = m.halted ? `${fw.name}: the emulated CPU halted` :
+      `${fw.name} · ${mhz} MHz · ${mips.toFixed(0)} M instructions/s · load ${perf.loadText()} · ` +
+      `${(m.ms / 1000).toFixed(1)} s`;
+    // (hover: the JIT's work in the audio thread, and the audio's health)
+    status.title = [m.jit ? `JIT: ${m.jit.regions} regions compiled, ${m.jit.failed} failed${m.jit.error ? ` (${m.jit.error})` : ""}` : "",
+      `load: the share of the audio thread's time the emulator takes (over 100%: the sound breaks up)`,
+      `${m.short} short audio quanta (the firmware's audio fell behind its own clock)`].filter(Boolean).join("\n");
+    last = { t: now, minsns: m.minsns };
+  }
+}
+
+startBtn.addEventListener("click", async () => {
+  startBtn.disabled = true;
+  status.textContent = "starting audio…";
+  await startAudio();
   await boot();
   if (midiSel.value) midiOpen();                  // (an input picked on an earlier visit)
   await ac.resume();

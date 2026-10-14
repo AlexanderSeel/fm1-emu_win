@@ -24,6 +24,10 @@ function jitImports(exports, stats) {
   };
 }
 
+// the wall clock, for how long each quantum's emulation takes (where an AudioWorklet has no
+// performance.now(), Date.now(): whole milliseconds, which still average out over a second)
+const now = globalThis.performance?.now ? () => performance.now() : () => Date.now();
+
 class Fm1 extends AudioWorkletProcessor {
   constructor() {
     super();
@@ -75,6 +79,8 @@ class Fm1 extends AudioWorkletProcessor {
     this.budget = m.mhz * 1e6 * 0.02;   // at most 20 ms of emulated time per quantum
     this.short = 0;
     this.calls = 0;
+    this.busy = 0;                      // ms spent emulating since the last frame message
+    this.worst = 0;                     // the longest quantum among them
     this.port.postMessage({ type: "booted", seq: m.seq });
   }
 
@@ -83,7 +89,7 @@ class Fm1 extends AudioWorkletProcessor {
     const x = this.x;
     if (!x) return true;
     const n = out[0].length;
-    const t0 = currentTime;
+    const t0 = now();
     let have;
     try {
       have = x.fm1_render(n, this.budget);
@@ -97,12 +103,19 @@ class Fm1 extends AudioWorkletProcessor {
     out[0].set(l);
     if (out[1]) out[1].set(r);
     this.short = (this.short || 0) + (have < n ? 1 : 0);
+    const took = now() - t0;
+    this.busy += took;
+    if (took > this.worst) this.worst = took;
     if (++this.calls % 11 === 0) {
       // the screen and the LEDs, copied out of wasm memory (the page has its own instance)
       const lcd = new Uint16Array(x.memory.buffer, x.fm1_lcd(), 240 * 240).slice();
       const leds = new Float32Array(x.memory.buffer, x.fm1_leds(), 41).slice();
       this.port.postMessage({ type: "frame", lcd, leds, ms: x.fm1_ms(), minsns: x.fm1_minsns(),
-        short: this.short, halted: x.fm1_halted(), jit: this.jit }, [lcd.buffer, leds.buffer]);
+        short: this.short, halted: x.fm1_halted(), jit: this.jit,
+        // the audio thread's time: busy ms over these 11 quanta of n frames, and the worst one
+        busy: this.busy, worst: this.worst, quanta: 11, frames: n }, [lcd.buffer, leds.buffer]);
+      this.busy = 0;
+      this.worst = 0;
     }
     return true;
   }
