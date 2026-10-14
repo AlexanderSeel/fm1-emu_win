@@ -76,13 +76,14 @@ identity says which board it runs on.
 
 **Play it: [joakimeriksson.github.io/fm1-emu/smk37](https://joakimeriksson.github.io/fm1-emu/smk37/)**.
 The firmwares come from [genkigenki's install page](https://genkigenki.github.io/smk37/)
-(`node tools/smk37_catalog.mjs` refreshes the list). M-VAVE's own SMK-37 firmware boots but its
-screen stays dark.
+(`node tools/smk37_catalog.mjs` refreshes the list). M-VAVE's own SMK-37 firmware runs as the
+MIDI controller it is (screen, buttons, pads, keys; it names the chord you hold), without sound (its
+notes go to USB / Bluetooth MIDI) and slower than real time in the browser so far.
 
 <!-- smk37-firmwares: node tools/readme_firmwares.mjs -->
 | Firmware (opens it on the page) | By | What it is |
 |---|---|---|
-| [M-VAVE stock firmware 016](https://joakimeriksson.github.io/fm1-emu/smk37/?fw=stock) | [M-VAVE](https://github.com/genkigenki/fm1-to-smk37) | The firmware the SMK-37 Pro ships with. Bring your own `SMK-37 Pro_016.fwsc`. |
+| [M-VAVE stock firmware 016](https://joakimeriksson.github.io/fm1-emu/smk37/?fw=stock) | [M-VAVE](https://github.com/genkigenki/fm1-to-smk37) | The firmware the SMK-37 Pro ships with: a MIDI controller. Bring your own `SMK-37 Pro_016.fwsc`. |
 | [Makkuro37 0.1](https://joakimeriksson.github.io/fm1-emu/smk37/?fw=makkuro37) | [genkigenki](https://github.com/genkigenki/Makkuro37) | A microtonal drone synth: eight voices as eight soot creatures, 96 presets. |
 | [Vector37 0.2.2](https://joakimeriksson.github.io/fm1-emu/smk37/?fw=vector37) | [genkigenki](https://github.com/genkigenki/Vector37) | An orbiting overtone synth: a moon circles a sun along a path, and where it is decides how much of each of four sounds you hear. |
 | [Snoop37 2.6.5](https://joakimeriksson.github.io/fm1-emu/smk37/?fw=snoop37) | [isod89 (port: genkigenki)](https://github.com/genkigenki/sloop-fm1) | SLOOP, the four-track looper groovebox, adapted for the SMK-37. |

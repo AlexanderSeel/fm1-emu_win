@@ -514,6 +514,37 @@ wasm).
 - fm1-live opens an SMK-37 package in an SMK-37 window (`window_smk`; not tried by hand yet);
   `Action::Vel` carries a key velocity.
 
+## 5.16 M-VAVE's own SMK-37 firmware runs (2026-10-15)
+
+It booted to a dark screen. Five things, in the order they showed up (all SMK-37-only or gaps no
+FM-1 firmware reaches; every FM-1 firmware byte-identical, native and wasm):
+
+- An interrupt storm, 2.4 M a second: its ADC scan chains conversions through IRQ 24, each handler
+  starting the next, and conversions finished at once. On the SMK-37 a conversion now takes 40 us
+  (the hardware map's SMK timing) and raises IRQ 24 at its end (`Periph::adc_next`).
+- Its Bluetooth controller task reset the chip ("btctrler"): its buffers are checked against the BT
+  window base at 0x2FC44, which the emulator served as V13's .bd_base. The firmware writes that
+  register (V13 writes 0x01C09E7C, the SMK-37's v016 0x01C09A18): it is stored now.
+- The float multiply-accumulates `3f e5` op 7 / 8: `rD += rA * rB (f)` / `rD -= ...` (vendor
+  assembler; not fused: JieLi's clang calls a library fmaf). Native JIT: through the helper.
+- `78..7b e0 0S DS`: rD = sat16(rS) (s / u), now a micro-op (the table's class had no semantics).
+- Core 0 waited at boot for the second USB PHY (0x16800 bit 4, after powering it up): the block
+  is stored registers on the SMK-37, bit 4 reading set.
+
+It runs as a MIDI controller: the main screen, buttons (ARP toggles the arpeggiator, its LED
+lights), pads lit, and the keys: PATCH, then C-E-G held, and it shows "C Maj" with those keys
+marked, which also confirms the matrix's column numbering independently of the ports. No sound:
+its notes go to USB / Bluetooth MIDI. SPI1 transfers take their time on the wire on the SMK-37
+(60 MHz / (BAUD + 1), done bit and IRQ 16 at the end).
+
+Speed: ~150 k interrupts a second (its key scan from SPI2's interrupt), and the ISR wrappers'
+`{psr, rets, reti}` pushes / pops went through `exec_syntax`'s string matching with an allocation
+each: now first in exec_syntax, allocation-free (native 1.17x -> 1.42x at 240 MHz); the SoC's
+register map hashes with a cheap multiplicative hash instead of SipHash. In the browser it runs at
+~0.6x real time whatever the clock: the cost is per interrupt and peripheral event. Next for it:
+the interrupt path (ISR entry / exit as micro-ops, fewer compiled-code exits).
+`fm1-emu` prints interrupts by source; `FM1_FWSC_XIP=file` saves a package's XIP window.
+
 ## 6. Phase 5 — Boot & integration
 
 - Boot stock firmware to a stable idle/main-loop state.
