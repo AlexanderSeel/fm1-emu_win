@@ -3,8 +3,8 @@
 The **M-VAVE FM-1** is a pocket FM synthesizer, and a small community writes its own firmwares
 for it: drum machines, grooveboxes, ambient generators, a chord harp. This project emulates the
 FM-1 itself, its CPU, screen, keys, knobs and audio, so every one of those firmwares runs
-unchanged in a browser or on a computer. You can try a firmware before you install it, write
-one without a synth on the desk, or just play.
+unchanged in a browser, on a computer or as an instrument plugin in a DAW (AU, VST3). You can
+try a firmware before you install it, write one without a synth on the desk, or just play.
 
 **Play it: [joakimeriksson.github.io/fm1-emu](https://joakimeriksson.github.io/fm1-emu/)**:
 pick a firmware, press Start, play with the computer keyboard, the mouse, a touch screen or
@@ -131,13 +131,68 @@ memory dumps).
 The page builds with `web/build.sh` (Rust to WebAssembly; needs the `wasm32-unknown-unknown`
 target), the whole site with `tools/build_site.sh`.
 
-### In a DAW: AU, VST3, CLAP
+## In your DAW: AU and VST3
 
-`tools/build_plugin.sh` builds the emulator as an instrument plugin on a Mac: an AU (Logic,
-GarageBand), a VST3 and a CLAP, all from one Rust plugin (MIT, as are the SDKs it uses). It
-installs them and runs Apple's AU validator. Load a `.fwsc` in its window and play it from the
-host's MIDI; the firmware and its saved patches are kept in the project.
-See [crates/fm1-plugin](crates/fm1-plugin/README.md).
+The emulator also comes as an **instrument plugin**, so a firmware plays in a DAW like any
+other synth:
+
+| Format | Loads in |
+|---|---|
+| **AU** | Logic Pro, GarageBand, MainStage, and most other Mac DAWs |
+| **VST3** | Ableton Live, Cubase, FL Studio, Reaper, Bitwig, Studio One, Cakewalk… |
+| **CLAP** | Bitwig, Reaper, FL Studio, Studio One… |
+
+**What it does:**
+- **The firmware:** **Load firmware…** in the plugin's window picks a `.fwsc` package: any
+  community firmware (the table above links each author's) or M-VAVE's own. An SMK-37 package
+  gets the SMK-37's panel.
+- **Playing it:** MIDI from the DAW plays it, as through the FM-1's MIDI IN. A *MIDI channel*
+  setting moves all notes to one channel; M-VAVE's firmware listens on 2. The panel is the
+  page's, played with the mouse: keys, buttons, knobs, and on the SMK-37 the pads, faders and
+  wheels.
+- **Automation:** *Master* (the MASTER pot) is a parameter the DAW can automate.
+- **The project keeps the firmware and its patches.** The package and every flash sector the
+  firmware has written are saved with the song, so it reopens with the same sounds.
+- **Timing:** the emulator runs a little ahead of the DAW and reports that delay as the plugin's
+  latency, so the DAW compensates and notes land where they were placed. The status bar shows
+  how much faster than real time the firmware could run on this computer; most run at 3–6x,
+  the heaviest at about 1.5x.
+
+**Build and install it (macOS, Apple silicon).** There's no download yet: a plugin given to
+others has to be signed with an Apple Developer ID. You need Rust, CMake and Ninja
+(`brew install cmake ninja`), then:
+
+```sh
+tools/build_plugin.sh
+```
+
+This builds the plugin and installs `FM-1.component`, `FM-1.vst3` and `FM-1.clap` in
+`~/Library/Audio/Plug-Ins`. It then runs Apple's AU validator on them.
+
+**In GarageBand:**
+1. *Settings → Audio/MIDI*: tick *Enable Audio Units*, then quit and reopen GarageBand.
+2. Make a *Software Instrument* track and open its Smart Controls (**B**).
+3. Click the *Instrument* slot and choose *AU Instruments → fm1-emu → FM-1*.
+4. Click the slot to open its window, then *Load firmware…*.
+5. Play it with **⌘K** (Musical Typing) or a MIDI keyboard.
+
+**In Logic:** a Software Instrument track's instrument slot, *AU Instruments → fm1-emu → FM-1*.
+
+**In VST3 or CLAP hosts:** add *FM-1* (by fm1-emu) as an instrument on a track.
+
+**How it's built:** it's one plugin written in Rust as a CLAP with
+[nih-plug](https://github.com/robbert-vdh/nih-plug). [clap-wrapper](https://github.com/free-audio/clap-wrapper)
+makes the AU and VST3 of it, and the plugin stays MIT. All its parts are MIT, ISC or Apache-2.0,
+including Apple's AudioUnitSDK and Steinberg's VST3 SDK, which is MIT since 3.8.
+
+**So far it has passed:**
+- Apple's AU validator (`auval`);
+- Steinberg's VST3 validator (47 of 47 tests);
+- GarageBand, as an AU;
+- Steinberg's VST3 test host.
+
+Logic, Ableton and the Windows / Linux builds haven't been tried yet. More in
+[crates/fm1-plugin](crates/fm1-plugin/README.md).
 
 ## How it works
 
@@ -165,7 +220,8 @@ How it was built and checked, step by step, is told in a technical report:
 The emulator is MIT (`LICENSE`). The firmwares are their authors' and are not part of this
 repository; the page fetches them from the authors' sites. `fm1-sid/` has files under other
 licences, among them its player firmware, GPL-3.0 since it is built on Felucca's code:
-its README lists them.
+its README lists them. The plugin (`crates/fm1-plugin`) is MIT too; the libraries and SDKs it
+builds with are MIT, ISC or Apache-2.0.
 
 ## Credits
 
