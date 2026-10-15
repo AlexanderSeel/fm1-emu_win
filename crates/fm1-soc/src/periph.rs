@@ -749,7 +749,13 @@ impl Periph {
 
     /// Writes handled here; returns false for plain SFR storage.
     pub fn write(&mut self, addr: u32, v: u32) -> bool {
-        self.next_due = 0; // a timer or DMA may have been (re)programmed
+        // a timer or DMA may have been (re)programmed: the runner services the SoC before the
+        // next instruction (leaving compiled code). Not for the FM-1's ADC: its conversions are
+        // instant, so a write there changes only whether IRQ 24 is raised (then it does).
+        // OberVave converts ~1 M times a second, 5 writes each: every one left the JIT.
+        if !(matches!(addr, 0x13100 | 0x13104) && self.board != crate::Board::Smk37) {
+            self.next_due = 0;
+        }
         match addr {
             0x10800 => {
                 if self.t4_con & 1 == 0 && v & 1 != 0 {
@@ -823,9 +829,15 @@ impl Periph {
                             self.next_due = 0;
                         } else {
                             self.adc_done = true;
+                            if self.adc_irq != (v & 0x20 != 0) {
+                                self.next_due = 0;
+                            }
                             self.adc_irq = v & 0x20 != 0;
                         }
                     } else {
+                        if self.adc_irq {
+                            self.next_due = 0;
+                        }
                         self.adc_done = false;
                         self.adc_irq = false;
                     }
