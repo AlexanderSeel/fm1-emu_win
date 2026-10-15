@@ -134,6 +134,9 @@ pub fn run(
     // the sectors last put in the project's state
     let mut saved: Sectors = Vec::new();
     let mut last_view = Instant::now();
+    // when the host last took frames, and the free run's start (wall time, emulated ms)
+    let mut last_take = Instant::now();
+    let mut free: Option<(Instant, u64)> = None;
     let mut last_flash = Instant::now();
     let (mut speed_t, mut speed_ms, mut busy, mut starved0) = (Instant::now(), 0u64, Duration::ZERO, 0u64);
     while !shared.quit.load(Ordering::Relaxed) {
@@ -186,7 +189,25 @@ pub fn run(
             std::thread::sleep(Duration::from_millis(2));
             continue;
         };
-        if rtrb_fill(&out) >= lead {
+        let fill = rtrb_fill(&out);
+        if fill < lead {
+            last_take = Instant::now();
+            free = None;
+        }
+        if fill >= lead && last_take.elapsed() >= Duration::from_millis(50) {
+            // The host takes no audio (a host that only shows the window, a track not playing):
+            // the machine runs on in real time, as the device would, its audio dropped and not
+            // counted, so the host's stamps still line up when it takes frames again.
+            let (t0, ms0) = *free.get_or_insert((Instant::now(), mm.soc.periph.ms()));
+            if mm.soc.periph.ms() - ms0 < t0.elapsed().as_millis() as u64 {
+                let t1 = Instant::now();
+                mm.run(20_000);
+                busy += t1.elapsed();
+                mm.soc.periph.audio.clear();
+            } else {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        } else if fill >= lead {
             std::thread::sleep(Duration::from_micros(500));
         } else {
             while due.front().is_some_and(|e| e.frame <= made) {
@@ -222,8 +243,8 @@ pub fn run(
             if speed_t.elapsed() >= Duration::from_secs(1) {
                 let ms = mm.soc.periph.ms();
                 // (the first second is the boot's: it runs flat out to fill the ring)
-                if speed_ms > 0 {
-                    v.speed = (ms - speed_ms) as f32 / busy.as_secs_f32().max(1e-6) / 1000.0;
+                if speed_ms > 0 && busy > Duration::ZERO {
+                    v.speed = ms.saturating_sub(speed_ms) as f32 / busy.as_secs_f32() / 1000.0;
                     v.late = v.starved - starved0;
                 }
                 starved0 = v.starved;

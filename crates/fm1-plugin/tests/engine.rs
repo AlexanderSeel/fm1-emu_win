@@ -43,3 +43,37 @@ fn a_note_sounds_when_it_is_due() {
     eprintln!("level before the note {before:.4}, sound {onset} frames after it was due");
     assert!(onset < 1024, "the note came {onset} frames late");
 }
+
+/// A host that takes no audio (one that only shows the window): the machine runs on in real
+/// time, so the firmware boots and draws its screen. FM1_TEST_FW=<id> runs another firmware
+/// from reference/firmwares.
+#[test]
+fn it_runs_when_the_host_takes_no_audio() {
+    let fw = std::env::var("FM1_TEST_FW").unwrap_or_else(|_| "felucca".into());
+    let pkg = match std::fs::read(format!("{}/../../reference/firmwares/{fw}.fwsc", env!("CARGO_MANIFEST_DIR"))) {
+        Ok(p) => p,
+        Err(_) => return eprintln!("no reference/firmwares/felucca.fwsc: skipped"),
+    };
+    let shared = Arc::new(Shared {
+        view: Mutex::new(View { lcd: vec![0; 240 * 240], leds: [0.0; 41], pads: [0; 16], board: fm1_soc::Board::Fm1, booted: false, halted: false, speed: 0.0, starved: 0, late: 0 }),
+        quit: Default::default(),
+    });
+    let params = Arc::new(fm1_plugin::Fm1Params::default());
+    let (tx, rx) = mpsc::channel();
+    let (_midi, midi_rx) = rtrb::RingBuffer::new(64);
+    let (audio_tx, _audio) = rtrb::RingBuffer::new(16384);
+    let sh = shared.clone();
+    let t = std::thread::spawn(move || engine::run(sh, params, rx, midi_rx, audio_tx));
+    tx.send(Cmd::Lead(2048)).unwrap();
+    tx.send(Cmd::Boot { pkg: Arc::new(pkg), sectors: Vec::new() }).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(3000));
+    let (lit, speed) = {
+        let v = shared.view.lock().unwrap();
+        (v.lcd.iter().filter(|&&p| p != 0).count(), v.speed)
+    };
+    shared.quit.store(true, std::sync::atomic::Ordering::Relaxed);
+    t.join().unwrap();
+    eprintln!("{lit} lit pixels, could run {speed:.1}x real time");
+    assert!(lit > 1000, "the screen stayed dark");
+    assert!(speed > 1.0 && speed < 100.0);
+}
