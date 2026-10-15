@@ -1,15 +1,24 @@
 #!/usr/bin/env bash
 # Build the FM-1 plugin (macOS): the CLAP from Rust (crates/fm1-plugin), then the AU and the
 # VST3 around it (clap-wrapper, crates/fm1-plugin/wrap), the CLAP carried inside each bundle so
-# each stands alone. Signs both ad hoc (enough for this Mac), installs them in ~/Library/Audio/Plug-Ins and
-# runs Apple's AU validator.
+# each stands alone. Signs them (ad hoc unless SIGN_IDENTITY names a Developer ID certificate in
+# the keychain), installs them in ~/Library/Audio/Plug-Ins and runs Apple's AU validator.
 #   tools/build_plugin.sh            # build, install, validate
 #   NO_INSTALL=1 tools/build_plugin.sh
+#   SIGN_IDENTITY="Developer ID Application: ..." tools/build_plugin.sh
+# tools/package_plugin.sh zips what this builds for a release.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 root=$PWD
 out=$root/target/plugin
 mkdir -p "$out"
+# a Developer ID signature takes the hardened runtime and a timestamp (notarization wants both);
+# the CLAP inside each bundle is signed before it goes in, so the bundles are signed without --deep
+identity=${SIGN_IDENTITY:--}
+sign() {
+  if [ "$identity" = "-" ]; then codesign -s - -f "$1"
+  else codesign -s "$identity" -f --options runtime --timestamp "$1"; fi
+}
 
 # the CLAP: a bundle around the cdylib
 (cd crates/fm1-plugin && cargo build --release)
@@ -32,7 +41,7 @@ cat > "$clap/Contents/Info.plist" <<EOF
 </dict>
 </plist>
 EOF
-codesign -s - -f "$clap"
+sign "$clap"
 
 # the AU around it
 cmake -S crates/fm1-plugin/wrap -B "$out/build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DFM1_CLAP="$clap" >/dev/null
@@ -46,14 +55,14 @@ cp "$out/build/fm1_auv2-build-helper-output/auv2_Info.plist" "$out/FM-1.componen
 rm -rf "$out/FM-1.component/Contents/PlugIns"
 mkdir -p "$out/FM-1.component/Contents/PlugIns"
 cp -R "$clap" "$out/FM-1.component/Contents/PlugIns/"
-codesign -s - -f --deep "$out/FM-1.component"
+sign "$out/FM-1.component"
 vst3=$(find "$out/build" -maxdepth 2 -name "FM-1.vst3" -type d | head -1)
 rm -rf "$out/FM-1.vst3"
 cp -R "$vst3" "$out/FM-1.vst3"
 rm -rf "$out/FM-1.vst3/Contents/PlugIns"
 mkdir -p "$out/FM-1.vst3/Contents/PlugIns"
 cp -R "$clap" "$out/FM-1.vst3/Contents/PlugIns/"
-codesign -s - -f --deep "$out/FM-1.vst3"
+sign "$out/FM-1.vst3"
 echo "built $clap, $out/FM-1.component and $out/FM-1.vst3"
 
 [ -n "${NO_INSTALL:-}" ] && exit 0

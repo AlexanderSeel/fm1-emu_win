@@ -53,6 +53,31 @@ open vst3sdk-build/bin/Release/editorhost.app --args ~/Library/Audio/Plug-Ins/VS
 An ad hoc signature is enough on the Mac that built the plugin. To give it to others, it has to be
 signed with an Apple Developer ID and notarized.
 
+## Releases
+
+`.github/workflows/plugin-release.yml` runs on a tag `plugin-v<version>`, with the version taken
+from this crate's `Cargo.toml`. On an Apple silicon runner it:
+1. runs the tests;
+2. builds and installs the plugin and runs Apple's AU validator;
+3. builds Steinberg's validator and runs it on the VST3;
+4. packages the zip (`tools/package_plugin.sh`: the three plugins and an `INSTALL.txt`);
+5. publishes a GitHub Release with the zip and the notes the packaging writes.
+
+```sh
+# bump version in crates/fm1-plugin/Cargo.toml, commit, then
+git tag plugin-v0.1.0 && git push origin plugin-v0.1.0
+```
+
+Without signing secrets the release is unsigned (`INSTALL.txt` gives the command that lets macOS
+open it). With these repository secrets it's signed with a Developer ID and notarized:
+- `MACOS_CERTIFICATE`: a "Developer ID Application" certificate as a base64 `.p12`;
+- `MACOS_CERTIFICATE_PASSWORD`: its password;
+- `APPLE_ID`, `APPLE_TEAM_ID` and `APPLE_APP_PASSWORD`: an app-specific password, for
+  notarization.
+
+Locally, `SIGN_IDENTITY="Developer ID Application: …" tools/build_plugin.sh` then
+`tools/package_plugin.sh` does the same.
+
 ## Using it
 
 - **Load firmware…** picks a `.fwsc`: a community firmware (the page's list links each author's
