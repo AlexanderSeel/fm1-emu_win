@@ -545,6 +545,22 @@ register map hashes with a cheap multiplicative hash instead of SipHash. In the 
 the interrupt path (ISR entry / exit as micro-ops, fewer compiled-code exits).
 `fm1-emu` prints interrupts by source; `FM1_FWSC_XIP=file` saves a package's XIP window.
 
+## 5.17 The catalog follows the FM-1 Firmware Hub too (2026-10-15)
+
+thefirmwarehub.com (designburg's hub, `/catalog.json`, 37 firmwares) lists more than
+fm1-editor.com. Its own package copies (`fw/<name>.fwsc`) have no CORS header, so the page
+fetches each one from its author: github.io pages, or raw.githubusercontent.com for a repo's
+`docs/` (both send `Access-Control-Allow-Origin: *`). GitHub release assets don't, and the
+firmwares published only that way stay out (Dinghy, fm1-chord, MAKU, FM-106, Fart Machine One,
+Felucca 8 Patterns); DUELL and MYCELIUM have no published package.
+
+Added: CTL-1, ETCH, FM-1 Doom, JIANT FM, OberVave, Polly, Skiff, SLOOP DX7 Banks, SLOOP Floyd FM,
+sloopDX, TRIBE, winampFM, zp12 (35 entries, 33 community). Bumped: Felucca 1.6.1, Jangada 1.0,
+Melodee 1.3.6, X0X 1.0.9. Two decoder gaps: `5x ed` halfword loads / stores (route 35, the
+classes fit only the corpus offsets; JIANT) and `80 e1|f1 00 DS` clz (route 36; Bubba Machine).
+Not added yet: Bubba Machine (stops on `rts` decoded as data at 0x0201d5d4, no audio) and Doom
+E1M1 (spins on a timer at 0x020035dc waiting for `[r10+4]` to advance, blue screen).
+
 ## 6. Phase 5 — Boot & integration
 
 - Boot stock firmware to a stable idle/main-loop state.

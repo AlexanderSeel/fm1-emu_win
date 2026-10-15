@@ -2570,6 +2570,27 @@ impl Cpu {
                 }
                 self.regs[b] = addr.wrapping_add(inc as u32);
             }
+            35 =>
+            {
+                // `5x ed` (see `half_mem`); a pre-increment updates the base first
+                let m = half_mem(raw).unwrap();
+                let a = self.regs[m.b].wrapping_add(m.off as u32);
+                if m.pre {
+                    self.regs[m.b] = a;
+                }
+                if m.store {
+                    let v = self.regs[m.d] >> if m.flag { 16 } else { 0 };
+                    bus.write16(a, v as u16);
+                } else {
+                    let v = bus.read16(a);
+                    self.regs[m.d] = if m.flag { v as i16 as i32 as u32 } else { v as u32 };
+                }
+            }
+            36 =>
+            {
+                let (d, s) = (((raw >> 28) & 0xf) as usize, ((raw >> 24) & 0xf) as usize);
+                self.regs[d] = self.regs[s].leading_zeros();
+            }
             34 =>
             {
                 let (d, s, signed) = sat16_raw(raw).unwrap();
@@ -2772,6 +2793,14 @@ fn decode_any(win: u64, pc: u32) -> Result<fm1_isa::Instruction, fm1_isa::Decode
         // word offset), s = store (route 33; all 20620 corpus samples fit): the classes fit only
         // the corpus offsets (ObervaVe's `r3 = [sp+2384]`)
         Err(_) if win & 0xffff == 0xe9d4 => raw(&SP_WORD_CRAW),
+        // `5x ed`: halfword loads / stores at a 10-bit offset, plain or pre-incrementing the base
+        // (route 35, `half_mem`; all 30337 corpus samples fit): the classes fit only the corpus
+        // offsets (JIANT's `h[++r5=-198] = r0`)
+        Err(_) if half_mem(win & 0xffff_ffff).is_some() => raw(&HALF_MEM_CRAW),
+        // `80 e1 00 DS` / `80 f1 00 DS` (a dual-issue pair's head): rD = clz(rS). The classes fit
+        // only the corpus registers and had no `f1` form (Bubba Machine's)
+        Err(_) if win & 0xff_ffff == 0x00_e180 => raw(&CLZ_CRAW),
+        Err(_) if win & 0xff_ffff == 0x00_f180 => raw(&CLZ_PAIR_CRAW),
         // `3f e5 Ax DB` (and `3f f5`, a dual-issue pair's head) with op 7 / 8: the float
         // multiply-accumulates `rD += rA * rB (f)` / `rD -= rA * rB (f)` (vendor assembler,
         // work/probe/fpu78b.S); the corpora's FPU classes had none (the SMK-37's stock DSP code)
@@ -2954,6 +2983,18 @@ static FPU_MAC_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
 };
 static FPU_MAC_PAIR_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
     name: "fpu_mac_craw", syntax: "R += R * R (f) #", len: 4, count: 0, mask: 0, match_: 0,
+    group: "alu", alt: &[], samples: &[], slots: &[],
+};
+static HALF_MEM_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "half_mem_craw", syntax: "h[R+#i] (raw)", len: 4, count: 0, mask: 0, match_: 0,
+    group: "load", alt: &[], samples: &[], slots: &[],
+};
+static CLZ_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "clz_pair_craw", syntax: "R = clz(R) (raw)", len: 4, count: 0, mask: 0, match_: 0,
+    group: "alu", alt: &[], samples: &[], slots: &[],
+};
+static CLZ_PAIR_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "clz_pair_craw", syntax: "R = clz(R)  #", len: 4, count: 0, mask: 0, match_: 0,
     group: "alu", alt: &[], samples: &[], slots: &[],
 };
 static SP_WORD_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
@@ -4235,6 +4276,8 @@ fn route_of(insn: &Instruction, alu4: &Option<Alu4>, bittest: &Option<BitTest>) 
             "pc_r_1_mov_sp" | "pc_r_2_mov_sp" | "pc_r_3_mov_sp"
             | "pc_r_4_mov_sp" | "pc_r_mov_sp" | "pc_mask_mov_sp_craw" => 28,
             "sp_word_craw" => 33,
+            "half_mem_craw" => 35,
+            "clz_pair_craw" => 36,
             "rep_i_r" | "rep_i_i" => 29,
             n if n.starts_with("fpu_") => ROUTE_FPU,
             _ => ROUTE_SYNTAX,
@@ -4490,6 +4533,19 @@ fn fast_raw(route: u16, insn: &Instruction, alu4: &Option<Alu4>, bittest: &Optio
         16 | 18 | 19 | 21 | 22 | 27 | 32 => Some(Fast::Raw { route: route as u8, raw: raw as u32 }),
         26 if insn.entry.len == 4 => Some(Fast::PushMask { mask: ((raw >> 16) & 0xffff) as u16 }),
         28 if insn.entry.len == 4 => Some(Fast::PopMask { mask: ((raw >> 16) & 0xffff) as u16 }),
+        35 => {
+            let m = half_mem(raw)?;
+            let (d, b) = (m.d as u8, m.b as u8);
+            match (m.store, m.pre) {
+                (false, false) => Some(Fast::Ld { d, b: Base::Reg(b), off: m.off as u32, w: 2, signed: m.flag }),
+                (false, true) => Some(Fast::LdPre { d, b, i: 16, w: 2, signed: m.flag, inc: m.off as u32 }),
+                // (the store of the high half has no micro-op: route 35's step arm)
+                (true, _) if m.flag => None,
+                (true, false) => Some(Fast::St { s: d, b: Base::Reg(b), off: m.off as u32, w: 2 }),
+                (true, true) => Some(Fast::StPre { s: d, b, i: 16, w: 2, inc: m.off as u32 }),
+            }
+        }
+        36 => Some(Fast::Un { d: ((raw >> 28) & 0xf) as u8, s: ((raw >> 24) & 0xf) as u8, k: 4 }),
         34 => {
             let (d, s, signed) = sat16_raw(raw)?;
             Some(Fast::Un { d, s, k: if signed { 5 } else { 6 } })
@@ -4663,6 +4719,27 @@ fn fpu(op: u8, a: u32, b: u32) -> u32 {
         0x8f => (a as i32 as f32).to_bits(),
         _ => (a as f32).to_bits(),
     }
+}
+
+/// `5x ed` halfword accesses: data = bits(28,31), base = bits(20,23), bit16 store, byte 0 bit 2
+/// signed (a load) / the high half (a store), bit 3 pre-increment; off = sext10(byte0 & 3 << 8 |
+/// bits(24,27) << 4 | bits(17,19) << 1), in bytes. All 30337 corpus samples fit.
+#[derive(Clone, Copy, Debug)]
+struct HalfMem { d: usize, b: usize, store: bool, flag: bool, pre: bool, off: i32 }
+fn half_mem(raw: u64) -> Option<HalfMem> {
+    if (raw >> 8) & 0xff != 0xed || raw & 0xf0 != 0x50 {
+        return None;
+    }
+    let (b0, b2, b3) = (raw & 0xff, (raw >> 16) & 0xff, (raw >> 24) & 0xff);
+    let x = ((b0 & 3) << 8 | (b3 & 15) << 4 | (b2 & 14)) as i32;
+    Some(HalfMem {
+        d: (b3 >> 4) as usize,
+        b: (b2 >> 4) as usize,
+        store: b2 & 1 != 0,
+        flag: b0 & 4 != 0,
+        pre: b0 & 8 != 0,
+        off: if x & 512 != 0 { x - 1024 } else { x },
+    })
 }
 
 /// `78..7b e0 0S DS`: rD = sat16(rS), S 1 signed (s), 0 unsigned (u); byte 0's low bits do not
