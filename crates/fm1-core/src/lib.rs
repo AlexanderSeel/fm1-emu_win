@@ -631,7 +631,10 @@ impl Cpu {
                 match last.fast {
                     Fast::BrI { target, .. } | Fast::BrR { target, .. } | Fast::BrIEq { target, .. } | Fast::BrINe { target, .. }
                     | Fast::BitBr { target, .. } | Fast::DecBr { target, .. } => queue.extend([end, target]),
-                    Fast::Goto { target } | Fast::Call { target } => queue.push_back(target),
+                    Fast::Goto { target } => queue.push_back(target),
+                    // the callee, and where it returns to (its return finds that block in the
+                    // region: `jit_wasm::Gen::jump_local`)
+                    Fast::Call { target } => queue.extend([target, end]),
                     Fast::IfBlk { has_else: false, then_d, .. } => queue.extend([end, end.wrapping_add(then_d as u32)]),
                     f if f.may_jump() => {}
                     _ => queue.push_back(end),

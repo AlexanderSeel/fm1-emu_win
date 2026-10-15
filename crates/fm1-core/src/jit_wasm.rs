@@ -373,6 +373,9 @@ struct Gen<'a> {
     h_op: u32,
     /// the region's blocks by start pc -> index
     index: std::collections::HashMap<u32, u32>,
+    /// the same as a table in memory for jumps to a pc known only at run time (`jump_local`):
+    /// its address and mask; (pc, index) pairs at ((pc >> 1) & mask) * 8, collision-free
+    table: Option<(u32, u32)>,
     /// the block being emitted, the region's size, and the `if`s open inside the block's code
     cur: u32,
     n: u32,
@@ -445,6 +448,37 @@ impl Gen<'_> {
         self.st_field_from(off_pc(), l);
         self.done_plus(count);
         self.op(RETURN);
+    }
+    /// continue at the pc in local l (a return, a pc popped, a table branch, a helper's jump):
+    /// the region's block there, found in its table, else back to Rust. (Every such jump used
+    /// to leave: X0X went back to the dispatcher every 15 instructions.)
+    fn jump_local(&mut self, l: u32, count: u32) {
+        if let Some((table, mask)) = self.table {
+            // L_OFF = the entry's offset; its pc there: continue at its block
+            self.get(l);
+            self.i32c(1);
+            self.op(I32_SHR_U);
+            self.i32c(mask);
+            self.op(I32_AND);
+            self.i32c(3);
+            self.op(I32_SHL);
+            self.set(L_OFF);
+            self.get(L_OFF);
+            self.mem_op(I32_LOAD, 2, table);
+            self.get(l);
+            self.op(I32_EQ);
+            self.if_();
+            self.get(L_OFF);
+            self.mem_op(I32_LOAD, 2, table + 4);
+            self.set(L_CUR);
+            self.done_plus(count);
+            self.set(L_DONE);
+            // to the dispatch loop, as `goto`
+            self.op(BR);
+            uleb(&mut self.c, (self.n - 1 - self.cur + self.nest) as u64);
+            self.end();
+        }
+        self.exit_local(l, count);
     }
     /// continue at a fixed pc, `count` instructions of this block done: the region's block there,
     /// else back to Rust. `last`: at the very end of the block's code (the next block's code
@@ -705,6 +739,7 @@ fn compile<B: Bus>(blocks: &[(usize, u32, Vec<crate::BOp>)], mem: &JitMem, profi
         h_write: h_write::<B> as usize as u32,
         h_op: if profile { h_op::<B, true> as usize as u32 } else { h_op::<B, false> as usize as u32 },
         index: blocks.iter().enumerate().map(|(k, b)| (b.1, k as u32)).collect(),
+        table: jump_table(blocks),
         cur: 0,
         n,
         nest: 0,
@@ -1095,7 +1130,7 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
                 g.i32c(4);
                 g.op(I32_ADD);
                 g.mem_op(I32_STORE, 2, off_sp());
-                g.exit_local(L_VAL, count);
+                g.jump_local(L_VAL, count);
                 ended = true;
             }
             Fast::PushRets { n } => {
@@ -1142,7 +1177,7 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
                 g.i32c(4);
                 g.op(I32_ADD);
                 g.mem_op(I32_STORE, 2, off_sp());
-                g.exit_local(L_VAL, count);
+                g.jump_local(L_VAL, count);
                 ended = true;
             }
             Fast::BrI { a, v, cond, target } => {
@@ -1247,13 +1282,13 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
                 g.ld_reg(r); g.i32c(next_pc); g.op(I32_ADD); g.set(L_ADDR);
                 g.load(if half { 2 } else { 1 }, false, idx);
                 g.get(L_VAL); g.i32c(1); g.op(I32_SHL); g.i32c(next_pc); g.op(I32_ADD);
-                g.set(L_VAL); g.exit_local(L_VAL, count);
+                g.set(L_VAL); g.jump_local(L_VAL, count);
                 ended = true;
             }
             Fast::Rts => {
                 g.ld_field(off_rets());
                 g.set(L_VAL);
-                g.exit_local(L_VAL, count);
+                g.jump_local(L_VAL, count);
                 ended = true;
             }
             // ---- everything else: the interpreter's executor for this one op
@@ -1275,7 +1310,7 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
                 g.get(L_OPRES);
                 g.op(I32_WRAP_I64);
                 g.set(L_VAL);
-                g.exit_local(L_VAL, count);
+                g.jump_local(L_VAL, count);
                 g.end();
                 bus_used = true;
             }
@@ -1298,6 +1333,30 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
         // fell off the end of the prefix
         g.goto(pc, ops.len() as u32, true);
     }
+}
+
+/// A region's blocks as a table for `Gen::jump_local`: the smallest power-of-two size (at least
+/// twice the blocks) where (pc >> 1) & mask sets them all apart. Free slots hold pc 1 (no
+/// block starts at an odd pc). Lives as long as the program (as the regions' code does).
+fn jump_table(blocks: &[(usize, u32, Vec<crate::BOp>)]) -> Option<(u32, u32)> {
+    let mut size = (2 * blocks.len()).next_power_of_two().max(8);
+    while size <= 4096 {
+        let mask = size as u32 - 1;
+        let mut t = vec![1u32; 2 * size];
+        let fits = blocks.iter().enumerate().all(|(k, b)| {
+            let h = ((b.1 >> 1) & mask) as usize;
+            let free = t[2 * h] == 1;
+            t[2 * h] = b.1;
+            t[2 * h + 1] = k as u32;
+            free
+        });
+        if fits {
+            let t: &'static [u32] = Box::leak(t.into_boxed_slice());
+            return Some((t.as_ptr() as usize as u32, mask));
+        }
+        size *= 2;
+    }
+    None
 }
 
 /// The whole module around one function body.
