@@ -561,6 +561,25 @@ classes fit only the corpus offsets; JIANT) and `80 e1|f1 00 DS` clz (route 36; 
 Not added yet: Bubba Machine (stops on `rts` decoded as data at 0x0201d5d4, no audio) and Doom
 E1M1 (spins on a timer at 0x020035dc waiting for `[r10+4]` to advance, blue screen).
 
+## 5.18 The plugin: AU, VST3 and CLAP (2026-10-15)
+
+`crates/fm1-plugin` (its own cargo workspace, so its GUI dependencies stay out of the emulator's
+builds): one CLAP instrument written with nih-plug, its VST3 feature off since that brings GPL
+bindings. clap-wrapper v0.16 (`crates/fm1-plugin/wrap`, CMake + Ninja) makes the AUv2 and the VST3
+of it, with Apple's AudioUnitSDK (Apache-2.0) and the VST3 SDK 3.8 (MIT); each bundle carries the
+CLAP in Contents/PlugIns, where the wrapper looks first. `tools/build_plugin.sh` builds, signs ad
+hoc, installs, runs `auval` (passes: render tests at 11.025-192 kHz, latency, state, UI).
+Under Ninja clap-wrapper's PRE_BUILD copy of the generated Info.plist is overwritten by the
+bundle's default one (no AudioComponents: "didn't find the component"); the script copies it in.
+
+The machine runs on its own thread, a ring of 44.1 kHz frames ahead of the host (a host block +
+1024), host MIDI stamped with its frame (the host's position + the lead), applied when the machine
+reaches it; the lead is the latency reported. A test (`tests/engine.rs`) runs Felucca and finds a
+stamped note sounding 312 frames after its frame (the DMA half then running, and the attack).
+The project keeps the package (base64) and the flash sectors the firmware wrote (checked every
+2 s), so patches come back. The window draws panel.rs / panel_smk.rs, played as on the page;
+MASTER is a host parameter, so is a MIDI channel override (M-VAVE's firmware listens on 2).
+
 ## 6. Phase 5 — Boot & integration
 
 - Boot stock firmware to a stable idle/main-loop state.

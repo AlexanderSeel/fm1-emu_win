@@ -131,6 +131,14 @@ memory dumps).
 The page builds with `web/build.sh` (Rust to WebAssembly; needs the `wasm32-unknown-unknown`
 target), the whole site with `tools/build_site.sh`.
 
+### In a DAW: AU, VST3, CLAP
+
+`tools/build_plugin.sh` builds the emulator as an instrument plugin on a Mac: an AU (Logic,
+GarageBand), a VST3 and a CLAP, all from one Rust plugin (MIT, as are the SDKs it uses). It
+installs them and runs Apple's AU validator. Load a `.fwsc` in its window and play it from the
+host's MIDI; the firmware and its saved patches are kept in the project.
+See [crates/fm1-plugin](crates/fm1-plugin/README.md).
+
 ## How it works
 
 The FM-1 is built on a JieLi AC791N: two cores of JieLi's own 32-bit pi32v2 CPU, with no
