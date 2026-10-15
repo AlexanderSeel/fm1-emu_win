@@ -505,8 +505,9 @@ impl Cpu {
                         if k > 0 {
                             n += k;
                             pc = self.pc;
-                            // (it left between the two instructions of a glued pair)
-                            careful = self.hold_irq != 0;
+                            // (it left between the two instructions of a glued pair, or inside an
+                            // if-else block's then-part)
+                            careful = self.hold_irq != 0 || !self.pred_skips.is_empty();
                             continue;
                         }
                     }
@@ -621,11 +622,28 @@ impl Cpu {
             }
             let Ok(Some((bid, start, len))) = self.block_at(bus, pc) else { continue };
             let all = &self.bops[start as usize..(start + len) as usize];
-            let ops: Vec<BOp> = all.iter().take_while(|o| !o.careful).copied().collect();
+            let mut ops: Vec<BOp> = all.iter().take_while(|o| !o.careful).copied().collect();
+            let (all_len, tail) = (all.len(), all.get(ops.len()).copied());
+            // an if-else block at the end, its then-part plain: compiled with the then-part in
+            // tow (`jit_wasm`'s IfBlk), going on at the else part or past it
+            if let Some(last) = tail.filter(|_| ops.len() + 1 == all_len) {
+                if let Fast::IfBlk { has_else: true, fam, then_d, else_d, .. } = last.fast {
+                    let next = pc + ops.iter().chain([&last]).map(|o| o.len as u32).sum::<u32>();
+                    if let Some(then) = (fam < 8).then(|| self.then_part(bus, next, then_d)).flatten() {
+                        let then_end = next.wrapping_add(then_d as u32);
+                        ops.push(last);
+                        ops.extend(then);
+                        queue.extend([then_end, then_end.wrapping_add(else_d as u32)]);
+                        total += ops.len();
+                        out.push((bid, pc, ops));
+                        continue;
+                    }
+                }
+            }
             if ops.is_empty() {
                 continue;
             }
-            if ops.len() == all.len() {
+            if ops.len() == all_len {
                 let last = ops[ops.len() - 1];
                 let end: u32 = pc + ops.iter().map(|o| o.len as u32).sum::<u32>();
                 match last.fast {
@@ -644,6 +662,30 @@ impl Cpu {
             out.push((bid, pc, ops));
         }
         out
+    }
+
+    /// The then-part of an if-else block, `then_d` bytes from `pc`, when it is plain micro-ops
+    /// at the start of the block there (no jump, pair, careful op): what the wasm JIT compiles
+    /// in line with the if.
+    #[cfg(target_arch = "wasm32")]
+    fn then_part<B: Bus>(&mut self, bus: &mut B, pc: u32, then_d: u16) -> Option<Vec<BOp>> {
+        let mut then = Vec::new();
+        let mut q = pc;
+        let end = pc.wrapping_add(then_d as u32);
+        if q != end {
+            let (_, start, len) = self.block_at(bus, pc).ok()??;
+            for o in &self.bops[start as usize..(start + len) as usize] {
+                if q == end {
+                    break;
+                }
+                if o.careful || o.pair_head || o.glue || o.fast.may_jump() {
+                    return None;
+                }
+                then.push(*o);
+                q += o.len as u32;
+            }
+        }
+        (q == end).then_some(then)
     }
 
     /// Is RAM block `id` still built from what memory holds now? In the wasm build, by the bus's

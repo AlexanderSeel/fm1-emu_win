@@ -151,6 +151,9 @@ pub struct Ctx {
     synced: u32,
     /// the next tick is due: leave after this instruction
     brk: u32,
+    /// left inside an if-else block's then-part: its skip (then end, else end), for `run` to
+    /// put in `Cpu::pred_skips` as the interpreter has it there (0: none)
+    pred: [u32; 2],
 }
 
 /// Run compiled code: returns the instructions executed; cpu.pc is set. At most `cap`
@@ -161,11 +164,16 @@ pub struct Ctx {
 pub(crate) unsafe fn run<B: Bus>(f: u32, start: u32, cpu: &mut Cpu, bus: &mut B, extra: u32, cap: u32) -> u32 {
     // instructions this call may run: their ticks ((k - 1) + extra) must all fit tick_room
     let limit = (bus.tick_room() + 1).saturating_sub(extra as u64).min(1 << 30).min(cap as u64) as u32;
-    let mut ctx = Ctx { cpu: cpu as *mut Cpu, bus: bus as *mut B as *mut (), extra, synced: 0, brk: 0 };
+    let mut ctx = Ctx { cpu: cpu as *mut Cpu, bus: bus as *mut B as *mut (), extra, synced: 0, brk: 0, pred: [0; 2] };
     // SAFETY: on wasm32 a function pointer is its index in the function table, where the host
     // installed this block's `run` with exactly this signature
     let code: extern "C" fn(*mut Cpu, *mut Ctx, u32, u32) -> u32 = unsafe { std::mem::transmute(f as usize) };
     let k = code(cpu as *mut Cpu, &mut ctx, limit, start);
+    if ctx.pred[0] != 0 {
+        let (te, ee) = (ctx.pred[0], ctx.pred[1]);
+        cpu.pred_skips.retain(|&(t, _)| t != te);
+        cpu.pred_skips.push((te, ee));
+    }
     if k > 0 {
         // the ticks of the instructions run, less those the helpers applied already
         let need = (k - 1) + extra;
@@ -364,6 +372,7 @@ fn off_hold() -> u32 {
     offset_of!(Cpu, hold_irq) as u32
 }
 const OFF_BRK: u32 = offset_of!(Ctx, brk) as u32;
+const OFF_PRED: u32 = offset_of!(Ctx, pred) as u32;
 
 struct Gen<'a> {
     c: Vec<u8>,
@@ -376,6 +385,8 @@ struct Gen<'a> {
     /// the same as a table in memory for jumps to a pc known only at run time (`jump_local`):
     /// its address and mask; (pc, index) pairs at ((pc >> 1) & mask) * 8, collision-free
     table: Option<(u32, u32)>,
+    /// emitting an if-else block's then-part: its skip (then end, else end)
+    pred: Option<(u32, u32)>,
     /// the block being emitted, the region's size, and the `if`s open inside the block's code
     cur: u32,
     n: u32,
@@ -529,7 +540,21 @@ impl Gen<'_> {
             self.i32c(1);
             self.mem_op(I32_STORE, 2, off_hold());
         }
-        self.exit_imm(next_pc, count);
+        match self.pred {
+            // inside an if-else block's then-part: at its end the skip is taken (as `finish`),
+            // before it the skip goes with the exit (`run` puts it in pred_skips)
+            Some((te, ee)) if next_pc == te => self.exit_imm(ee, count),
+            Some((te, ee)) => {
+                self.get(L_CTX);
+                self.i32c(te);
+                self.mem_op(I32_STORE, 2, OFF_PRED);
+                self.get(L_CTX);
+                self.i32c(ee);
+                self.mem_op(I32_STORE, 2, OFF_PRED + 4);
+                self.exit_imm(next_pc, count);
+            }
+            None => self.exit_imm(next_pc, count),
+        }
         self.end();
     }
 
@@ -740,6 +765,7 @@ fn compile<B: Bus>(blocks: &[(usize, u32, Vec<crate::BOp>)], mem: &JitMem, profi
         h_op: if profile { h_op::<B, true> as usize as u32 } else { h_op::<B, false> as usize as u32 },
         index: blocks.iter().enumerate().map(|(k, b)| (b.1, k as u32)).collect(),
         table: jump_table(blocks),
+        pred: None,
         cur: 0,
         n,
         nest: 0,
@@ -1233,6 +1259,45 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
                 g.goto(target, count, false);
                 g.end();
             }
+            Fast::IfBlk { a, rk, fam, alt, has_else: true, rv, then_d, else_d } if fam < 8 && g.pred.is_none() => {
+                // the region brought its then-part along (`Cpu::wasm_region`): the rest of this
+                // block's ops. Not taken: on at the else part. Taken: the then-part, then past
+                // the else part (the interpreter's pred_skips, kept by check_brk on an exit)
+                let then_end = next_pc.wrapping_add(then_d as u32);
+                let else_end = then_end.wrapping_add(else_d as u32);
+                g.rhs(rk, rv);
+                g.ld_reg(a);
+                g.set(L_A);
+                if fam == 2 {
+                    g.get(L_A);
+                    g.get(L_B);
+                    g.op(I32_AND);
+                    g.i32c(0);
+                    g.op(I32_NE);
+                    g.i32c(alt as u32);
+                    g.op(I32_EQ);
+                } else {
+                    g.get(L_A);
+                    g.get(L_B);
+                    g.op(match fam { 0 => I32_EQ, 1 => I32_GE_U, 4 => I32_GT_U, 5 => I32_GE_S, _ => I32_GT_S });
+                    if alt {
+                        g.op(I32_EQZ);
+                    }
+                }
+                g.op(I32_EQZ);
+                g.if_();
+                g.goto(then_end, count, false);
+                g.end();
+                if i + 1 == ops.len() {
+                    // an empty then-part
+                    g.goto(else_end, count, true);
+                    ended = true;
+                    break;
+                }
+                g.pred = Some((then_end, else_end));
+                pc = next_pc;
+                continue;
+            }
             Fast::IfBlk { a, rk, fam, alt, has_else: false, rv, then_d, .. } if fam < 8 => {
                 // taken: the then-part follows; not taken: skip it
                 g.rhs(rk, rv);
@@ -1322,6 +1387,14 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
             g.check_brk(next_pc, count, op.glue);
         }
         pc = next_pc;
+        if let Some((te, ee)) = g.pred.filter(|&(te, _)| next_pc == te) {
+            // the then-part's end: past the else part
+            let _ = te;
+            g.pred = None;
+            g.goto(ee, count, true);
+            ended = true;
+            break;
+        }
         if op.fast.may_jump() {
             // (the block's last op): it fell through
             g.goto(next_pc, count, true);
