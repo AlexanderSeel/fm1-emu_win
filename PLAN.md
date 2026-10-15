@@ -655,6 +655,36 @@ Android or browser AudioWorklet measurements.
   actual browser/Android callback behavior and native DAW playback remain to be verified.
   Node throughput and the worklet harness do not substitute for those device checks.
 
+## 5.20 WASM: fewer exits from compiled code (geomean +14%, X0X +57%) (2026-10-16)
+
+Node's CPU profile (`node --cpu-prof web/bench.mjs`) put about a third of WASM time in
+`run_fast` itself: the dispatcher between compiled regions. FM1_PROFILE counts showed X0X
+leaving compiled code every 15 instructions (38 M times in 3 emulated s). Three causes, fixed:
+- Run-time jumps (returns, popped pcs, table branches, helper jumps) always left the region.
+  Each region now has a collision-free (pc >> 1) & mask table of its blocks in memory; such
+  a jump looks its target up and continues inside. Regions also queue a call's return point.
+- An if-else block was careful, never compiled; X0X's hot string compare starts with one. The
+  region takes the then-part in tow when plain; an exit inside it (a tick after a bus access)
+  hands `run` the skip for `pred_skips`, as the interpreter has it.
+- Every peripheral write set next_due = 0 (a SoC service, leaving compiled code). The FM-1's
+  instant ADC needs one only when IRQ 24's state changes; OberVave converts ~1 M times / s.
+
+WASM, three interleaved rounds against 1e11413: geomean 1.137 over 35 firmwares; X0X 1.72x ->
+2.70x, OberVave 1.25x -> 1.78x, CTL-1 +33%, FuMi +31%, Polly +28%, zp12 +18%, GHOULBOX +17%,
+FM-1 Doom 1.18x -> 1.33x, stock +11%, SMK-37 stock 1.41x -> 1.47x; none slower beyond noise
+(FM-1 SID -1%). Native (the ADC change): OberVave +21%, X0X +4%. Audio identical natively
+(35) and in WASM (36 with and without input, SMK-37 stock and 14 ports), also at 120 MHz and
+against the WASM interpreter; JIT == interpreter == single steps natively.
+
+Tried and dropped (measured):
+- Skipping cpu1's idle rounds: record a round (interpreted), and while its state, the words it
+  read and its stores (idempotent RAM bytes, a no-op latch clear) are unchanged and no IRQ is
+  due, skip the slice. X0X: 570 k of its idle slices skipped, yet only +4% WASM, ~0 native,
+  stock FM-1 -2%. The SMK-37's idle loop reads TIMER5's count (it changes every slice), so
+  it can never be skipped. The cost was in the probing calls' fixed overhead, not the rounds.
+- Regions of 64 blocks / 768 ops: Doom +3%, Felucca +4%, but zp12 -7%, X0X / AMB -5%.
+Next for Doom (slowest, 1.33x): its frame wait calls through ~6 regions per round.
+
 ## 6. Phase 5 — Boot & integration
 
 - Boot stock firmware to a stable idle/main-loop state.
