@@ -25,6 +25,7 @@
 
 use fm1_core::Bus;
 
+pub mod script;
 pub mod fwsc;
 mod lcd;
 pub mod machine;

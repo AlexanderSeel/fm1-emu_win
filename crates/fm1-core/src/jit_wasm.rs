@@ -58,6 +58,8 @@ pub struct Jit {
     pub(crate) rinfo: Vec<(Box<[usize]>, u64)>,
     pub regions: u32,
     pub bytes: usize,
+    /// compile helper calls that count themselves (`Cpu::profile` when the JIT was made)
+    profile: bool,
 }
 
 impl std::fmt::Debug for Jit {
@@ -67,8 +69,8 @@ impl std::fmt::Debug for Jit {
 }
 
 impl Jit {
-    pub fn new() -> Option<Jit> {
-        Some(Jit { state: Vec::new(), rinfo: Vec::new(), regions: 0, bytes: 0 })
+    pub fn new(profile: bool) -> Option<Jit> {
+        Some(Jit { state: Vec::new(), rinfo: Vec::new(), regions: 0, bytes: 0, profile })
     }
 
     fn at(&mut self, id: usize) -> &mut Entry {
@@ -97,7 +99,7 @@ impl Jit {
     /// RAM blocks having just been found current. False: it could not be compiled.
     pub(crate) fn install<B: Bus>(&mut self, blocks: &[(usize, u32, Vec<crate::BOp>)], mem: &JitMem, ver: u64) -> bool {
         COMPILE_BUDGET.fetch_sub(1, Ordering::Relaxed);
-        let m = compile::<B>(blocks, mem);
+        let m = compile::<B>(blocks, mem, self.profile);
         // SAFETY: a plain byte slice; the host copies it before returning
         let f = unsafe { fm1_jit_compile(m.as_ptr(), m.len()) };
         if f == 0 {
@@ -219,12 +221,17 @@ extern "C" fn h_write<B: Bus>(ctx: *mut Ctx, addr: u32, v: u32, idx: u32, w: u32
 }
 
 /// Any op through the interpreter's own executor: bit 32 = jumped (target in the low word).
-extern "C" fn h_op<B: Bus>(ctx: *mut Ctx, op: *const Fast, idx: u32, next_pc: u32) -> u64 {
+// PROF: count the call (`Cpu::jit_helpers`); chosen when compiling, so code compiled without
+// profiling pays nothing for it (an unconditional call cost 10-12% on AMB / TRIBE)
+extern "C" fn h_op<B: Bus, const PROF: bool>(ctx: *mut Ctx, op: *const Fast, idx: u32, next_pc: u32) -> u64 {
     // SAFETY: as h_read; `op` points at a leaked, immutable Fast.
     let ctx = unsafe { &mut *ctx };
     let bus = unsafe { &mut *(ctx.bus as *mut B) };
     let cpu = unsafe { &mut *ctx.cpu };
     unsafe { sync(ctx, bus, idx) };
+    if PROF {
+        cpu.profile_helper(unsafe { &*op });
+    }
     let j = cpu.exec_fast(bus, unsafe { *op }, next_pc);
     if bus.next_tick_due() {
         ctx.brk = 1;
@@ -689,14 +696,14 @@ impl Gen<'_> {
 
 /// The module for a region: blocks (id, start pc, plain micro-ops: none careful), the hot one
 /// first.
-fn compile<B: Bus>(blocks: &[(usize, u32, Vec<crate::BOp>)], mem: &JitMem) -> Vec<u8> {
+fn compile<B: Bus>(blocks: &[(usize, u32, Vec<crate::BOp>)], mem: &JitMem, profile: bool) -> Vec<u8> {
     let n = blocks.len() as u32;
     let mut g = Gen {
         c: Vec::with_capacity(64 * blocks.iter().map(|b| b.2.len()).sum::<usize>()),
         mem,
         h_read: h_read::<B> as usize as u32,
         h_write: h_write::<B> as usize as u32,
-        h_op: h_op::<B> as usize as u32,
+        h_op: if profile { h_op::<B, true> as usize as u32 } else { h_op::<B, false> as usize as u32 },
         index: blocks.iter().enumerate().map(|(k, b)| (b.1, k as u32)).collect(),
         cur: 0,
         n,
@@ -1226,6 +1233,21 @@ fn block<B: Bus>(g: &mut Gen<'_>, pc0: u32, ops: &[crate::BOp]) {
                 g.i32c(next_pc);
                 g.mem_op(I32_STORE, 2, off_rets());
                 g.goto(target, count, true);
+                ended = true;
+            }
+            Fast::PopRets => {
+                g.ld_field(off_sp()); g.set(L_ADDR);
+                g.load(4, false, idx);
+                g.get(L_CPU); g.get(L_VAL); g.mem_op(I32_STORE, 2, off_rets());
+                g.get(L_CPU); g.get(L_ADDR); g.i32c(4); g.op(I32_ADD);
+                g.mem_op(I32_STORE, 2, off_sp());
+                bus_used = true;
+            }
+            Fast::Tb { r, half } => {
+                g.ld_reg(r); g.i32c(next_pc); g.op(I32_ADD); g.set(L_ADDR);
+                g.load(if half { 2 } else { 1 }, false, idx);
+                g.get(L_VAL); g.i32c(1); g.op(I32_SHL); g.i32c(next_pc); g.op(I32_ADD);
+                g.set(L_VAL); g.exit_local(L_VAL, count);
                 ended = true;
             }
             Fast::Rts => {

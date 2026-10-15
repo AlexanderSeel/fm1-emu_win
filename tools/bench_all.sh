@@ -26,23 +26,30 @@ printf "%-14s %8s %9s" firmware native "M insn/s"
 [ -n "${WASM:-}" ] && printf " %8s" wasm
 [ -n "${REF:-}" ] && printf "  audio"
 echo
+failed=0
 for f in $FW; do
   if [ "$f" = stock ]; then src=(--fwsc "$STOCK"); else src=(--fw "$f"); fi
   wavenv=()
   [ -n "${WAV:-}" ] && wavenv=(FM1_BENCH_WAV="$WAV/$f.raw")
-  line="$(env ${ENV:-} ${wavenv[@]+"${wavenv[@]}"} "$BIN" "${src[@]}" --mhz "$MHZ" --bench "$MS" 2>&1 | grep "real time")"
+  if ! line="$(env ${ENV:-} ${wavenv[@]+"${wavenv[@]}"} "$BIN" "${src[@]}" --mhz "$MHZ" --bench "$MS" 2>&1 | grep "ms emulated")"; then
+    printf "%s FAILED native benchmark\n" "$f" >&2
+    failed=1
+  fi
   x="$(sed -E 's/.* ([0-9.]+)x real time.*/\1/' <<<"$line")"
   mi="$(sed -E 's/.* ([0-9.]+) M instructions.*/\1/' <<<"$line")"
   printf "%-14s %7sx %9s" "$f" "${x:-?}" "${mi:-?}"
   if [ -n "${WASM:-}" ]; then
     if [ "$f" = stock ]; then pkg="$STOCK"; else pkg="reference/firmwares/$f.fwsc"; fi
-    w="$(FM1_FWSC="$pkg" node web/bench.mjs "$MHZ" "$((MS / 1000))" 2>&1 | sed -nE 's/.* ([0-9.]+)x real time.*/\1/p')"
+    if ! w="$(FM1_FWSC="$pkg" node web/bench.mjs "$MHZ" "$((MS / 1000))" 2>&1 | sed -nE 's/.* ([0-9.]+)x real time.*/\1/p')" || [ -z "$w" ]; then
+      failed=1
+    fi
     printf " %7sx" "${w:-?}"
   fi
   if [ -n "${REF:-}" ]; then
     # (a bench can end an audio half earlier or later: the run loop checks its budget per block)
     c="$(cmp "$WAV/$f.raw" "$REF/$f.raw" 2>&1)"
-    if [ -z "$c" ]; then printf "  same"; elif grep -q EOF <<<"$c"; then printf "  same (prefix)"; else printf "  DIFFERENT"; fi
+    if [ -z "$c" ]; then printf "  same"; elif grep -q EOF <<<"$c"; then printf "  same (prefix)"; else printf "  DIFFERENT"; failed=1; fi
   fi
   echo
 done
+exit "$failed"

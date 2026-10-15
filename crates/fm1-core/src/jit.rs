@@ -17,7 +17,7 @@
 //!
 //! Register plan (AAPCS64 callee-saved, so helpers may be called freely):
 //!   x19 = &Cpu, x20 = &Ctx, x21 = RAM host base, x22 = XIP host base,
-//!   w23 / w24 = values kept across a helper call within one instruction,
+//!   w23 / w24 = values kept across a helper call within one instruction, x25 = code flags,
 //!   w26 = instructions done in this call before the current block, w27 = the limit
 //!   (instructions this call may run). Guest registers, sp and rets stay in the Cpu struct;
 //!   pc is stored at exit.
@@ -32,7 +32,7 @@ pub struct JitMem {
     pub ram: *mut u8,
     pub ram_base: u32,
     pub ram_len: u32,
-    /// RAM's code-word flags (the wasm JIT's inline stores; not used here)
+    /// RAM code-word flags: stores to watched words must pass through the bus.
     pub ram_code: *const u8,
     pub xip: *const u8,
     pub xip_base: u32,
@@ -53,6 +53,7 @@ pub struct Ctx {
     _pad: u32,
     /// the chain slot of the exit taken back to Rust (null: not a chainable exit)
     slot: *mut u64,
+    code_version: Option<u64>,
 }
 const OFF_BRK: u32 = 24;
 const OFF_SLOT: u32 = 32;
@@ -107,6 +108,10 @@ pub struct Jit {
     cache: CodeCache,
     /// per block: runs counted until hot, then the compiled entry (or a failure)
     state: Vec<Entry>,
+    // Boxes keep addresses embedded in generated code stable until cache reset.
+    guards: Vec<Box<RamGuard>>,
+    /// compile helper calls that count themselves (`Cpu::profile` when the JIT was made)
+    profile: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -131,8 +136,8 @@ impl std::fmt::Debug for Jit {
 const HOT: u32 = 32;
 
 impl Jit {
-    pub fn new() -> Option<Jit> {
-        Some(Jit { cache: CodeCache::new(64 << 20)?, state: Vec::new() })
+    pub fn new(profile: bool) -> Option<Jit> {
+        Some(Jit { cache: CodeCache::new(64 << 20)?, state: Vec::new(), guards: Vec::new(), profile })
     }
 
     /// The compiled code of block `id` (prefix length), compiling it once it is hot.
@@ -152,7 +157,7 @@ impl Jit {
                 let e = if plen == 0 {
                     Entry::No
                 } else {
-                    match compile::<B>(&ops[..plen], pc0, mem) {
+                    match compile::<B>(&ops[..plen], pc0, mem, &mut self.guards, self.profile) {
                         Some((w, body)) => match self.cache.write(&w) {
                             // SAFETY: body is a word index inside the code just written
                             Some(p) => Entry::Code(p, unsafe { p.add(body * 4) }, plen as u32),
@@ -182,6 +187,7 @@ impl Jit {
     pub fn reset(&mut self) {
         self.state.clear();
         self.cache.used = 0;
+        self.guards.clear();
     }
 }
 
@@ -189,12 +195,12 @@ impl Jit {
 ///
 /// # Safety
 /// `code` must come from `Jit::entry` for this bus type and the memory `mem` describes.
-pub(crate) unsafe fn run<B: Bus>(code: *const u8, cpu: &mut Cpu, bus: &mut B, mem: &JitMem, extra: u32) -> (u32, *mut u64) {
+pub(crate) unsafe fn run<B: Bus>(code: *const u8, cpu: &mut Cpu, bus: &mut B, mem: &JitMem, extra: u32, cap: u32) -> (u32, *mut u64) {
     // instructions this call may run: their ticks ((k - 1) + extra) must all fit tick_room
-    let limit = (bus.tick_room() + 1).saturating_sub(extra as u64).min(1 << 30) as u32;
-    let mut ctx = Ctx { cpu: cpu as *mut Cpu, bus: bus as *mut B as *mut (), extra, synced: 0, brk: 0, _pad: 0, slot: std::ptr::null_mut() };
-    let f: extern "C" fn(*mut Cpu, *mut Ctx, *mut u8, *const u8, u32) -> u32 = unsafe { std::mem::transmute(code) };
-    let k = f(cpu as *mut Cpu, &mut ctx, mem.ram, mem.xip, limit);
+    let limit = (bus.tick_room() + 1).saturating_sub(extra as u64).min(1 << 30).min(cap as u64) as u32;
+    let mut ctx = Ctx { cpu: cpu as *mut Cpu, bus: bus as *mut B as *mut (), extra, synced: 0, brk: 0, _pad: 0, slot: std::ptr::null_mut(), code_version: bus.code_writes() };
+    let f: extern "C" fn(*mut Cpu, *mut Ctx, *mut u8, *const u8, u32, *const u8) -> u32 = unsafe { std::mem::transmute(code) };
+    let k = f(cpu as *mut Cpu, &mut ctx, mem.ram, mem.xip, limit, mem.ram_code);
     if k > 0 {
         // the ticks of the instructions run, less those the helpers applied already
         let need = (k - 1) + extra;
@@ -225,7 +231,7 @@ extern "C" fn h_read<B: Bus>(ctx: *mut Ctx, addr: u32, idx: u32, w: u32) -> u32 
         2 => bus.read16(addr) as u32,
         _ => bus.read32(addr),
     };
-    if bus.next_tick_due() {
+    if bus.next_tick_due() || bus.code_writes() != ctx.code_version {
         ctx.brk = 1;
     }
     v
@@ -241,26 +247,51 @@ extern "C" fn h_write<B: Bus>(ctx: *mut Ctx, addr: u32, v: u32, idx: u32, w: u32
         2 => bus.write16(addr, v as u16),
         _ => bus.write32(addr, v),
     }
-    if bus.next_tick_due() {
+    if bus.next_tick_due() || bus.code_writes() != ctx.code_version {
         ctx.brk = 1;
     }
 }
 
 /// Any op through the interpreter's own executor: bit 32 = jumped (target in the low word).
-extern "C" fn h_op<B: Bus>(ctx: *mut Ctx, op: *const Fast, idx: u32, next_pc: u32) -> u64 {
+// PROF: count the call (`Cpu::jit_helpers`); chosen when compiling, so code compiled without
+// profiling pays nothing for it
+extern "C" fn h_op<B: Bus, const PROF: bool>(ctx: *mut Ctx, op: *const Fast, idx: u32, next_pc: u32) -> u64 {
     // SAFETY: as h_read; `op` points at a leaked, immutable Fast.
     let ctx = unsafe { &mut *ctx };
     let bus = unsafe { &mut *(ctx.bus as *mut B) };
     let cpu = unsafe { &mut *ctx.cpu };
     unsafe { sync(ctx, bus, idx) };
+    if PROF {
+        cpu.profile_helper(unsafe { &*op });
+    }
     let j = cpu.exec_fast(bus, unsafe { *op }, next_pc);
-    if bus.next_tick_due() {
+    if bus.next_tick_due() || bus.code_writes() != ctx.code_version {
         ctx.brk = 1;
     }
     match j {
         Some(t) => (1u64 << 32) | t as u64,
         None => 0,
     }
+}
+
+// Each RAM body owns an immutable snapshot. Even an old incoming chain remains safe
+// after its block has been rebuilt: it must validate the code it actually executes.
+struct RamGuard {
+    pc: u32,
+    bytes: Box<[u8]>,
+    version: Option<u64>,
+}
+
+extern "C" fn h_ram_ok<B: Bus>(ctx: *mut Ctx, guard: *mut RamGuard) -> u32 {
+    let ctx = unsafe { &mut *ctx };
+    let bus = unsafe { &mut *(ctx.bus as *mut B) };
+    let guard = unsafe { &mut *guard };
+    let version = bus.code_writes();
+    if version.is_some() && guard.version == version { return 1; }
+    let valid = crate::ram_code(bus, guard.pc)
+        .is_some_and(|now| now.len() >= guard.bytes.len() && now[..guard.bytes.len()] == *guard.bytes);
+    if valid { guard.version = version; }
+    valid as u32
 }
 
 // ------------------------------------------------------------------ code generation
@@ -271,6 +302,7 @@ const RAM: Reg = 21;
 const XIP: Reg = 22;
 const KEEP: Reg = 23;
 const KEEP2: Reg = 24;
+const FLAGS: Reg = 25;
 const DONE: Reg = 26;
 const LIMIT: Reg = 27;
 const FRAME: i32 = 96;
@@ -479,6 +511,11 @@ impl Gen<'_> {
         self.a.mov32(2, mem.ram_len.saturating_sub(w as u32));
         self.a.cmp(3, 2);
         self.a.b_cond(AC::Hi, slow);
+        if !mem.ram_code.is_null() {
+            self.a.lsr_imm(2, 3, 2);
+            self.a.ldrb_u(2, FLAGS, 2);
+            self.a.cbnz(2, slow);
+        }
         match w {
             4 => self.a.str_u(1, RAM, 3),
             2 => self.a.strh_u(1, RAM, 3),
@@ -515,7 +552,7 @@ impl Gen<'_> {
 }
 
 /// Native code for a block prefix of plain micro-ops (none careful).
-fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem) -> Option<(Vec<u32>, usize)> {
+fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<Box<RamGuard>>, profile: bool) -> Option<(Vec<u32>, usize)> {
     for o in [off_reg(15), off_sp(), off_rets(), off_pc(), off_hold()] {
         if o >= 16384 {
             return None;
@@ -529,7 +566,7 @@ fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem) -> Option<(Vec<u3
         exit,
         h_read: h_read::<B> as usize as u64,
         h_write: h_write::<B> as usize as u64,
-        h_op: h_op::<B> as usize as u64,
+        h_op: if profile { h_op::<B, true> as usize as u64 } else { h_op::<B, false> as usize as u64 },
     };
     // prologue (entry from Rust); chained blocks enter at the body
     g.a.stp_pre(29, 30, SP, -FRAME);
@@ -543,6 +580,7 @@ fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem) -> Option<(Vec<u3
     g.a.mov_x(RAM, 2);
     g.a.mov_x(XIP, 3);
     g.a.mov(LIMIT, 4);
+    g.a.mov_x(FLAGS, 5);
     g.a.movz(DONE, 0, 0);
     let body = g.a.here();
     // the whole prefix must fit the call's limit, else back to Rust before running any of it
@@ -553,6 +591,23 @@ fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem) -> Option<(Vec<u3
         g.a.b_cond(AC::Ls, fits);
         g.exit_imm(pc0, 0);
         g.a.bind(fits);
+    }
+
+    if !(0x0200_0000..0x0400_0000).contains(&pc0) {
+        let off = pc0.wrapping_sub(mem.ram_base) as usize;
+        let len = ops.iter().map(|op| op.len as usize).sum::<usize>() + 6;
+        let len = len.min((mem.ram_len as usize).checked_sub(off)?);
+        // SAFETY: jit_mem provides a live RAM allocation, and the range is checked above.
+        let bytes = unsafe { std::slice::from_raw_parts(mem.ram.add(off), len) }.into();
+        guards.push(Box::new(RamGuard { pc: pc0, bytes, version: None }));
+        let guard = guards.last_mut().unwrap().as_mut();
+        let valid = g.a.label();
+        g.a.mov_x(0, CTX);
+        g.a.mov64(1, guard as *mut RamGuard as u64);
+        g.call(h_ram_ok::<B> as *const () as u64);
+        g.a.cbnz(0, valid);
+        g.exit_imm(pc0, 0);
+        g.a.bind(valid);
     }
 
     let mut pc = pc0;
@@ -865,6 +920,68 @@ fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem) -> Option<(Vec<u3
                 g.store(4, idx);
                 bus_used = true;
             }
+            Fast::SpAdd { v } => {
+                g.a.ldr(0, CPU, off_sp()); g.add_imm(0, 0, v);
+                g.a.str(0, CPU, off_sp());
+            }
+            Fast::RFromSp { d, v } => {
+                g.a.ldr(0, CPU, off_sp()); g.add_imm(0, 0, v); g.st_reg(0, d);
+            }
+            Fast::Mov2 { dh, dl, sh, sl } => {
+                g.ld_reg(0, sh); g.ld_reg(1, sl);
+                g.st_reg(0, dh); g.st_reg(1, dl);
+            }
+            Fast::Mov2I { dh, dl, v } => {
+                g.a.mov32(0, v); g.st_reg(0, dl);
+                g.a.mov32(0, ((v as i32) >> 31) as u32); g.st_reg(0, dh);
+            }
+            Fast::BitExt { d, s, p, l, signed } => {
+                let (p, l) = (p as u32 & 31, l as u32 & 31);
+                g.ld_reg(0, s); g.a.lsr_imm(0, 0, p);
+                if l != 0 {
+                    if signed { g.a.sbfx(0, 0, 0, l); } else { g.a.ubfx(0, 0, 0, l); }
+                }
+                g.st_reg(0, d);
+            }
+            Fast::BitIns { d, s, p, l } => {
+                let (p, l) = (p as u32 & 31, l as u32 & 31);
+                let mask = if l == 0 { u32::MAX } else { (1u32 << l) - 1 };
+                g.ld_reg(0, s); g.ld_reg(1, d);
+                g.a.mov32(2, mask); g.a.and(0, 0, 2); g.a.lsl_imm(0, 0, p);
+                g.a.mov32(2, !(mask << p)); g.a.and(1, 1, 2); g.a.orr(0, 0, 1);
+                g.st_reg(0, d);
+            }
+            Fast::PushRets { n } => {
+                let (top, bot) = ((n as i32).max(3), (n as i32).min(4));
+                for r in std::iter::once(-1).chain((bot..=top).rev()) {
+                    g.a.ldr(0, CPU, off_sp()); g.a.sub_imm(0, 0, 4);
+                    g.a.str(0, CPU, off_sp());
+                    if r < 0 { g.a.ldr(1, CPU, off_rets()); } else { g.ld_reg(1, r as u8); }
+                    g.store(4, idx);
+                }
+                bus_used = true;
+            }
+            Fast::PopPc { n } => {
+                let (top, bot) = ((n as i32).max(3), (n as i32).min(4));
+                for r in bot..=top {
+                    g.a.ldr(0, CPU, off_sp()); g.load(4, false, idx); g.st_reg(0, r as u8);
+                    g.a.ldr(0, CPU, off_sp()); g.a.add_imm(0, 0, 4); g.a.str(0, CPU, off_sp());
+                }
+                g.a.ldr(0, CPU, off_sp()); g.load(4, false, idx); g.a.mov(KEEP, 0);
+                g.a.ldr(0, CPU, off_sp()); g.a.add_imm(0, 0, 4); g.a.str(0, CPU, off_sp());
+                g.exit_reg(KEEP, count);
+            }
+            Fast::PopRets => {
+                g.a.ldr(0, CPU, off_sp()); g.load(4, false, idx); g.a.str(0, CPU, off_rets());
+                g.a.ldr(0, CPU, off_sp()); g.a.add_imm(0, 0, 4); g.a.str(0, CPU, off_sp());
+                bus_used = true;
+            }
+            Fast::Tb { r, half } => {
+                g.ld_reg(0, r); g.add_imm(0, 0, next_pc);
+                g.load(if half { 2 } else { 1 }, false, idx);
+                g.a.lsl_imm(0, 0, 1); g.add_imm(0, 0, next_pc);
+                g.exit_reg(0, count);
+            }
             Fast::PushRet => {
                 g.a.ldr(0, CPU, off_sp());
                 g.a.sub_imm(0, 0, 4);
@@ -928,4 +1045,92 @@ fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem) -> Option<(Vec<u3
     g.a.ldp_post(29, 30, SP, FRAME);
     g.a.ret();
     Some((g.a.finish(), body))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::BOp;
+    struct Memory { data: Vec<u8>, flags: Vec<u8>, version: u64 }
+    impl Memory {
+        fn new() -> Self { Self { data: vec![0; 256], flags: vec![1; 65], version: 0 } }
+    }
+    impl Bus for Memory {
+        fn read8(&mut self, a: u32) -> u8 { self.data[a as usize] }
+        fn read16(&mut self, a: u32) -> u16 { u16::from_le_bytes(self.data[a as usize..a as usize+2].try_into().unwrap()) }
+        fn read32(&mut self, a: u32) -> u32 { u32::from_le_bytes(self.data[a as usize..a as usize+4].try_into().unwrap()) }
+        fn write8(&mut self, a: u32, v: u8) { self.data[a as usize] = v; self.version += 1; }
+        fn write16(&mut self, a: u32, v: u16) { self.data[a as usize..a as usize+2].copy_from_slice(&v.to_le_bytes()); self.version += 1; }
+        fn write32(&mut self, a: u32, v: u32) { self.data[a as usize..a as usize+4].copy_from_slice(&v.to_le_bytes()); self.version += 1; }
+        fn tick_room(&self) -> u64 { 1000 }
+        fn next_tick_due(&self) -> bool { false }
+        fn add_ticks(&mut self, _: u64) {}
+        fn code_writes(&self) -> Option<u64> { Some(self.version) }
+        fn jit_mem(&mut self) -> Option<JitMem> {
+            Some(JitMem { ram: self.data.as_mut_ptr(), ram_base: 0, ram_len: 256,
+                ram_code: self.flags.as_ptr(), xip: std::ptr::null(), xip_base: 0x02000000, xip_len: 0 })
+        }
+    }
+    fn op(fast: Fast) -> BOp { BOp { fast, len: 2, careful: false, pair_head: false, glue: false } }
+    fn hot(j: &mut Jit, id: usize, pc: u32, ops: &[BOp], mem: &JitMem) -> *const u8 {
+        for _ in 0..HOT { j.entry::<Memory>(id, ops, pc, mem); }
+        j.entry::<Memory>(id, ops, pc, mem).unwrap().0
+    }
+    #[test]
+    fn ram_chain_rejects_changed_target_and_respects_budget() {
+        let mut bus = Memory::new(); let mem = bus.jit_mem().unwrap();
+        let mut cpu = Cpu::new(0); let mut j = Jit::new(false).unwrap();
+        let from = hot(&mut j, 0, 0, &[op(Fast::Goto { target: 32 })], &mem);
+        hot(&mut j, 1, 32, &[op(Fast::MovI { d: 0, v: 42 })], &mem);
+        let (_, slot) = unsafe { run(from, &mut cpu, &mut bus, &mem, 0, 10) };
+        assert!(!slot.is_null());
+        unsafe { *slot = j.body(1).unwrap() as u64; }
+        assert_eq!(unsafe { run(from, &mut cpu, &mut bus, &mem, 0, 1) }.0, 1);
+        assert_eq!(cpu.regs[0], 0);
+        assert_eq!(unsafe { run(from, &mut cpu, &mut bus, &mem, 0, 10) }.0, 2);
+        assert_eq!(cpu.regs[0], 42);
+        bus.write8(32, 1); cpu.regs[0] = 0;
+        assert_eq!(unsafe { run(from, &mut cpu, &mut bus, &mem, 0, 10) }.0, 1);
+        assert_eq!(cpu.pc, 32); assert_eq!(cpu.regs[0], 0);
+    }
+    #[test]
+    fn code_store_exits_before_following_instruction() {
+        let mut bus = Memory::new(); let mem = bus.jit_mem().unwrap();
+        let mut cpu = Cpu::new(0); let mut j = Jit::new(false).unwrap();
+        cpu.regs[0] = 123; cpu.regs[1] = 2;
+        let code = hot(&mut j, 0, 0, &[
+            op(Fast::St { s: 0, b: Base::Reg(1), off: 0, w: 4 }),
+            op(Fast::MovI { d: 2, v: 99 })], &mem);
+        assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10) }.0, 1);
+        assert_eq!(cpu.pc, 2); assert_eq!(cpu.regs[2], 0);
+        assert_eq!(bus.read32(2), 123); assert_eq!(bus.version, 1);
+    }
+    #[test]
+    fn direct_ops_match_interpreter_with_aliases_and_edge_fields() {
+        let mut cases = vec![Fast::SpAdd { v: u32::MAX - 3 }, Fast::RFromSp { d: 0, v: 17 },
+            Fast::Mov2 { dh: 1, dl: 0, sh: 0, sl: 1 }, Fast::Mov2I { dh: 0, dl: 1, v: 0x80000001 },
+            Fast::PopRets, Fast::Tb { r: 0, half: false }, Fast::Tb { r: 0, half: true }];
+        for n in [0, 3, 4, 15] { cases.push(Fast::PushRets { n }); cases.push(Fast::PopPc { n }); }
+        for p in [0, 1, 15, 31] { for l in [0, 1, 16, 31] {
+            for signed in [false, true] { cases.push(Fast::BitExt { d: 1, s: 1, p, l, signed }); }
+            cases.push(Fast::BitIns { d: 1, s: 1, p, l });
+            cases.push(Fast::BitIns { d: 1, s: 2, p, l });
+        }}
+        let mut j = Jit::new(false).unwrap();
+        for (id, fast) in cases.into_iter().enumerate() {
+            let mut bus = Memory::new(); let mut reference = Memory::new();
+            for i in 128..256 { bus.data[i] = i as u8; reference.data[i] = i as u8; }
+            let mem = bus.jit_mem().unwrap();
+            let mut cpu = Cpu::new(0); let mut expected = Cpu::new(0);
+            cpu.regs = [0x87654321; 16]; cpu.regs[0] = 128; cpu.regs[2] = 0xfedcba98;
+            cpu.sp = 192; cpu.rets = 0x12345678;
+            expected.regs = cpu.regs; expected.sp = cpu.sp; expected.rets = cpu.rets;
+            expected.pc = expected.exec_fast(&mut reference, fast, 2).unwrap_or(2);
+            let code = hot(&mut j, id, 0, &[op(fast)], &mem);
+            assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 1) }.0, 1, "{fast:?}");
+            assert_eq!((cpu.regs, cpu.sp, cpu.rets, cpu.pc), (expected.regs, expected.sp, expected.rets, expected.pc), "{fast:?}");
+            assert_eq!(bus.data, reference.data, "{fast:?}");
+        }
+    }
+
 }

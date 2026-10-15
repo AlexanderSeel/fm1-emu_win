@@ -306,7 +306,10 @@ stage.addEventListener("drop", (e) => {
 function draw() {
   const mem = () => ui.memory.buffer;
   if (frame) {
-    new Uint16Array(mem(), ui.panel_lcd(), 240 * 240).set(frame.lcd);
+    if (frame.lcd) {
+      new Uint16Array(mem(), ui.panel_lcd(), 240 * 240).set(frame.lcd);
+      frame.lcd = null;
+    }
     new Float32Array(mem(), ui.panel_leds(), 41).set(frame.leds);
     if (frame.pads) for (let p = 0; p < 16; p++) ui.panel_set(5, p, frame.pads[p]);
   }
@@ -736,6 +739,8 @@ function onWorklet(e) {
     return;
   }
   if (m.type !== "frame" || booting) return;
+  // Preserve an update not yet drawn when a status-only message arrives.
+  if (!m.lcd && frame?.lcd) m.lcd = frame.lcd;
   frame = m;
   perf.add(m);
   const now = performance.now();

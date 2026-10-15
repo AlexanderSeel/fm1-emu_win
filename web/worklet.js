@@ -6,6 +6,7 @@
 function jitImports(exports, stats) {
   return {
     fm1_jit_compile(ptr, len) {
+      const start = now();
       try {
         const x = exports();
         const bytes = new Uint8Array(x.memory.buffer, ptr, len).slice();
@@ -14,11 +15,17 @@ function jitImports(exports, stats) {
         const slot = table.grow(1);
         table.set(slot, run);
         stats.regions++;
+        stats.bytes += len;
+        stats.tableSlots = table.length;
         return slot;
       } catch (e) {
         stats.failed++;
         stats.error = String(e);
         return 0;
+      } finally {
+        const elapsed = now() - start;
+        stats.compileMs += elapsed;
+        stats.compileMaxMs = Math.max(stats.compileMaxMs, elapsed);
       }
     },
   };
@@ -61,7 +68,7 @@ class Fm1 extends AudioWorkletProcessor {
     // phone compiling it again on every firmware change takes a noticeable while
     if (!this.module) this.module = await WebAssembly.compile(m.wasm);
     let x;
-    this.jit = { regions: 0, failed: 0, error: "" };
+    this.jit = { regions: 0, failed: 0, error: "", bytes: 0, tableSlots: 0, compileMs: 0, compileMaxMs: 0 };
     x = (await WebAssembly.instantiate(this.module, { env: jitImports(() => x, this.jit) })).exports;
     // hot code compiled to WebAssembly, a few blocks per quantum at most (?jit=0: interpreter only)
     x.fm1_jit(m.jit === false ? 0 : 1, 16);
@@ -79,6 +86,11 @@ class Fm1 extends AudioWorkletProcessor {
     }
     this.x = x;                         // (a reboot replaces the whole instance)
     this.budget = m.mhz * 1e6 * 0.02;   // at most 20 ms of emulated time per quantum
+    this.lastTiming = null;
+    this.views = null;
+    this.lcdRevision = null;
+    this.reportFrames = 0;
+    this.reportCalls = 0;
     this.short = 0;
     this.calls = 0;
     this.busy = 0;                      // ms spent emulating since the last frame message
@@ -101,25 +113,42 @@ class Fm1 extends AudioWorkletProcessor {
       this.port.postMessage({ type: "error", message: `render: ${err}` });
       return true;
     }
-    const l = new Float32Array(x.memory.buffer, x.fm1_out_l(), n);
-    const r = new Float32Array(x.memory.buffer, x.fm1_out_r(), n);
+    const buffer = x.memory.buffer, lp = x.fm1_out_l(), rp = x.fm1_out_r();
+    if (!this.views || this.views.l.buffer !== buffer || this.views.l.length !== n ||
+        this.views.l.byteOffset !== lp || this.views.r.byteOffset !== rp) {
+      this.views = { l: new Float32Array(buffer, lp, n), r: new Float32Array(buffer, rp, n) };
+    }
+    const { l, r } = this.views;
     out[0].set(l);
     if (out[1]) out[1].set(r);
     this.short = (this.short || 0) + (have < n ? 1 : 0);
-    const took = now() - t0;
-    this.busy += took;
-    if (took > this.worst) this.worst = took;
-    if (++this.calls % 11 === 0) {
-      // the screen and the LEDs, copied out of wasm memory (the page has its own instance)
-      const lcd = new Uint16Array(x.memory.buffer, x.fm1_lcd(), 240 * 240).slice();
+    this.reportFrames += n;
+    this.reportCalls++;
+    if (this.reportFrames >= sampleRate / 30) {
+      const revision = x.fm1_lcd_revision();
+      const lcd = revision !== this.lcdRevision ? new Uint16Array(x.memory.buffer, x.fm1_lcd(), 240 * 240).slice() : null;
+      this.lcdRevision = revision;
       const leds = new Float32Array(x.memory.buffer, x.fm1_leds(), 41).slice();
       const pads = this.board ? new Uint32Array(x.memory.buffer, x.fm1_pads(), 16).slice() : null;
+      const transfer = [leds.buffer];
+      if (lcd) transfer.push(lcd.buffer);
+      if (pads) transfer.push(pads.buffer);
+      // Report the preceding interval: its final postMessage is included in its timing.
       this.port.postMessage({ type: "frame", lcd, leds, ms: x.fm1_ms(), minsns: x.fm1_minsns(),
         short: this.short, halted: x.fm1_halted(), jit: this.jit, pads,
-        // the audio thread's time: busy ms over these 11 quanta of n frames, and the worst one
-        busy: this.busy, worst: this.worst, quanta: 11, frames: n }, [lcd.buffer, leds.buffer]);
+        busy: this.lastTiming?.busy ?? 0, worst: this.lastTiming?.worst ?? 0,
+        quanta: this.lastTiming?.quanta ?? 0, frames: this.lastTiming?.frames ?? n }, transfer);
+      const took = now() - t0;
+      this.lastTiming = { busy: this.busy + took, worst: Math.max(this.worst, took),
+        quanta: this.reportCalls, frames: this.reportFrames / this.reportCalls };
       this.busy = 0;
       this.worst = 0;
+      this.reportFrames = 0;
+      this.reportCalls = 0;
+    } else {
+      const took = now() - t0;
+      this.busy += took;
+      this.worst = Math.max(this.worst, took);
     }
     return true;
   }

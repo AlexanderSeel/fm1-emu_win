@@ -580,6 +580,81 @@ The project keeps the package (base64) and the flash sectors the firmware wrote 
 2 s), so patches come back. The window draws panel.rs / panel_smk.rs, played as on the page;
 MASTER is a host parameter, so is a MIDI channel override (M-VAVE's firmware listens on 2).
 
+## 5.19 Optimization pass: measurements, audio worklet, and native RAM chains (2026-10-15)
+
+Native AArch64, 240 MHz, three interleaved A/B rounds of 4 s with the same default
+scheduled chord (total emulated time / wall time, including boot):
+
+| Firmware | Before | After | Ratio |
+|---|---:|---:|---:|
+| Melodee | 1.96x | 3.63x | 1.85 |
+| Felucca | 4.80x | 4.83x | 1.01 |
+| X0X | 3.03x | 3.07x | 1.01 |
+| stock V13 | 3.47x | 4.46x | 1.29 |
+
+WASM in Node, three interleaved rounds at 240 MHz with identical inputs, measured after
+1 s of warm-up: Melodee 1.63x -> 1.62x, Felucca 2.68x -> 2.69x, X0X 1.60x -> 1.65x,
+stock 2.65x -> 2.60x. Only X0X showed an improvement (~3%); the other differences are
+within the previously observed measurement noise. These are local host results, not
+Android or browser AudioWorklet measurements.
+
+- Measurement: native and WASM use `fm1_soc::script::queue` for the same timestamped keys,
+  encoder and MIDI events (`FM1_BENCH_KEYS`). WASM now defaults to the native benchmark's
+  chord, stops at actual emulated time, checks boot/halt/progress, and reports real audio
+  frames separately. `FM1_BENCH_NOKEYS=1` disables the script. Old binaries without the
+  script export require that option rather than silently testing different workloads.
+- `FM1_BENCH_JSON=file` records results for both hosts; `FM1_WARMUP_MS` separates steady
+  playback from boot. WASM also reports render p50/p95/p99/max, short quanta, compilation
+  time/bytes/count, table slots and linear-memory size. Optional `FM1_PROFILE=1` (WASM) or
+  `FM1_BENCH_ROUTES=1` (native) reports JIT entries/instructions and helper counts per core.
+  Profiling allocates and slows execution: do not enable it for speed comparisons.
+- `node tools/bench_wasm_ab.mjs A.wasm B.wasm 3 [firmware ids...]` runs alternating A/B and
+  B/A pairs and reports median steady-state factors plus all samples. `MS` and `MHZ`
+  select duration/clock. Native comparison remains `tools/bench_ab.sh`. Comparison scripts
+  now fail on execution errors or audio mismatches; mode checks explicitly skip per-step
+  execution when a second core ran.
+- Worklet: cache output views (refresh on memory growth, pointer or quantum-size change),
+  send LCD only when pixels changed, cap reports at 30 Hz using audio frames, transfer pad
+  buffers too. LCD revisions include partial writes and reset; an identical redraw does
+  not need a transfer. The page consumes each LCD update once and preserves pending updates
+  across status-only messages. Load accounting includes copying and `postMessage`, reported
+  one interval later so the message's own delivery cost is included.
+- Native RAM chaining: inline stores consult live code-word flags, helpers leave after code
+  writes, and each compiled RAM body validates its own immutable snapshot against the
+  shared bus write version. This also guards old incoming links after code replacement.
+  Snapshots are owned by the JIT and freed with its cache. Chained execution respects the
+  caller's instruction budget, as WASM already did, to preserve cpu1 idle-loop discovery.
+  Untracked buses do not get RAM chain links.
+- The first chaining prototype slowed flash-heavy firmware ~6-8%. Helper profiling then
+  identified millions of X0X calls for stack/bitfield operations. AArch64 now directly emits
+  SpAdd, RFromSp, Mov2/Mov2I, BitExt/BitIns, PushRets/PopPc, PopRets and table branches.
+  WASM directly emits PopRets and table branches. The final native A/B run above no longer
+  shows the flash-heavy regression. Floating-point/NaN handling stays on its existing path.
+- Validation: 40 core/SoC tests, including native generated-code comparisons against the
+  interpreter for aliasing and edge bitfields, budget limits, stale RAM chain targets, and
+  stores into executing code. Two Node worklet tests cover LCD throttling, partial updates,
+  view reuse/memory growth and full callback timing. Native and WASM audio agree with their
+  respective baselines on all 35 locally available FM-1 firmwares (4 s at 240 MHz; compare
+  common lengths because a runner may stop at a different DMA half). JIT == block interpreter
+  for Felucca, X0X, GHOULBOX, stock and Melodee; per-step checks pass where applicable.
+  The local WASM smoke test boots, draws 57,600 lit pixels and responds to MIDI.
+- Review (Claude): the WASM "within noise" above came from four firmwares that change little.
+  Over all 35 (three interleaved rounds, no input script) the pass made WASM 4% slower, AMB
+  -12%, TRIBE -10%, GHOULBOX -6%: `h_op` called `profile_helper` for every helper op, with
+  profiling off too (not inlined there, the op copied). Bisected by building WASM variants
+  (no LCD revision compare: still slow; no PopRets/Tb: still slow; no profile call: level).
+  Now each JIT picks `h_op::<B, PROF>` when compiling, from `Cpu::profile` when the JIT was
+  made, so plain code pays nothing (turn profiling on before the first render). After: WASM
+  0.99-1.01x of the committed build on AMB, TRIBE, Felucca, GHOULBOX, X0X, Melodee, stock;
+  native as above (Melodee 1.98x -> 3.66x, stock 3.50x -> 4.47x, AMB / TRIBE level). Audio
+  identical to the previous build for all 35 firmwares, native and WASM; JIT == interpreter
+  (and per-step where single-core) for Felucca, X0X, GHOULBOX, stock, Melodee, AMB, TRIBE.
+- Remaining experiments require evidence before changing defaults: browser/mobile compilation
+  budgets and callback percentiles, register caching, region size/hotness, careful pairs,
+  and shared scheduler/peripheral hotspots. No browser was connected during this pass, so
+  actual browser/Android callback behavior and native DAW playback remain to be verified.
+  Node throughput and the worklet harness do not substitute for those device checks.
+
 ## 6. Phase 5 — Boot & integration
 
 - Boot stock firmware to a stable idle/main-loop state.

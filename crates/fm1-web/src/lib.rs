@@ -57,6 +57,7 @@ impl Machine {
     /// fm1-live's loop: cpu0's blocks (interrupts exact at block granularity), cpu1 beside.
     fn run(&mut self, n: u32) {
         let jit = self.cpu.jit_on;
+        if let Some(c1) = self.cpu1.as_mut() { c1.profile = self.cpu.profile; }
         let Machine { cpu, cpu1, soc, pending_tick, .. } = self;
         if machine::run_dual(cpu1, soc, n, RAM_SIZE, jit, |soc, k| machine::run_blocks(cpu, soc, k, pending_tick)).is_err() {
             self.halted = true;
@@ -130,6 +131,39 @@ pub extern "C" fn fm1_jit(on: u32, per_render: u32) {
     }
 }
 
+/// Optional profiling, disabled during throughput measurements. Turn it on before the first
+/// fm1_render: the JIT, made then, compiles helper calls that count themselves only if it is.
+#[no_mangle]
+pub extern "C" fn fm1_profile(on: u32) {
+    if let Some(m) = machine() { m.cpu.profile = on != 0; }
+}
+
+static mut PROFILE_JSON: Vec<u8> = Vec::new();
+/// NUL-terminated JSON valid until the next report call.
+#[no_mangle]
+#[allow(static_mut_refs)]
+pub extern "C" fn fm1_profile_report() -> *const u8 {
+    let report = machine().map(|m| format!("[{},{}]", m.cpu.jit_profile_json(),
+        m.cpu1.as_ref().map_or_else(|| "null".to_owned(), |c| c.jit_profile_json()))).unwrap_or_else(|| "[]".to_owned());
+    unsafe {
+        PROFILE_JSON = report.into_bytes();
+        PROFILE_JSON.push(0);
+        PROFILE_JSON.as_ptr()
+    }
+}
+
+/// Install the same timestamped input script used by the native benchmark.
+#[no_mangle]
+pub extern "C" fn fm1_bench_script(ptr: *mut u8, len: u32) -> u32 {
+    // SAFETY: owned allocation returned by fm1_alloc, consumed exactly once.
+    let bytes = unsafe { Vec::from_raw_parts(ptr, len as usize, len as usize) };
+    let Ok(script) = std::str::from_utf8(&bytes) else { return 1 };
+    let Some(m) = machine() else { return 1 };
+    m.soc.periph.script.clear();
+    fm1_soc::script::queue(&mut m.soc, script);
+    0
+}
+
 /// Render `frames` (<= 1024) stereo frames into the out buffers, running the machine until the
 /// I2S DMA has produced them (at most `max_insns`). Returns the frames that are real audio.
 #[no_mangle]
@@ -180,6 +214,12 @@ pub extern "C" fn fm1_out_r() -> *const f32 {
 #[no_mangle]
 pub extern "C" fn fm1_lcd() -> *const u16 {
     machine().map_or(std::ptr::null(), |m| m.soc.lcd.fb.as_ptr())
+}
+
+/// Framebuffer revision, including partial window updates.
+#[no_mangle]
+pub extern "C" fn fm1_lcd_revision() -> u32 {
+    machine().map_or(0, |m| m.soc.lcd.revision)
 }
 
 /// The LEDs' on-fractions since the last call (41 floats; SMK-37: its 19 button LEDs first).

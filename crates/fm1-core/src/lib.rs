@@ -204,8 +204,8 @@ pub struct Cpu {
     bmap: Vec<u32>,
     /// Per block: for one over RAM code, the bytes it was built from. RAM can change (code
     /// copied in, overlays), so such a block is checked against memory before every entry
-    /// and rebuilt when they differ; the AArch64 JIT never chains into one (`jit_body_at`), the
-    /// wasm JIT's regions include them, checked on entry (`wasm_region_ok`).
+    /// and rebuilt when they differ. AArch64 chain targets validate their own snapshots;
+    /// WASM regions validate their RAM blocks on entry (`wasm_region_ok`).
     /// The stock firmware's synth renders on cpu1 from RAM: without blocks it ran a step at
     /// a time.
     bbytes: Vec<Option<Box<[u8]>>>,
@@ -220,6 +220,9 @@ pub struct Cpu {
     pub route_hist: [u64; 32],
     pub slow_hist: std::collections::HashMap<&'static str, u64>,
     pub profile: bool,
+    pub jit_entries: u64,
+    pub jit_insns: u64,
+    pub jit_helpers: std::collections::BTreeMap<String, u64>,
     /// Instruction-cache misses (decodes) since reset.
     pub decodes: u64,
     /// Canonical syntax of the instruction executing (from its cache line).
@@ -245,6 +248,31 @@ pub struct Cpu {
 }
 
 impl Cpu {
+    pub fn jit_profile_json(&self) -> String {
+        let helpers = self.jit_helpers.iter().map(|(k, v)| format!("\"{k}\":{v}")).collect::<Vec<_>>().join(",");
+        format!("{{\"entries\":{},\"instructions\":{},\"helpers\":{{{helpers}}}}}", self.jit_entries, self.jit_insns)
+    }
+
+    /// Count a JIT helper call when profiling. Called for every helper op, so the check is
+    /// inlined and the counting kept out of line: a plain call (with the op copied) cost the
+    /// wasm build 10-12% on busy firmwares (AMB, TRIBE) with profiling off.
+    #[inline(always)]
+    fn profile_helper(&mut self, op: &Fast) {
+        if self.profile {
+            self.profile_helper_count(op);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn profile_helper_count(&mut self, op: &Fast) {
+        let name = match op {
+            Fast::Raw { route, .. } => format!("Raw{route}"),
+            _ => format!("{op:?}").split([' ', '{']).next().unwrap().to_owned(),
+        };
+        *self.jit_helpers.entry(name).or_default() += 1;
+    }
+
     pub fn new(entry: u32) -> Self {
         Self {
             pc: entry,
@@ -411,7 +439,7 @@ impl Cpu {
             if self.jit_on && !careful {
                 if let Some(mem) = jit_mem {
                     if self.jit.is_none() {
-                        self.jit = jit::Jit::new().map(Box::new);
+                        self.jit = jit::Jit::new(self.profile).map(Box::new);
                     }
                     let code = match self.jit.as_mut() {
                         Some(j) => j.entry::<B>(id, &self.bops[start as usize..(start + len) as usize], pc, &mem),
@@ -422,7 +450,8 @@ impl Cpu {
                         let extra = if n == 0 { 0 } else { 1 };
                         sync!();
                         // SAFETY: code was compiled for this bus type and memory map
-                        let (k, slot) = unsafe { jit::run(code, self, bus, &mem, extra) };
+                        let (k, slot) = unsafe { jit::run(code, self, bus, &mem, extra, budget.saturating_sub(n).max(len)) };
+                        if self.profile { self.jit_entries += 1; self.jit_insns += k as u64; }
                         if k > 0 {
                             n += k;
                             pc = self.pc;
@@ -430,7 +459,7 @@ impl Cpu {
                             careful = self.hold_irq != 0;
                             if !slot.is_null() {
                                 // a chainable exit came back: link it once its target is compiled
-                                if let Some(body) = self.jit_body_at(pc) {
+                                if let Some(body) = self.jit_body_at(pc, bus.code_writes().is_some() && !mem.ram_code.is_null()) {
                                     // SAFETY: slots are leaked u64s owned by the compiled code
                                     unsafe { *slot = body as u64 };
                                 }
@@ -444,7 +473,7 @@ impl Cpu {
             if self.jit_on && !careful {
                 if let Some(mem) = jit_mem {
                     if self.wjit.is_none() {
-                        self.wjit = jit_wasm::Jit::new().map(Box::new);
+                        self.wjit = jit_wasm::Jit::new(self.profile).map(Box::new);
                     }
                     let code = match self.wjit.as_mut().map(|j| j.lookup(id)) {
                         // (a region with RAM blocks runs only while they are what memory holds)
@@ -472,6 +501,7 @@ impl Cpu {
                         let cap = budget.saturating_sub(n).max(len);
                         // SAFETY: code was compiled for this bus type and memory map
                         let k = unsafe { jit_wasm::run(code, at, self, bus, extra, cap) };
+                        if self.profile { self.jit_entries += 1; self.jit_insns += k as u64; }
                         if k > 0 {
                             n += k;
                             pc = self.pc;
@@ -615,8 +645,8 @@ impl Cpu {
 
     /// Is RAM block `id` still built from what memory holds now? In the wasm build, by the bus's
     /// count of writes to code words when it keeps one: the same count as when the block was last
-    /// found current, nothing has changed; else the bytes are compared. (Natively the AArch64
-    /// JIT's inline stores go past that count: the bytes are compared every time.)
+    /// found current, nothing has changed; else the bytes are compared. Native block lookup
+    /// compares bytes; compiled RAM chain targets keep separate versioned snapshots.
     #[inline]
     fn ram_block_ok<B: Bus>(&mut self, bus: &mut B, id: usize) -> bool {
         #[cfg(target_arch = "wasm32")]
@@ -645,9 +675,9 @@ impl Cpu {
 
     /// The compiled body of the block starting at pc, if there is one.
     #[cfg(all(target_arch = "aarch64", target_os = "macos"))]
-    fn jit_body_at(&self, pc: u32) -> Option<*const u8> {
-        // RAM blocks are entered only through block_at, which checks their bytes first
-        if self.bmap.is_empty() || !(0x0200_0000..0x0400_0000).contains(&pc) {
+    fn jit_body_at(&self, pc: u32, ram_tracked: bool) -> Option<*const u8> {
+        // RAM bodies validate their own immutable code snapshot before execution.
+        if self.bmap.is_empty() || (!ram_tracked && !(0x0200_0000..0x0400_0000).contains(&pc)) {
             return None;
         }
         let id = self.bmap[(pc >> 1) as usize & (self.bmap.len() - 1)];

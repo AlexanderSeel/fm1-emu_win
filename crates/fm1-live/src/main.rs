@@ -240,7 +240,7 @@ fn high_priority() {
 fn bench(o: &Opts, ms: u64) {
     let mut m = match Machine::new(o) {
         Ok(m) => m,
-        Err(e) => return eprintln!("cannot read {}: {e}", o.bin),
+        Err(e) => { eprintln!("cannot read {}: {e}", o.bin); std::process::exit(1); },
     };
     if std::env::var("FM1_BENCH_NOKEYS").is_ok() {
         m.soc.periph.script.clear();
@@ -251,16 +251,21 @@ fn bench(o: &Opts, ms: u64) {
     m.soc.periph.script.push_back((m.soc.periph.cycle_of_ms(1000), Action::Key { id: 28, down: true }));
     }
     m.cpu.profile = std::env::var("FM1_BENCH_ROUTES").is_ok();
+    let warmup = std::env::var("FM1_WARMUP_MS").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(1000).min(ms.saturating_sub(1));
+    let mut steady = None;
     let t = Instant::now();
     let mut insns = 0u64;
     let mut pcs: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
     let sample = std::env::var("FM1_BENCH_PCS").is_ok();
     while m.soc.periph.ms() < ms {
+        if steady.is_none() && m.soc.periph.ms() >= warmup {
+            steady = Some((Instant::now(), m.soc.periph.ms()));
+        }
         if sample && m.soc.periph.ms() > ms / 2 {
             for _ in 0..1000 {
                 if let Err(e) = m.run(97) {
                     eprintln!("halt: {e}");
-                    break;
+                    std::process::exit(1);
                 }
                 *pcs.entry(m.cpu.pc).or_insert(0) += 1;
             }
@@ -269,7 +274,7 @@ fn bench(o: &Opts, ms: u64) {
         }
         if let Err(e) = m.run(100_000) {
             eprintln!("halt: {e}");
-            break;
+            std::process::exit(1);
         }
         insns += 100_000;
         if let Some(c1) = m.cpu1.as_mut() {
@@ -289,6 +294,15 @@ fn bench(o: &Opts, ms: u64) {
         }
     }
     let wall = t.elapsed().as_secs_f64();
+    let steady_rt = steady.map(|(t, start)| (m.soc.periph.ms() - start) as f64 / 1000.0 / t.elapsed().as_secs_f64());
+    let frames = m.soc.periph.audio.len() / 2;
+    println!("steady: {:?}x real time; {frames} real audio frames", steady_rt);
+    if let Ok(path) = std::env::var("FM1_BENCH_JSON") {
+        let json = format!("{{\"emulatedMs\":{},\"wallSeconds\":{wall},\"realtime\":{},\"audioFrames\":{frames},\"steadyRealtime\":{}}}\n",
+            m.soc.periph.ms(), m.soc.periph.ms() as f64 / 1000.0 / wall,
+            steady_rt.map_or_else(|| "null".to_owned(), |v| v.to_string()));
+        std::fs::write(path, json).expect("write benchmark JSON");
+    }
     println!("icache: {} decodes for {} instructions", m.cpu.decodes, insns);
     if let Some(c1) = &m.cpu1 {
         println!("cpu1: {} instructions ({:.1} M per emulated s)", c1.insn_count, c1.insn_count as f64 / 1e3 / ms as f64);
@@ -299,6 +313,8 @@ fn bench(o: &Opts, ms: u64) {
         println!("audio: {} samples -> {path}", m.soc.periph.audio.len());
     }
     if m.cpu.profile {
+        println!("JIT cpu0: {}", m.cpu.jit_profile_json());
+        if let Some(c1) = &m.cpu1 { println!("JIT cpu1: {}", c1.jit_profile_json()); }
         let tot: u64 = m.cpu.route_hist.iter().sum();
         println!("slow path: {} of {} instructions ({:.1}%)", tot, insns, 100.0 * tot as f64 / insns as f64);
         for (i, n) in m.cpu.route_hist.iter().enumerate().filter(|(_, n)| **n > 0) {
@@ -394,42 +410,7 @@ fn start_audio(ring: Arc<AudioRing>) -> Result<cpal::Stream, String> {
 /// encoder turns, `ms:mHEX` MIDI bytes into the MIDI IN jack. False when the variable is unset.
 fn script_keys(m: &mut Machine) -> bool {
     let Ok(keys) = std::env::var("FM1_BENCH_KEYS") else { return false };
-    for k in keys.split(',') {
-        if let Some((t, rest)) = k.split_once(':') {
-            // `ms:mHEX` sends MIDI bytes into the MIDI IN jack (`ms:m903c64` = note on C4)
-            if let Some(hex) = rest.trim().strip_prefix('m') {
-                if let Ok(t) = t.trim().parse::<u64>() {
-                    let at = m.soc.periph.cycle_of_ms(t);
-                    for i in (0..hex.len() & !1).step_by(2) {
-                        if let Ok(b) = u8::from_str_radix(&hex[i..i + 2], 16) {
-                            m.soc.periph.script.push_back((at, Action::Midi { b }));
-                        }
-                    }
-                }
-                continue;
-            }
-            // `ms:eN:clicks` turns matrix encoder N
-            if let Some((e, c)) = rest.strip_prefix('e').and_then(|r| r.split_once(':')) {
-                if let (Ok(t), Ok(enc), Ok(clicks)) = (t.trim().parse::<u64>(), e.parse::<u8>(), c.parse::<i32>()) {
-                    let at = m.soc.periph.cycle_of_ms(t);
-                    m.soc.periph.script.push_back((at, Action::Enc { enc, clicks }));
-                }
-                continue;
-            }
-            let id = rest;
-            let (id, down) = match id.trim().strip_suffix('^') { Some(i) => (i, false), None => (id.trim(), true) };
-            // a number, or a name on this board's panel (FM-1: `PLAY`, `C4`; SMK-37: `seqplay`, `k12`)
-            let id = id.parse::<u8>().ok().or_else(|| match m.soc.board {
-                fm1_soc::Board::Smk37 => fm1_soc::smk::key_id(id),
-                fm1_soc::Board::Fm1 => fm1_soc::periph::key_id(id),
-            });
-            if let (Ok(t), Some(id)) = (t.trim().parse::<u64>(), id) {
-                let at = m.soc.periph.cycle_of_ms(t);
-                m.soc.periph.script.push_back((at, Action::Key { id, down }));
-            }
-        }
-    }
-    m.soc.periph.script.make_contiguous().sort_by_key(|(c, _)| *c);
+    fm1_soc::script::queue(&mut m.soc, &keys);
     true
 }
 

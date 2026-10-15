@@ -25,6 +25,7 @@ pub struct Lcd {
     arg_next: usize,
     pixel_hi: Option<u8>,
     pub frames: u64,
+    pub revision: u32,
     pub inverted: bool,
     /// pixels received since the last RAMWR (trace aid)
     pub pixels_in_window: u64,
@@ -49,6 +50,7 @@ impl Lcd {
             arg_next: 0,
             pixel_hi: None,
             frames: 0,
+            revision: 0,
             inverted: false,
             pixels_in_window: 0,
             display_on: false,
@@ -101,6 +103,7 @@ impl Lcd {
             0x28 => self.display_on = false,
             0x01 => {
                 self.fb.fill(0x0000);
+                self.revision = self.revision.wrapping_add(1);
                 self.display_on = false;
                 self.inverted = false;
                 self.frames += 1;
@@ -136,7 +139,10 @@ impl Lcd {
         self.pixels_in_window += 1;
         let (x, y) = (self.cursor.0 as usize, self.cursor.1 as usize);
         if x < W && y < H {
-            self.fb[y * W + x] = px;
+            if self.fb[y * W + x] != px {
+                self.fb[y * W + x] = px;
+                self.revision = self.revision.wrapping_add(1);
+            }
         }
         // advance through the window
         if self.cursor.0 >= x1 {
@@ -210,4 +216,26 @@ pub fn write_bmp(path: &str, fb: &[u16], inverted: bool) -> std::io::Result<()> 
 fn lcd_trace_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("FM1_LCD_TRACE").is_ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn revision_tracks_partial_updates_and_reset() {
+        let mut lcd = Lcd::new();
+        lcd.feed(0x2c, false);
+        lcd.feed(0x12, true);
+        assert_eq!(lcd.revision, 0);
+        lcd.feed(0x34, true);
+        assert_eq!(lcd.revision, 1);
+        assert_eq!(lcd.frames, 0); // a partial window must still reach the display
+        lcd.feed(0x2c, false);
+        lcd.feed(0x12, true);
+        lcd.feed(0x34, true);
+        assert_eq!(lcd.revision, 1); // identical redraw
+        lcd.feed(0x01, false);
+        assert_eq!(lcd.revision, 2);
+        assert_eq!(lcd.fb[0], 0);
+    }
 }

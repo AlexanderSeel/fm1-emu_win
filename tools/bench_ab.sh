@@ -3,7 +3,7 @@
 # between back-to-back runs fakes 6-8% differences). Prints the median real-time factor of each.
 #   tools/bench_ab.sh OLD_BIN NEW_BIN [rounds=3] [firmware ids...]   (default: felucca x0x ghoulbox)
 #   MS=6000 MHZ=240 ENV="FM1_NO_JIT=1" tools/bench_ab.sh ...
-set -uo pipefail
+set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 A="$1"; B="$2"; N="${3:-3}"; shift 2; [ $# -gt 0 ] && shift
@@ -12,7 +12,10 @@ MS="${MS:-6000}"; MHZ="${MHZ:-240}"
 STOCK="reference/FM-1-RE/firmware-images/v13/raw_fw/FM-1.fwsc"
 run() {
   local src=(--fw "$2"); [ "$2" = stock ] && src=(--fwsc "$STOCK")
-  env ${ENV:-} "$1" "${src[@]}" --mhz "$MHZ" --bench "$MS" 2>&1 | sed -nE 's/.* ([0-9.]+)x real time.*/\1/p' | tail -1
+  local value
+  value="$(env ${ENV:-} "$1" "${src[@]}" --mhz "$MHZ" --bench "$MS" 2>&1 | sed -nE 's/.* ms emulated.* ([0-9.]+)x real time.*/\1/p' | tail -1)"
+  [[ "$value" =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "missing benchmark result for $2" >&2; return 1; }
+  printf '%s\n' "$value"
 }
 median() { tr ' ' '\n' | grep . | sort -n | awk '{a[NR]=$1} END {print a[int((NR+1)/2)]}'; }
 printf "%-14s %8s %8s %7s\n" firmware A B "B/A"
