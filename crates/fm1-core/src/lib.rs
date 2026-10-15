@@ -2666,6 +2666,23 @@ impl Cpu {
                 let (d, s) = (((raw >> 28) & 0xf) as usize, ((raw >> 24) & 0xf) as usize);
                 self.regs[d] = self.regs[s].leading_zeros();
             }
+            37 =>
+            {
+                let (d, off, w, signed) = sp_load_raw(raw);
+                let a = self.sp.wrapping_add(off);
+                self.regs[d as usize] = match (w, signed) {
+                    (1, false) => bus.read8(a) as u32,
+                    (1, true) => bus.read8(a) as i8 as i32 as u32,
+                    _ => bus.read16(a) as i16 as i32 as u32,
+                };
+            }
+            38 =>
+            {
+                let (d, s) = ((raw & 0xe) as usize, ((raw >> 4) & 0xe) as usize);
+                let (lo, hi) = (self.regs[s], self.regs[s + 1]);
+                self.regs[d] = lo;
+                self.regs[d + 1] = hi;
+            }
             34 =>
             {
                 let (d, s, signed) = sat16_raw(raw).unwrap();
@@ -2876,6 +2893,12 @@ fn decode_any(win: u64, pc: u32) -> Result<fm1_isa::Instruction, fm1_isa::Decode
         // only the corpus registers and had no `f1` form (Bubba Machine's)
         Err(_) if win & 0xff_ffff == 0x00_e180 => raw(&CLZ_CRAW),
         Err(_) if win & 0xff_ffff == 0x00_f180 => raw(&CLZ_PAIR_CRAW),
+        // `dc|dd|d9 e9 OO RX`: rR = b[sp+off] (u|s) / h[sp+off] (s), off = X << 8 | OO (route 37;
+        // all 1481 corpus samples fit; the classes knew only offset 0 for a signed byte: DUELL)
+        Err(_) if matches!(win & 0xffff, 0xe9dc | 0xe9dd | 0xe9d9) => raw(&SP_LOAD_CRAW),
+        // `SD 15` / `SD d5` (a dual-issue pair's head): r(D+1)_rD = r(S+1)_rS, both even (route
+        // 38; the classes fit only the corpus pairs: Tonitor's `r5_r4 = r11_r10 #`)
+        Err(_) if matches!((win >> 8) & 0xff, 0x15 | 0xd5) && win & 0x11 == 0 => raw(if win & 0x8000 != 0 { &MOV2_PAIR_CRAW } else { &MOV2_CRAW }),
         // `3f e5 Ax DB` (and `3f f5`, a dual-issue pair's head) with op 7 / 8: the float
         // multiply-accumulates `rD += rA * rB (f)` / `rD -= rA * rB (f)` (vendor assembler,
         // work/probe/fpu78b.S); the corpora's FPU classes had none (the SMK-37's stock DSP code)
@@ -3063,6 +3086,18 @@ static FPU_MAC_PAIR_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
 static HALF_MEM_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
     name: "half_mem_craw", syntax: "h[R+#i] (raw)", len: 4, count: 0, mask: 0, match_: 0,
     group: "load", alt: &[], samples: &[], slots: &[],
+};
+static SP_LOAD_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "sp_load_craw", syntax: "R = b[sp+#i] (raw)", len: 4, count: 0, mask: 0, match_: 0,
+    group: "load", alt: &[], samples: &[], slots: &[],
+};
+static MOV2_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "mov2_craw", syntax: "R_R = R_R (raw)", len: 2, count: 0, mask: 0, match_: 0,
+    group: "move", alt: &[], samples: &[], slots: &[],
+};
+static MOV2_PAIR_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "mov2_craw", syntax: "R_R = R_R  #", len: 2, count: 0, mask: 0, match_: 0,
+    group: "move", alt: &[], samples: &[], slots: &[],
 };
 static CLZ_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
     name: "clz_pair_craw", syntax: "R = clz(R) (raw)", len: 4, count: 0, mask: 0, match_: 0,
@@ -4353,6 +4388,8 @@ fn route_of(insn: &Instruction, alu4: &Option<Alu4>, bittest: &Option<BitTest>) 
             "sp_word_craw" => 33,
             "half_mem_craw" => 35,
             "clz_pair_craw" => 36,
+            "sp_load_craw" => 37,
+            "mov2_craw" => 38,
             "rep_i_r" | "rep_i_i" => 29,
             n if n.starts_with("fpu_") => ROUTE_FPU,
             _ => ROUTE_SYNTAX,
@@ -4621,6 +4658,14 @@ fn fast_raw(route: u16, insn: &Instruction, alu4: &Option<Alu4>, bittest: &Optio
             }
         }
         36 => Some(Fast::Un { d: ((raw >> 28) & 0xf) as u8, s: ((raw >> 24) & 0xf) as u8, k: 4 }),
+        37 => {
+            let (d, off, w, signed) = sp_load_raw(raw);
+            Some(Fast::Ld { d, b: Base::Sp, off, w, signed })
+        }
+        38 => {
+            let (d, s) = ((raw & 0xe) as u8, ((raw >> 4) & 0xe) as u8);
+            Some(Fast::Mov2 { dh: d + 1, dl: d, sh: s + 1, sl: s })
+        }
         34 => {
             let (d, s, signed) = sat16_raw(raw)?;
             Some(Fast::Un { d, s, k: if signed { 5 } else { 6 } })
@@ -4794,6 +4839,18 @@ fn fpu(op: u8, a: u32, b: u32) -> u32 {
         0x8f => (a as i32 as f32).to_bits(),
         _ => (a as f32).to_bits(),
     }
+}
+
+/// `dc|dd|d9 e9 OO RX`: (register, offset from sp, width, signed) of a byte (u / s) or signed
+/// halfword load (route 37).
+fn sp_load_raw(raw: u64) -> (u8, u32, u8, bool) {
+    let (b0, b2, b3) = (raw & 0xff, (raw >> 16) & 0xff, (raw >> 24) & 0xff);
+    let (w, signed) = match b0 {
+        0xdc => (1, false),
+        0xdd => (1, true),
+        _ => (2, true),
+    };
+    ((b3 >> 4) as u8, ((b3 & 0xf) << 8 | b2) as u32, w, signed)
 }
 
 /// `5x ed` halfword accesses: data = bits(28,31), base = bits(20,23), bit16 store, byte 0 bit 2
