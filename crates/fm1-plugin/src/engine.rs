@@ -52,10 +52,12 @@ pub struct View {
     pub board: Board,
     pub booted: bool,
     pub halted: bool,
-    /// emulated time over wall time, over the last second
+    /// emulated time over the time spent emulating it, over the last second: how much faster
+    /// than real time the machine could run (it runs at the host's pace)
     pub speed: f32,
-    /// frames the host found missing (the machine fell behind)
+    /// frames the host found missing (the machine fell behind): all, and in the last second
     pub starved: u64,
+    pub late: u64,
 }
 
 /// The flash sectors that differ from the package's.
@@ -133,7 +135,7 @@ pub fn run(
     let mut saved: Sectors = Vec::new();
     let mut last_view = Instant::now();
     let mut last_flash = Instant::now();
-    let (mut speed_t, mut speed_ms) = (Instant::now(), 0u64);
+    let (mut speed_t, mut speed_ms, mut busy, mut starved0) = (Instant::now(), 0u64, Duration::ZERO, 0u64);
     while !shared.quit.load(Ordering::Relaxed) {
         while let Ok(c) = cmds.try_recv() {
             match c {
@@ -143,6 +145,12 @@ pub fn run(
                     let mut v = shared.view.lock().unwrap();
                     v.booted = m.is_some();
                     v.halted = false;
+                    v.speed = 0.0;
+                    // (frames missed before a machine runs do not count)
+                    starved0 = v.starved;
+                    speed_t = Instant::now();
+                    speed_ms = 0;
+                    busy = Duration::ZERO;
                     v.board = m.as_ref().map_or(Board::Fm1, |m| m.soc.board);
                     saved = sectors;
                     due.clear();
@@ -187,7 +195,9 @@ pub fn run(
                     mm.soc.periph.apply(&Action::Midi { b });
                 }
             }
+            let t0 = Instant::now();
             mm.run(20_000);
+            busy += t0.elapsed();
             let a = std::mem::take(&mut mm.soc.periph.audio);
             for f in a.chunks_exact(2) {
                 // (a full ring drops the frame: the host has stopped taking them)
@@ -211,8 +221,13 @@ pub fn run(
             v.halted = mm.halted;
             if speed_t.elapsed() >= Duration::from_secs(1) {
                 let ms = mm.soc.periph.ms();
-                v.speed = (ms - speed_ms) as f32 / speed_t.elapsed().as_millis() as f32;
-                (speed_t, speed_ms) = (Instant::now(), ms);
+                // (the first second is the boot's: it runs flat out to fill the ring)
+                if speed_ms > 0 {
+                    v.speed = (ms - speed_ms) as f32 / busy.as_secs_f32().max(1e-6) / 1000.0;
+                    v.late = v.starved - starved0;
+                }
+                starved0 = v.starved;
+                (speed_t, speed_ms, busy) = (Instant::now(), ms.max(1), Duration::ZERO);
             }
         }
         if last_flash.elapsed() >= Duration::from_secs(2) {

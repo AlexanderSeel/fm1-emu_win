@@ -889,6 +889,7 @@ name = "fm1-plugin"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "dispatch2",
  "fm1-core",
  "fm1-soc",
  "nih_plug",

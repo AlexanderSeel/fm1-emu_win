@@ -147,6 +147,7 @@ impl Fm1 {
                 halted: false,
                 speed: 0.0,
                 starved: 0,
+                late: 0,
             }),
             quit: Default::default(),
         });

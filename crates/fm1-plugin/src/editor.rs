@@ -32,6 +32,8 @@ struct Ui {
     grab: Option<Grab>,
     wheel_acc: f32,
     msg: String,
+    /// the file dialog's answer, while it is open
+    picking: Option<Answer>,
 }
 
 impl Default for Ui {
@@ -52,6 +54,7 @@ impl Default for Ui {
             grab: None,
             wheel_acc: 0.0,
             msg: String::new(),
+            picking: None,
         }
     }
 }
@@ -59,10 +62,16 @@ impl Default for Ui {
 const NKEY: i32 = 37;
 
 pub fn create(params: Arc<Fm1Params>, link: Arc<Link>) -> Option<Box<dyn Editor>> {
-    create_egui_editor(params.editor_state.clone(), Ui::default(), |_, _| {}, move |ctx, setter, ui| {
-        let (lcd, leds, pads, board, booted, halted, speed, starved) = {
+    // (the state outlives a window: one opened again has a new egui context, so the panel's
+    // texture, which belongs to the old one, is made again)
+    let build = |_: &egui::Context, ui: &mut Ui| {
+        ui.tex = None;
+        ui.grab = None;
+    };
+    create_egui_editor(params.editor_state.clone(), Ui::default(), build, move |ctx, setter, ui| {
+        let (lcd, leds, pads, board, booted, halted, speed, late) = {
             let v = link.shared.view.lock().unwrap();
-            (v.lcd.clone(), v.leds, v.pads, v.board, v.booted, v.halted, v.speed, v.starved)
+            (v.lcd.clone(), v.leds, v.pads, v.board, v.booted, v.halted, v.speed, v.late)
         };
         if board != ui.board || ui.base.is_empty() {
             ui.board = board;
@@ -74,8 +83,14 @@ pub fn create(params: Arc<Fm1Params>, link: Arc<Link>) -> Option<Box<dyn Editor>
 
         egui::TopBottomPanel::top("bar").show(ctx, |bar| {
             bar.horizontal(|bar| {
-                if bar.button("Load firmware…").clicked() {
-                    load(&params, &link, &mut ui.msg);
+                if bar.add_enabled(ui.picking.is_none(), egui::Button::new("Load firmware…")).clicked() {
+                    ui.picking = Some(pick());
+                }
+                if let Some(answer) = ui.picking.as_ref().and_then(|a| a.lock().unwrap().take()) {
+                    ui.picking = None;
+                    if let Some(path) = answer {
+                        load(&params, &link, &path, &mut ui.msg);
+                    }
                 }
                 let name = params.firmware.lock().unwrap().name.clone();
                 bar.label(egui::RichText::new(if name.is_empty() { "no firmware".into() } else { name }).strong());
@@ -90,7 +105,8 @@ pub fn create(params: Arc<Fm1Params>, link: Arc<Link>) -> Option<Box<dyn Editor>
                 } else if halted {
                     "The firmware stopped: an instruction the emulator does not know".into()
                 } else {
-                    format!("{speed:.2}x real time{}", if starved > 0 { format!(", {starved} frames late") } else { String::new() })
+                    let late = if late > 0 { format!(", {late} frames late in the last second") } else { String::new() };
+                    if speed > 0.0 { format!("could run {speed:.1}x real time{late}") } else { format!("starting{late}") }
                 };
                 bar.label(status);
             });
@@ -248,10 +264,28 @@ pub fn create(params: Arc<Fm1Params>, link: Arc<Link>) -> Option<Box<dyn Editor>
     })
 }
 
-/// Pick a package, check that it unpacks, and boot it (the project keeps it from now on).
-fn load(params: &Fm1Params, link: &Link, msg: &mut String) {
-    let Some(path) = rfd::FileDialog::new().add_filter("FM-1 firmware package", &["fwsc"]).pick_file() else { return };
-    let bytes = match std::fs::read(&path) {
+/// Ask for a package. The dialog runs modally, so not from inside the window's frame: macOS
+/// sends the window events while it is open (a mouse leaving it), and the window's code is still
+/// in the frame then (in GarageBand's AU host that aborts). On macOS it opens from the main queue
+/// once the frame is done; the answer lands in the returned slot (a path, or None if cancelled).
+type Answer = Arc<std::sync::Mutex<Option<Option<std::path::PathBuf>>>>;
+fn pick() -> Answer {
+    let answer: Answer = Default::default();
+    let slot = answer.clone();
+    let ask = move || {
+        let path = rfd::FileDialog::new().add_filter("FM-1 firmware package", &["fwsc"]).pick_file();
+        *slot.lock().unwrap() = Some(path);
+    };
+    #[cfg(target_os = "macos")]
+    dispatch2::DispatchQueue::main().exec_async(ask);
+    #[cfg(not(target_os = "macos"))]
+    std::thread::spawn(ask);
+    answer
+}
+
+/// Check that a package unpacks, and boot it (the project keeps it from now on).
+fn load(params: &Fm1Params, link: &Link, path: &std::path::Path, msg: &mut String) {
+    let bytes = match std::fs::read(path) {
         Ok(b) => b,
         Err(e) => {
             *msg = format!("{}: {e}", path.display());

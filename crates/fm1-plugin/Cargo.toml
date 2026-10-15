@@ -19,6 +19,9 @@ rfd = "0.15"
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+dispatch2 = "0.3"
+
 # Its own workspace: the GUI and plugin dependencies stay out of the emulator's builds and CI.
 [workspace]
 
