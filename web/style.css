@@ -130,5 +130,12 @@ footer { margin-top: 12px; padding-top: 14px; border-top: 1px solid var(--rule);
 .devices a, .devices span { padding: 2px 10px; border: 1px solid var(--line); border-radius: 14px; text-decoration: none; color: var(--ink); }
 .devices [aria-current] { background: var(--amber); border-color: var(--amber); color: #2a1a03; }
 
+/* ?embed=1 (main.js): the device and its controls only, for a window on another site */
+.embed-only { display: none; }
+[data-embed] .embed-only { display: inline; font-size: 13px; }
+[data-embed] #title, [data-embed] .runs, [data-embed] .devices, [data-embed] #fwlabel, [data-embed] .bar .file,
+[data-embed] #bankname, [data-embed] #about, [data-embed] .hint, [data-embed] .guide, [data-embed] footer { display: none; }
+[data-embed] main { padding-block: 8px; gap: 8px; }
+
 /* (an element the page hides stays hidden whatever its display rule) */
 [hidden] { display: none !important; }

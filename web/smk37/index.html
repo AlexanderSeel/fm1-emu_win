@@ -16,6 +16,7 @@
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="style.css">
+<script>if (new URLSearchParams(location.search).get("embed") === "1") document.documentElement.setAttribute("data-embed", "");</script>
 </head>
 <body>
 <main>
@@ -23,11 +24,12 @@
     <h1 id="title">M-VAVE SMK-37 (emulated)</h1>
     <nav class="devices" aria-label="Device"><a href="../">FM-1</a><span aria-current="page">SMK-37</span></nav>
     <span id="status">click Start to boot</span>
+    <a class="embed-only" id="fullpage" href="./" target="_blank" rel="noopener">SMK-37 emulator, full page ↗</a>
     <p class="runs">Runs an SMK-37 emulator in a WASM virtual machine: the FM-1's chip with the SMK-37's keys, pads,
       faders and wheels.</p>
   </header>
   <div class="bar">
-    <label>Firmware <select id="fw" aria-label="Firmware"></select></label>
+    <label id="fwlabel">Firmware <select id="fw" aria-label="Firmware"></select></label>
     <label>Clock <select id="mhz" aria-label="Emulated clock"></select></label>
     <label id="midiin" title="A MIDI keyboard plays the SMK-37's keys (notes C3..C6, with velocity) and its wheels (pitch bend, mod wheel)">MIDI keyboard
       <select id="midi" aria-label="MIDI input"><option value="">off</option><option value="*">all inputs</option></select>

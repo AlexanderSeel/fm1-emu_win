@@ -685,6 +685,26 @@ Tried and dropped (measured):
 - Regions of 64 blocks / 768 ops: Doom +3%, Felucca +4%, but zp12 -7%, X0X / AMB -5%.
 Next for Doom (slowest, 1.33x): its frame wait calls through ~6 regions per round.
 
+## 5.21 The catalog follows the FM-1 Firmware Hub (2026-10-16)
+
+zvenson opened the Hub to other pages (Access-Control-Allow-Origin: * on /fw/*.fwsc and
+/catalog.json; packages never change under their name; the catalog updates every 3 hours).
+`tools/hub_catalog.mjs` builds web/firmwares.json from it: every Hub firmware that runs here,
+its package from the Hub (manifest / author URLs dropped for those), ours kept where we have it
+(description, licence, installer), the rest from the Hub (new entries' licences from GitHub),
+plus the entries the Hub lacks (stock, SID, April, Purple Monkey, Quest, SLOOP ALG, FM-1 Doom).
+Each entry records its Hub id (`hub`); the layout stays fm1-live-readable (`{ "id": ...`).
+49 entries, 47 community (42 from the Hub, 14 new: Dinghy, fm1-chord, MAKU, FM-106, Fart
+Machine One, Felucca 8 Patterns, DUELL, MYCELIUM, Pigeon, CS-1, HYP-1, Tonitor, Noiz Demons,
+Coral Flower). Left out: Bubba Machine (black screen). Following the Hub moved SLOOP Floyd FM
+back to 2.4 (its author's site had 2.4.1); Hortator's and Melodee's Hub packages are other
+builds under the same version (their audio changed); Rainbow's reference image too, though its
+package is the same (the build before this gives the same new audio on the new files).
+Page: `?fw=` takes the Hub's ids (salt, floyd, sloopbanks); `?embed=1` shows only the device
+and its controls (inline <head> script sets data-embed before the first paint; nothing stored),
+for the Hub's "Try in browser" window; each card links to its Hub card (#fw-<id>). Checked in
+headless Chrome over the DevTools protocol (node + built-in WebSocket).
+
 ## 6. Phase 5 — Boot & integration
 
 - Boot stock firmware to a stable idle/main-loop state.

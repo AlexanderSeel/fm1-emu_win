@@ -16,6 +16,7 @@
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" href="data:,">
 <link rel="stylesheet" href="style.css">
+<script>if (new URLSearchParams(location.search).get("embed") === "1") document.documentElement.setAttribute("data-embed", "");</script>
 </head>
 <body>
 <main>
@@ -23,10 +24,11 @@
     <h1 id="title">M-VAVE FM-1 (emulated)</h1>
     <nav class="devices" aria-label="Device"><span aria-current="page">FM-1</span><a href="smk37/">SMK-37</a></nav>
     <span id="status">click Start to boot</span>
+    <a class="embed-only" id="fullpage" href="./" target="_blank" rel="noopener">FM-1 emulator, full page ↗</a>
     <p class="runs">Runs an FM-1 emulator in a WASM virtual machine.</p>
   </header>
   <div class="bar">
-    <label>Firmware <select id="fw" aria-label="Firmware"></select></label>
+    <label id="fwlabel">Firmware <select id="fw" aria-label="Firmware"></select></label>
     <label>Clock <select id="mhz" aria-label="Emulated clock"></select></label>
     <label id="midiin">MIDI in <select id="midi" aria-label="MIDI input"><option value="">off</option><option value="*">all inputs</option></select>
       <span id="midiact" aria-hidden="true"></span></label>
@@ -167,11 +169,11 @@
 
     <section id="firmwares" class="span" aria-labelledby="h-fw">
       <h2 id="h-fw">The firmwares</h2>
-      <p>Every community firmware from <a href="https://fm1-editor.com/firmware/">fm1-editor.com/firmware</a> and
-        <a href="https://thefirmwarehub.com/">the FM-1 Firmware Hub</a> whose package a page can download,
-        plus this repository's <a href="fm1-sid/">FM-1 SID</a> and M-VAVE's own. Each is its author's build,
-        unchanged, downloaded from the author's site when you start it. “Install” links to the author's installer,
-        for putting it on a real FM-1.</p>
+      <p>Every firmware on <a href="https://thefirmwarehub.com/">the FM-1 Firmware Hub</a> that runs here, a few
+        more from <a href="https://fm1-editor.com/firmware/">fm1-editor.com/firmware</a>, this repository's
+        <a href="fm1-sid/">FM-1 SID</a> and M-VAVE's own. Each is its author's build, unchanged, downloaded when you
+        start it (from the Hub, or the author's site). “On the Hub” links to its card there, “install” to the
+        author's installer, for putting it on a real FM-1.</p>
       <ul class="cards" id="fwlist"></ul>
     </section>
 
@@ -248,7 +250,8 @@
       <p>The emulator's source:
         <a href="https://github.com/joakimeriksson/fm1-emu">github.com/joakimeriksson/fm1-emu</a>.</p>
       <p>The firmwares are their authors' work, under the licences shown on each card; the list follows
-        <a href="https://fm1-editor.com/firmware/">fm1-editor.com/firmware</a> and <a href="https://thefirmwarehub.com/">the FM-1 Firmware Hub</a>.</p>
+        <a href="https://thefirmwarehub.com/">the FM-1 Firmware Hub</a> (thanks to zvenson for opening its packages to
+        other pages) and <a href="https://fm1-editor.com/firmware/">fm1-editor.com/firmware</a>.</p>
       <p>Built on public reverse engineering of the FM-1:
         <a href="https://github.com/AL-255/FM-1-RE">AL-255/FM-1-RE</a>,
         <a href="https://github.com/ip2k/lunar-modulator">ip2k/lunar-modulator</a>,

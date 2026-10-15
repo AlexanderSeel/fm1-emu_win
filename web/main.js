@@ -21,6 +21,12 @@ const store = (k, v) => { try { localStorage.setItem(k, v); } catch { /* private
 
 const catalog = await (await fetch("firmwares.json")).json();
 const byId = new Map(catalog.firmwares.map((f) => [f.id, f]));
+// the FM-1 Firmware Hub's ids too, where they differ (its cards link here with ?fw=<its id>)
+for (const f of catalog.firmwares) if (f.hub && !byId.has(f.hub)) byId.set(f.hub, f);
+// ?embed=1: only the device and its controls, for a window on another site (the inline script in
+// <head> set data-embed before the first paint; style.css hides the rest). It does not change the
+// firmware this browser starts with on the full page.
+const EMBED = document.documentElement.hasAttribute("data-embed");
 let fw = byId.get(params.get("fw")) || byId.get(stored(DEV.key + "fw")) || byId.get(catalog.default) || catalog.firmwares[0];
 let mhz = Number(params.get("mhz") || stored("fm1.mhz") || 100);
 // the audio buffer: "interactive" (small: keys answer quickly) unless this device needed a larger
@@ -126,6 +132,7 @@ if (DEVICE === "fm1") {
     else {
       links.append(link(f.repo, "source"));
       if (f.installer) links.append(link(f.installer, "install"));
+      if (f.hub) links.append(link(`https://thefirmwarehub.com/#fw-${f.hub}`, "on the Hub"));
     }
     // the same firmware on the other device (an SMK-37 build's `fm1`, or an FM-1 entry it names)
     const twin = DEVICE === "smk37" ? f.fm1 : twins.get(f.id);
@@ -231,13 +238,14 @@ function showFirmware() {
   q.set("fw", fw.id);
   q.set("mhz", mhz);
   history.replaceState(null, "", `?${q}`);
+  document.getElementById("fullpage").href = `./?fw=${fw.id}`;
 }
 showFirmware();
 
 fwSel.addEventListener("change", () => {
   fw = byId.get(fwSel.value) || localFw;
   loadedUrl = null;
-  store(DEV.key + "fw", fw.id);
+  if (!EMBED) store(DEV.key + "fw", fw.id);
   showFirmware();
   fwSel.blur();                 // back to playing from the keyboard
   if (node) boot();
@@ -262,7 +270,7 @@ async function openLocal(file) {
     idb("put", mv.id, bytes);
     fw = mv;
     fwSel.value = mv.id;
-    store(DEV.key + "fw", mv.id);
+    if (!EMBED) store(DEV.key + "fw", mv.id);
     loadedUrl = null;
     showFirmware();
     if (node) boot();
