@@ -434,6 +434,27 @@ finds them. Past the image the XIP window now shows the flash chip for every fir
 0xff), and a booted package's window, which covers flash 0x4000..0x93000 from the installed
 image, takes the chip's contents wherever the firmware erases or programs (`Soc::sync_xip`).
 
+### 64-bit multiply-subtract (2026-10-16)
+
+ADD-1 (an additive synth built with the vendor clang 4.0.1) halted on `fe e1 40 61`
+`r7_r6 -= r4 * r1 (u)`: clang emits it for `acc - (u64)a * b` (and `(s)` for signed factors),
+and fuses `a * b - c * d` into a multiply and a multiply-subtract. The corpora have one sample
+(`fe f1 00 00`), so the table has one class. The vendor assembler gives the `f8 e1` / `fc e1`
+fields: pair = bits(29,31), signed = bit28, a = bits(20,23), b = bits(24,27) (`fe e1 f0 1e`
+r1_r0 -= r15 * r14 (s), `fe e1 00 ed` r15_r14 -= r0 * r13 (u)). Route 21 runs it,
+`rP = rP - a * b` mod 2^64, from the fallback for any operands. `probes/mul64.c` compares it with
+LLVM's folding (borrows, wrap past zero, sign-extended factors, two pairs in flight; -O1 and -O2).
+
+The pair-op fallback also returned the plain class for byte1 `f1`, so a head such as
+`fc f1 ..` or `fe f1 ..` that the table didn't match was not taken as a dual-issue pair head (the
+second instruction saw its results). `f1` words now get a class whose syntax ends in `#`.
+
+The multiply by an immediate paired with a store that ADD-1 also reported (`ea f1 16 40 87 20`,
+`r10 = r4 * 0x16 # [sp] = r7`) decodes and runs here, and ran before this change: the immediate is
+the `composed_imm` 12-bit form (bits 16..27; the assembler calls it `timm12` and refuses 257 and
+-2). Checked against the assembler for 22 encodings, and in ADD-1's own build with the pair
+restored.
+
 ### Remaining exec gaps (known, traced)
 
 - goto/if branch-offset fields: printed = word offset (delta = 2*printed)

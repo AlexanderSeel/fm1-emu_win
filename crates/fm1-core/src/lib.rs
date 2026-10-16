@@ -2727,6 +2727,8 @@ impl Cpu {
                 //            pair = bits(29,31), signed = bit28
                 //   `fc e1`: rP += rA * rB (u|s) — the fields of `f8` (compiler-rt's
                 //            wide multiply; not in the corpora)
+                //   `fe e1`: rP -= rA * rB (u|s) — the fields of `f8` (vendor assembler;
+                //            clang's `acc - (u64)a * b`, probes/mul64.c)
                 //   `f6 e1`: rP = rQ / rB (u|s) — q = bits(21,23), b = bits(24,27),
                 //            pair = bits(29,31), signed = bit28
                                 let p = ((raw >> 29) & 7) as usize;
@@ -2747,12 +2749,15 @@ impl Cpu {
                         self.regs[lo] = y as u32;
                         self.regs[hi] = (y >> 32) as u32;
                     }
-                    0xf8 | 0xfc => {
+                    0xf8 | 0xfc | 0xfe => {
                         let a = self.regs[((raw >> 20) & 0xf) as usize];
                         let b = self.regs[((raw >> 24) & 0xf) as usize];
                         let mut y = if signed { (a as i32 as i64).wrapping_mul(b as i32 as i64) as u64 } else { (a as u64) * (b as u64) };
-                        if raw & 0xff == 0xfc {
-                            y = y.wrapping_add((self.regs[hi] as u64) << 32 | self.regs[lo] as u64);
+                        let acc = (self.regs[hi] as u64) << 32 | self.regs[lo] as u64;
+                        match raw & 0xff {
+                            0xfc => y = acc.wrapping_add(y),
+                            0xfe => y = acc.wrapping_sub(y),
+                            _ => {}
                         }
                         self.regs[lo] = y as u32;
                         self.regs[hi] = (y >> 32) as u32;
@@ -2839,11 +2844,24 @@ impl Cpu {
 
 pub use fm1_isa::composed_imm;
 
-/// Table-less class for the 64-bit pair op family (`d0/d8/f8/f6 e1`); the
+/// Table-less class for the 64-bit pair op family (`d0/d8/f8/fc/fe/f6 e1`); the
 /// raw decoder in `execute` ignores everything but `len`.
 static PAIR_OP_RAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
     name: "pair_op_raw",
     syntax: "r1_r0 pair op (raw)",
+    len: 4,
+    count: 0,
+    mask: 0,
+    match_: 0,
+    group: "misc",
+    alt: &[],
+    samples: &[],
+    slots: &[],
+};
+/// The same family with byte1 `f1`: a dual-issue pair's head (the trailing `#` makes it one)
+static PAIR_OP_PAIR_RAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "pair_op_raw",
+    syntax: "r1_r0 pair op (raw)  #",
     len: 4,
     count: 0,
     mask: 0,
@@ -2870,8 +2888,10 @@ fn decode_any(win: u64, pc: u32) -> Result<fm1_isa::Instruction, fm1_isa::Decode
         Ok(i) => Ok(i),
         // 64-bit pair ops the corpora never showed (e.g. `r3_r2 >>>= 39`)
         // share one raw layout; decode them without a table class
-        Err(_) if matches!((win >> 8) & 0xff, 0xe1 | 0xf1) && matches!(win & 0xff, 0xd0 | 0xd8 | 0xf8 | 0xfc | 0xf6) => {
-            Ok(fm1_isa::Instruction { addr: pc, raw: win, entry: &PAIR_OP_RAW })
+        Err(_) if matches!((win >> 8) & 0xff, 0xe1 | 0xf1) && matches!(win & 0xff, 0xd0 | 0xd8 | 0xf8 | 0xfc | 0xfe | 0xf6) => {
+            // (`f1`: a dual-issue pair's head, e.g. `fe f1 40 61` r7_r6 -= r4 * r1 (u) #)
+            let entry = if (win >> 8) & 0xff == 0xf1 { &PAIR_OP_PAIR_RAW } else { &PAIR_OP_RAW };
+            Ok(fm1_isa::Instruction { addr: pc, raw: win, entry })
         }
         // `d9 e8` / `d1 e8 <mask>`: push / pop of rets and a register mask; the table's
         // classes match only the masks the corpora used (libm's sin pops {rets, r11-r8, r6-r4})
@@ -3876,6 +3896,77 @@ mod tests {
     }
 
     #[test]
+    fn pair_multiply_subtract() {
+        // `fe e1 40 61` r7_r6 -= r4 * r1 (u), `fe e1 40 71` the same (s): bit 28 signed, the
+        // fields of `f8 e1` (vendor assembler; clang 4.0.1 emits it for `acc - (u64)a * b`)
+        let run = |code: [u8; 4], regs: &[(usize, u32)]| {
+            let mut mem = vec![0u8; 0x100];
+            mem[..4].copy_from_slice(&code);
+            let mut ram = FlatRam::new(mem);
+            let mut cpu = Cpu::new(0);
+            for &(r, v) in regs {
+                cpu.regs[r] = v;
+            }
+            cpu.step(&mut ram).unwrap();
+            assert_eq!(cpu.pc, 4);
+            cpu.regs
+        };
+        let pair = |r: [u32; 16], p: usize| (r[2 * p + 1] as u64) << 32 | r[2 * p] as u64;
+        // unsigned, borrowing from the high word
+        let r = run([0xfe, 0xe1, 0x40, 0x61], &[(6, 5), (7, 1), (4, 0xffff_ffff), (1, 3)]);
+        assert_eq!(pair(r, 3), 0x1_0000_0005u64.wrapping_sub(0xffff_ffffu64 * 3));
+        // signed: -2 * 0x7fffffff subtracted adds
+        let r = run([0xfe, 0xe1, 0x40, 0x71], &[(6, 10), (7, 0), (4, (-2i32) as u32), (1, 0x7fff_ffff)]);
+        assert_eq!(pair(r, 3), (10i64 - (-2i64) * 0x7fff_ffff) as u64);
+        // the same operands unsigned: a different result
+        let r = run([0xfe, 0xe1, 0x40, 0x61], &[(6, 10), (7, 0), (4, (-2i32) as u32), (1, 0x7fff_ffff)]);
+        assert_eq!(pair(r, 3), 10u64.wrapping_sub(0xffff_fffeu64 * 0x7fff_ffff));
+        // `fe e1 f0 1e` r1_r0 -= r15 * r14 (s), `fe e1 00 ed` r15_r14 -= r0 * r13 (u): the end pairs
+        let r = run([0xfe, 0xe1, 0xf0, 0x1e], &[(0, 0), (1, 0), (15, (-7i32) as u32), (14, 9)]);
+        assert_eq!(pair(r, 0), 63);
+        let r = run([0xfe, 0xe1, 0x00, 0xed], &[(14, 1), (15, 0), (0, 0x8000_0000), (13, 4)]);
+        assert_eq!(pair(r, 7), 1u64.wrapping_sub(0x2_0000_0000));
+        // a factor inside the pair reads its old value: `fe e1 60 67` r7_r6 -= r6 * r7 (u)
+        let r = run([0xfe, 0xe1, 0x60, 0x67], &[(6, 3), (7, 2)]);
+        assert_eq!(pair(r, 3), 0x2_0000_0003u64 - 6);
+    }
+
+    #[test]
+    fn pair_multiply_subtract_dual_issue() {
+        // `fe f1 40 61` r7_r6 -= r4 * r1 (u) #  paired with `87 20` [sp] = r7: the store sees
+        // the old r7 (the pair convention of pair_head_byte_extract)
+        let mut mem = vec![0u8; 0x200];
+        mem[..6].copy_from_slice(&[0xfe, 0xf1, 0x40, 0x61, 0x87, 0x20]);
+        let mut ram = FlatRam::new(mem);
+        let mut cpu = Cpu::new(0);
+        cpu.sp = 0x100;
+        (cpu.regs[6], cpu.regs[7], cpu.regs[4], cpu.regs[1]) = (0, 0x10, 0x1000, 0x1000);
+        while cpu.pc < 6 {
+            cpu.step(&mut ram).unwrap();
+        }
+        assert_eq!((cpu.regs[6], cpu.regs[7]), (0xff00_0000, 0xf));
+        assert_eq!(ram.read32(0x100), 0x10);
+    }
+
+    #[test]
+    fn multiply_immediate_dual_issue() {
+        // `ea f1 16 40` r10 = r4 * 0x16 #  paired with `87 20` [sp] = r7 (ADD-1's bank index),
+        // and `e3 f1 ff 25` r3 = r2 * 0x1fe00000 # (a rotated immediate) with `85 21` [sp+4] = r5
+        let mut mem = vec![0u8; 0x200];
+        mem[..12].copy_from_slice(&[0xea, 0xf1, 0x16, 0x40, 0x87, 0x20, 0xe3, 0xf1, 0xff, 0x25, 0x85, 0x21]);
+        let mut ram = FlatRam::new(mem);
+        let mut cpu = Cpu::new(0);
+        cpu.sp = 0x100;
+        (cpu.regs[4], cpu.regs[7], cpu.regs[2], cpu.regs[5]) = (3, 0x55, 5, 0x66);
+        while cpu.pc < 12 {
+            cpu.step(&mut ram).unwrap();
+        }
+        assert_eq!(cpu.regs[10], 66);
+        assert_eq!(cpu.regs[3], 5u32.wrapping_mul(0x1fe0_0000));
+        assert_eq!((ram.read32(0x100), ram.read32(0x104)), (0x55, 0x66));
+    }
+
+    #[test]
     fn pair_store_and_load() {
         // `50 ec 35 40` d[r3+4] = r5_r4 ; `50 ec 00 20` r3_r2 = d[r0+0]
         let mut mem = vec![0u8; 0x100];
@@ -4373,7 +4464,7 @@ fn route_of(insn: &Instruction, alu4: &Option<Alu4>, bittest: &Option<BitTest>) 
             _ if insn.entry.len == 4 && insn.raw & 0xff == 0xd8
                 && matches!((insn.raw >> 8) & 0xff, 0xec | 0xed | 0xee) => 20,
             _ if insn.entry.len == 4 && matches!((insn.raw >> 8) & 0xff, 0xe1 | 0xf1)
-                && matches!(insn.raw & 0xff, 0xd0 | 0xd8 | 0xf8 | 0xfc | 0xf6)
+                && matches!(insn.raw & 0xff, 0xd0 | 0xd8 | 0xf8 | 0xfc | 0xfe | 0xf6)
                 && insn.entry.syntax.starts_with('r') && has(insn.entry.syntax, "_r") => 21,
             _ if insn.entry.len == 4 && (insn.raw & 0xffff) == 0xe070 || (insn.raw & 0xffff) == 0xf070 => 22,
             "testset_b_r" | "testset_r" => 23,
