@@ -1,6 +1,6 @@
 # FM-1 as a plugin (AU, VST3, CLAP)
 
-The emulator as an instrument in a DAW: load a firmware package (`.fwsc`) in the plugin's
+The emulator as an instrument in a DAW: load a firmware package (`.fwsc`) or a shared setup (`.fm1save`) in the plugin’s
 window, play it from the host's MIDI, and play its panel with the mouse. It's the same panel as
 on the page, so an SMK-37 package gets the SMK-37's.
 
@@ -80,9 +80,18 @@ Locally, `SIGN_IDENTITY="Developer ID Application: …" tools/build_plugin.sh` t
 
 ## Using it
 
-- **Load firmware…** picks a `.fwsc`: a community firmware (the page's list links each author's
-  package) or M-VAVE's own. The package is saved in the host's project. So is every flash sector
-  the firmware writes, so your patches come back when the project reopens.
+- **Load firmware / save…** opens a `.fwsc` package or a shared `.fm1save` setup from the browser
+  or another plugin instance. Importing a save restores its firmware, patches and settings,
+  including when the same firmware is already running. For a browser backup that omits
+  bring-your-own firmware, load the matching `.fwsc` first, then import the `.fm1save`.
+  Invalid imports leave the current setup intact.
+- **Export save…** captures the running firmware and its latest flash changes as a `.fm1save`.
+  Send it to someone else, import it in the browser, or open it in another VST3/AU/CLAP instance.
+  It waits for flash writes to finish and writes the file in the background. Edits held only in
+  firmware RAM still need the firmware’s own Save command first. A shared file includes the
+  firmware, so its redistribution licence applies.
+- **DAW projects** still keep the firmware and the flash sectors it writes, so your patches come
+  back when the project reopens. Exporting a file also refreshes this project-state copy.
 - **MIDI** from the host goes to the MIDI IN jack. **MIDI channel** moves channel messages to one
   channel; M-VAVE's own firmware listens on 2.
 - **Master** is the panel's MASTER pot, and a host parameter you can automate.
@@ -127,3 +136,28 @@ audio. It uses `reference/firmwares/felucca.fwsc` (`node tools/fetch_firmwares.m
 | Steinberg's editorhost | VST3: the window draws, firmwares boot and react to the panel |
 | Logic, Ableton, REAPER, Bitwig | not yet tried |
 | Windows, Linux | not built yet: nih-plug and clap-wrapper support them, but `tools/build_plugin.sh` is macOS-only |
+
+## Testing portable saves locally
+
+```sh
+node tools/fetch_firmwares.mjs felucca
+cargo test --manifest-path crates/fm1-plugin/Cargo.toml --release --locked
+node tools/check_plugin_save_interop.mjs
+env NO_INSTALL=1 tools/build_plugin.sh
+```
+
+The interoperability check uses the real browser codec at `web/persistence.js` and the real
+plugin engine. Until the browser save PR is merged, pass a local copy of its `persistence.js`
+as the first argument. The tests also cover a browser-generated format fixture with synthetic
+bytes, rejected malformed saves, same-firmware replacement, live SPI snapshots and XIP restoration.
+The build command creates local bundles in `target/plugin` without changing installed plugins.
+
+The local AU smoke check loads the built bundle directly, renders audio and round-trips
+project state without installing it:
+
+```sh
+clang++ -std=c++17 tools/check_plugin_au.cpp -framework AudioToolbox -framework CoreFoundation -o /tmp/fm1-check-au
+/tmp/fm1-check-au "$PWD/target/plugin/FM-1.component"
+```
+
+This checks the AU API; the new file dialogs still need an interactive DAW check.
