@@ -16,6 +16,13 @@ With sound: nine of the firmwares in 50 seconds.
 
 https://github.com/user-attachments/assets/6849316e-7239-497e-b617-be74317dc2b1
 
+The browser keeps the firmware you run and automatically saves flash changes, including settings
+and patches saved through the firmware's own controls. Each exact firmware version has its own
+save. **Save & backup** offers a manual save, portable `.fm1save` backup export/import, reset,
+and a check for firmware updates. This also works with locally opened packages and on the
+SMK-37 page. Edits held only in firmware RAM need its normal save command first; browser saves
+survive reloads but clearing browser data removes them. Export a backup to keep a separate copy.
+
 The page hosts no firmware: it downloads each one from its author's own site when you start
 it, the same update package you would install on a real FM-1. M-VAVE's own firmware can't be
 fetched that way, so download `FM-1.fwsc` from M-VAVE and open it on the page.

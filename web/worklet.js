@@ -40,19 +40,35 @@ class Fm1 extends AudioWorkletProcessor {
     super();
     this.x = null;
     this.calls = 0;
+    this.bootToken = 0;
+    this.snapshots = [];
     this.port.onmessageerror = () => this.port.postMessage({ type: "error", message: "a message could not be read" });
     this.port.onmessage = async (e) => {
       const m = e.data;
       if (m.type === "boot") {
-        this.x = null;                    // the old machine stops now, not when the new one is up
+        const token = ++this.bootToken;
+        // Keep the previous (paused) instance until the replacement boots successfully.
         try {
-          await this.boot(m);
+          await this.boot(m, token);
         } catch (err) {
-          this.x = null;
-          this.port.postMessage({ type: "error", message: `boot: ${err}` });
+          if (token !== this.bootToken) return;
+          this.paused = false;
+          this.port.postMessage({ type: "error", seq: m.seq, message: `boot: ${err}` });
         }
+      } else if (m.type === "cancel-boot") {
+        ++this.bootToken;
+        this.x = null;
+        this.snapshots = [];
+      } else if (m.type === "snapshot" && !this.x) {
+        this.port.postMessage({ type: "snapshot", seq: m.seq, request: m.request, unavailable: true });
       } else if (this.x) {
-        if (m.type === "key") this.x.fm1_key(m.id, m.down ? 1 : 0);
+        if (m.type === "snapshot") {
+          if (m.seq !== this.seq) return;
+          this.snapshots.push({ ...m, started: now() });
+          this.flushSnapshots();
+        } else if (m.type === "cancel-snapshot") this.snapshots = this.snapshots.filter(r => r.request !== m.request);
+        else if (m.type === "resume") this.paused = false;
+        else if (m.type === "key") this.x.fm1_key(m.id, m.down ? 1 : 0);
         else if (m.type === "enc") this.x.fm1_enc(m.enc, m.clicks);
         else if (m.type === "pot") this.x.fm1_pot(m.value);
         else if (m.type === "midi") for (const b of m.bytes) this.x.fm1_midi(b);
@@ -62,7 +78,7 @@ class Fm1 extends AudioWorkletProcessor {
     };
   }
 
-  async boot(m) {
+  async boot(m, token) {
     // the module arrives as bytes: a compiled WebAssembly.Module does not cross into the
     // AudioWorklet's scope (Chrome delivers it as a messageerror). Compiled once, here: on a
     // phone compiling it again on every firmware change takes a noticeable while
@@ -70,6 +86,7 @@ class Fm1 extends AudioWorkletProcessor {
     let x;
     this.jit = { regions: 0, failed: 0, error: "", bytes: 0, tableSlots: 0, compileMs: 0, compileMaxMs: 0 };
     x = (await WebAssembly.instantiate(this.module, { env: jitImports(() => x, this.jit) })).exports;
+    if (token !== this.bootToken) return;
     // hot code compiled to WebAssembly, a few blocks per quantum at most (?jit=0: interpreter only)
     x.fm1_jit(m.jit === false ? 0 : 1, 16);
     // the whole update package (.fwsc): the machine unpacks it, gets the flash chip and the
@@ -80,9 +97,14 @@ class Fm1 extends AudioWorkletProcessor {
       return p;
     };
     const pkg = copy(m.package);
-    const bank = m.syx ? copy(m.syx) : 0;
-    if (x.fm1_boot_fwsc(pkg, m.package.byteLength, bank, m.syx ? m.syx.byteLength : 0, m.mhz) !== 0) {
+    if (x.fm1_boot_fwsc(pkg, m.package.byteLength, 0, 0, m.mhz) !== 0) {
       throw new Error("not an FM-1 update package (or a DX7 bank it cannot use)");
+    }
+    if (m.sectors?.byteLength && x.fm1_flash_restore(copy(m.sectors), m.sectors.byteLength) !== 0) {
+      throw new Error("invalid saved flash sectors");
+    }
+    if (m.syx && x.fm1_load_syx(copy(m.syx), m.syx.byteLength) === 1) {
+      throw new Error("this firmware cannot load that DX7 bank");
     }
     this.x = x;                         // (a reboot replaces the whole instance)
     this.budget = m.mhz * 1e6 * 0.02;   // at most 20 ms of emulated time per quantum
@@ -96,13 +118,58 @@ class Fm1 extends AudioWorkletProcessor {
     this.busy = 0;                      // ms spent emulating since the last frame message
     this.worst = 0;                     // the longest quantum among them
     this.board = x.fm1_board();         // 0 the FM-1, 1 the SMK-37 (the package says which)
-    this.port.postMessage({ type: "booted", seq: m.seq, board: this.board });
+    this.seq = m.seq;
+    this.paused = false;
+    this.snapshots = [];
+    this.flashRevision = x.fm1_flash_revision();
+    this.observedRevision = this.flashRevision;
+    this.flashChangedAt = this.lastSnapshot = now();
+    const base = new Uint8Array(x.memory.buffer, x.fm1_flash_base(), x.fm1_flash_len()).slice();
+    const flash = new Uint8Array(x.memory.buffer, x.fm1_flash(), x.fm1_flash_len()).slice();
+    this.port.postMessage({ type: "booted", seq: m.seq, board: this.board, revision: this.flashRevision, base, flash }, [base.buffer, flash.buffer]);
+  }
+
+  observeFlash() {
+    const revision = this.x.fm1_flash_revision();
+    if (revision !== this.observedRevision) {
+      this.observedRevision = revision;
+      this.flashChangedAt = now();
+      this.port.postMessage({ type: "flash-changed", seq: this.seq, revision });
+    }
+    return revision;
+  }
+
+  flushSnapshots() {
+    const x = this.x;
+    if (!x) return;
+    this.observeFlash();
+    const quiet = now() - this.flashChangedAt >= 250 || x.fm1_halted();
+    const busy = x.fm1_flash_busy();
+    for (const request of this.snapshots.splice(0)) {
+      if (busy || !quiet) {
+        if (request.request !== undefined && now() - request.started >= 1500) {
+          // A constantly writing firmware must not prevent switching away. Keep its
+          // last stable save instead of persisting a possibly half-written sector.
+          if (request.pause) this.paused = true;
+          this.port.postMessage({ type: "snapshot", seq: this.seq, request: request.request,
+            unavailable: true, error: request.pause ? null : "flash did not become quiet; try saving again" });
+        } else this.snapshots.push(request);
+        continue;
+      }
+      const flash = new Uint8Array(x.memory.buffer, x.fm1_flash(), x.fm1_flash_len()).slice();
+      this.flashRevision = x.fm1_flash_revision();
+      this.observedRevision = this.flashRevision;
+      this.lastSnapshot = now();
+      if (request.pause) this.paused = true;
+      this.port.postMessage({ type: "snapshot", seq: this.seq, request: request.request,
+        revision: this.flashRevision, flash }, [flash.buffer]);
+    }
   }
 
   process(_inputs, outputs) {
     const out = outputs[0];
     const x = this.x;
-    if (!x) return true;
+    if (!x || this.paused) return true;
     const n = out[0].length;
     const t0 = now();
     let have;
@@ -110,7 +177,10 @@ class Fm1 extends AudioWorkletProcessor {
       have = x.fm1_render(n, this.budget);
     } catch (err) {                       // a trap in the emulator: stop and say so
       this.x = null;
-      this.port.postMessage({ type: "error", message: `render: ${err}` });
+      for (const request of this.snapshots.splice(0)) {
+        this.port.postMessage({ type: "snapshot", seq: this.seq, request: request.request, unavailable: true });
+      }
+      this.port.postMessage({ type: "error", seq: this.seq, fatal: true, message: `render: ${err}` });
       return true;
     }
     const buffer = x.memory.buffer, lp = x.fm1_out_l(), rp = x.fm1_out_r();
@@ -125,6 +195,12 @@ class Fm1 extends AudioWorkletProcessor {
     this.reportFrames += n;
     this.reportCalls++;
     if (this.reportFrames >= sampleRate / 30) {
+      const flashRevision = this.observeFlash();
+      if (flashRevision !== this.flashRevision && now() - this.lastSnapshot >= 1000 &&
+          now() - this.flashChangedAt >= 250 && !this.snapshots.length) {
+        this.snapshots.push({});
+      }
+      this.flushSnapshots();
       const revision = x.fm1_lcd_revision();
       const lcd = revision !== this.lcdRevision ? new Uint16Array(x.memory.buffer, x.fm1_lcd(), 240 * 240).slice() : null;
       this.lcdRevision = revision;
@@ -134,7 +210,7 @@ class Fm1 extends AudioWorkletProcessor {
       if (lcd) transfer.push(lcd.buffer);
       if (pads) transfer.push(pads.buffer);
       // Report the preceding interval: its final postMessage is included in its timing.
-      this.port.postMessage({ type: "frame", lcd, leds, ms: x.fm1_ms(), minsns: x.fm1_minsns(),
+      this.port.postMessage({ type: "frame", seq: this.seq, lcd, leds, ms: x.fm1_ms(), minsns: x.fm1_minsns(),
         short: this.short, halted: x.fm1_halted(), jit: this.jit, pads,
         busy: this.lastTiming?.busy ?? 0, worst: this.lastTiming?.worst ?? 0,
         quanta: this.lastTiming?.quanta ?? 0, frames: this.lastTiming?.frames ?? n }, transfer);

@@ -139,3 +139,13 @@ footer { margin-top: 12px; padding-top: 14px; border-top: 1px solid var(--rule);
 
 /* (an element the page hides stays hidden whatever its display rule) */
 [hidden] { display: none !important; }
+
+.save-controls { flex: 1 1 240px; margin: 0; padding: 0 10px; }
+.save-controls summary { padding: 5px 0; }
+.save-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.save-actions button { font: inherit; color: var(--ink); background: var(--well); border: 1px solid var(--line);
+  border-radius: 6px; padding: 5px 10px; cursor: pointer; }
+.save-controls p { color: var(--dim); font-size: 12px; max-width: 70ch; }
+#save-status { color: var(--dim); font-size: 12px; }
+#save-status[data-error="true"] { color: var(--amber); }
+[data-embed] .save-controls, [data-embed] #save-status { display: none; }
