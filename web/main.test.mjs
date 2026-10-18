@@ -188,7 +188,11 @@ test('a boot timeout cancels the machine and the next firmware selection recover
   const p = await page(storage(), '', '', true);
   await p.api.startAudio(); await p.api.boot(); await settle();
   p.audio.hangBoot = true;
-  const booting = p.api.boot(); await settle(); p.expireBoot();
+  const sent = p.audio.messages.length;
+  const booting = p.api.boot();
+  // the hung boot's timer is set as it posts its boot message: until then, the timer is the last boot's
+  while (!p.audio.messages.slice(sent).some(m => m.type === 'boot')) await settle();
+  p.expireBoot();
   assert.equal(await booting, false);
   assert.equal(p.api.running, null);
   assert.ok(p.audio.messages.some(m => m.type === 'cancel-boot'));
