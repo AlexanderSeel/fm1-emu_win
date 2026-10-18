@@ -23,7 +23,7 @@ function harness() {
     busy: 0, worst: 0, lcdRevision: null, seq: 1, flashRevision: 0, observedRevision: 0,
     flashChangedAt: 0, lastSnapshot: 0 });
   const render = () => p.process([], [[new Float32Array(128), new Float32Array(128)]]);
-  return { p, messages, memory, render, change: () => revision++, advance: ms => time += ms,
+  return { p, context, messages, memory, render, change: () => revision++, advance: ms => time += ms,
     flashChange: () => flashRevision++, flashBusy: value => busy = value };
 }
 test('unchanged LCD is omitted; changed partial frame is sent at capped rate', () => {
@@ -111,4 +111,52 @@ test('replacement snapshots wait for a quiet interval and timed-out requests can
   pending.flashBusy(false); pending.advance(500); pending.p.flushSnapshots();
   assert.equal(pending.p.paused, undefined);
   assert.equal(pending.messages.length, 0);
+});
+
+test('render traps acknowledge pending and future snapshots, allowing a replacement boot', async () => {
+  const h = harness(); h.flashBusy(true);
+  await h.p.port.onmessage({ data: { type: 'snapshot', seq: 1, request: 20 } });
+  h.p.x.fm1_render = () => { throw new Error('trap'); };
+  h.render();
+  assert.equal(h.p.x, null);
+  assert.ok(h.messages.some(m => m.request === 20 && m.unavailable));
+  await h.p.port.onmessage({ data: { type: 'snapshot', seq: 1, request: 21 } });
+  assert.ok(h.messages.some(m => m.request === 21 && m.unavailable));
+  let booted = false; h.p.boot = async () => { booted = true; };
+  await h.p.port.onmessage({ data: { type: 'boot', seq: 2 } });
+  assert.equal(booted, true);
+});
+test('manual backups wait for quiet; continuous writes bound switching without saving partial flash', async () => {
+  const h = harness(); h.flashChange();
+  await h.p.port.onmessage({ data: { type: 'snapshot', seq: 1, request: 22 } });
+  assert.equal(h.messages.filter(m => m.type === 'snapshot').length, 0);
+  h.advance(300); h.p.flushSnapshots();
+  assert.ok(h.messages.some(m => m.request === 22 && m.flash));
+  const busy = harness(); busy.flashBusy(true);
+  await busy.p.port.onmessage({ data: { type: 'snapshot', seq: 1, request: 23, pause: true } });
+  busy.advance(1600); busy.p.flushSnapshots();
+  assert.ok(busy.messages.some(m => m.request === 23 && m.unavailable && !m.flash));
+  assert.equal(busy.p.paused, true);
+  const exporting = harness(); exporting.flashBusy(true);
+  await exporting.p.port.onmessage({ data: { type: 'snapshot', seq: 1, request: 24 } });
+  exporting.advance(1600); exporting.p.flushSnapshots();
+  assert.ok(exporting.messages.some(m => m.request === 24 && m.error));
+  assert.notEqual(exporting.p.paused, true);
+});
+test('cancelled boot invalidates an in-flight replacement and clears the old machine', async () => {
+  const h = harness(); const token = h.p.bootToken;
+  await h.p.port.onmessage({ data: { type: 'cancel-boot', seq: 2 } });
+  assert.equal(h.p.bootToken, token + 1); assert.equal(h.p.x, null);
+});
+
+test('a firmware without a user bank still boots when a DX7 bank is selected', async () => {
+  const h = harness(), x = h.p.x;
+  Object.assign(x, { fm1_alloc: () => 1000, fm1_jit() {}, fm1_boot_fwsc: () => 0,
+    fm1_load_syx: () => 2, fm1_board: () => 0, fm1_flash_base: () => 140000 });
+  h.p.module = {};
+  h.context.WebAssembly = { instantiate: async () => ({ exports: x }) };
+  await h.p.port.onmessage({ data: { type: 'boot', seq: 2, mhz: 100,
+    package: new Uint8Array(960).buffer, syx: new Uint8Array(4096).buffer } });
+  assert.ok(h.messages.some(m => m.type === 'booted' && m.seq === 2));
+  assert.equal(h.messages.some(m => m.type === 'error'), false);
 });

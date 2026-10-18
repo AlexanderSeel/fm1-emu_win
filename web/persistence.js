@@ -12,9 +12,14 @@ export async function packageHash(bytes) {
 export function changedSectors(base, flash) {
   if (base.length !== FLASH_SIZE || flash.length !== FLASH_SIZE) throw new Error('invalid flash size');
   const sectors = [];
+  // Compare four bytes per iteration; copied snapshots are naturally aligned.
+  const aligned = base.byteOffset % 4 === 0 && flash.byteOffset % 4 === 0;
+  const a = aligned ? new Uint32Array(base.buffer, base.byteOffset, FLASH_SIZE / 4) : base;
+  const b = aligned ? new Uint32Array(flash.buffer, flash.byteOffset, FLASH_SIZE / 4) : flash;
+  const step = aligned ? 4 : 1;
   for (let at = 0; at < FLASH_SIZE; at += SECTOR_SIZE) {
-    for (let i = at; i < at + SECTOR_SIZE; i++) {
-      if (base[i] !== flash[i]) {
+    for (let i = at / step; i < (at + SECTOR_SIZE) / step; i++) {
+      if (a[i] !== b[i]) {
         sectors.push({ at, data: flash.slice(at, at + SECTOR_SIZE) });
         break;
       }
@@ -64,19 +69,22 @@ const decode = (text, max) => {
 export function exportSave(record) {
   validateSectors(record.sectors);
   return JSON.stringify({ format: FORMAT, version: 1, hash: record.hash, name: record.name,
-    package: encode(record.package), sectors: record.sectors.map(s => ({ at: s.at, data: encode(s.data) })) });
+    package: record.byo ? null : encode(record.package), sectors: record.sectors.map(s => ({ at: s.at, data: encode(s.data) })) });
 }
 
-export async function importSave(text) {
+export async function importSave(text, resolvePackage = async () => null) {
   if (text.length > 16 << 20) throw new Error('backup too large');
   const r = JSON.parse(text);
   if (r.format !== FORMAT || r.version !== 1 || typeof r.name !== 'string' || r.name.length > 256 ||
       !Array.isArray(r.sectors) || r.sectors.length > 256) throw new Error('unsupported emulator save');
-  const pkg = decode(r.package, MAX_PACKAGE);
-  if (pkg.length < 20 * 0x30 || await packageHash(pkg) !== r.hash) throw new Error('firmware hash mismatch');
+  if (typeof r.hash !== 'string' || !/^[a-f0-9]{64}$/.test(r.hash)) throw new Error('invalid firmware hash');
+  const byo = r.package == null;
+  const pkg = byo ? await resolvePackage(r.hash) : decode(r.package, MAX_PACKAGE);
+  if (!pkg) throw new Error('open the matching .fwsc firmware first, then import this save again');
+  if (!(pkg instanceof Uint8Array) || pkg.length < 20 * 0x30 || pkg.length > MAX_PACKAGE || await packageHash(pkg) !== r.hash) throw new Error('firmware hash mismatch');
   const sectors = r.sectors.map(s => ({ at: s.at, data: decode(s.data, SECTOR_SIZE) }));
   validateSectors(sectors);
-  return { version: 1, hash: r.hash, name: r.name, package: pkg, sectors, revision: 0, url: null };
+  return { version: 1, hash: r.hash, name: r.name, package: pkg, byo, sectors, revision: 0, url: null };
 }
 
 export class SaveStore {
@@ -119,6 +127,24 @@ export class SaveStore {
     if (await packageHash(pkg) !== hash) throw new Error('stored firmware hash mismatch');
     return { ...state, hash, package: pkg };
   }
+  async remember(hash, entry) {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction('entries', 'readwrite');
+      tx.objectStore('entries').put({ hash }, entry);
+      tx.oncomplete = resolve;
+      tx.onabort = tx.onerror = () => reject(tx.error || new Error('could not remember firmware'));
+    });
+  }
+  async list() {
+    const db = await this.open();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction('states', 'readonly');
+      const request = tx.objectStore('states').getAll();
+      tx.oncomplete = () => resolve(request.result);
+      tx.onabort = tx.onerror = () => reject(tx.error || new Error('could not list saves'));
+    });
+  }
   async entry(key) {
     const entry = await this.get('entries', key);
     return entry ? this.load(entry.hash) : null;
@@ -139,7 +165,11 @@ export class SaveStore {
           tx.abort();
           return;
         }
-        tx.objectStore('packages').put(record.package, record.hash);
+        const packages = tx.objectStore('packages');
+        const installed = packages.getKey(record.hash);
+        installed.onsuccess = () => {
+          if (!installed.result) packages.put(record.package, record.hash);
+        };
         const { package: _pkg, ...state } = record;
         states.put({ ...state, revision }, record.hash);
         tx.objectStore('entries').put({ hash: record.hash }, entry);

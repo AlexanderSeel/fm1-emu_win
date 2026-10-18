@@ -29,9 +29,9 @@ an SPI operation is in progress. Increment the revision after erase/program oper
 Expose a validated, boot-only restore operation accepting offset + 4096-byte records.
 Reject unaligned, duplicate, out-of-range or truncated sectors before mutating memory.
 
-Restore before the first render. Synchronize modified bytes into the XIP window so
-firmware reading samples/data through XIP sees restored flash. Preserve decrypted code
-bytes from the package when restoring unchanged bytes in a whole-sector record.
+Restore before the first render. Copy every saved sector whole into the overlapping XIP
+window, just like a live SPI erase/program. This includes bytes equal to installed raw
+flash: installed raw flash and decrypted XIP differ. Keep untouched sectors decrypted.
 
 Apply a newly imported DX7 bank after restored state, preserving other saved flash.
 Use the pristine flash as the comparison baseline so imported voices are saved even
@@ -60,6 +60,8 @@ Explain that users still use their firmware's own save operation for edits in RA
 Reset only the selected firmware's flash after confirmation; keep its package.
 
 Export a versioned JSON backup containing the package, hash, display metadata and sectors.
+For bring-your-own firmware, omit the package (`package: null`); import resolves an already
+opened/cached package and requires the exact hash. The recipient supplies their own .fwsc.
 Validate format version, bounded sizes, package hash, sector alignment, length and
 duplicates before accepting imports. Verify the package boots before saving it locally.
 The export is an emulator save, not a firmware updater or a standard DX7 patch bank.
@@ -127,3 +129,22 @@ Browser termination can still interrupt the most recent asynchronous save. The s
 indicator represents a completed IndexedDB transaction, and exported backups provide a
 separate copy. Physical-device patch-bank export, RAM snapshots, automatic migration across
 firmware versions and a library UI for managing old versions remain outside this feature.
+
+## Review corrections
+
+- Restore full sectors in XIP; compare actual SPI erase/program with restore in Rust and
+  inspect XIP in the built-WASM round trip. Bank imports touch only changed bank sectors.
+- A missing/crashed machine acknowledges snapshots. Render errors clear the running page
+  session; a boot timeout cancels the pending worklet boot and clears its machine.
+- Reopening an unchanged save only updates its selection entry, leaving its revision intact.
+  Package bytes are inserted once; subsequent transactions update sparse state and metadata.
+  Compare raw snapshots in 32-bit words on the main thread, rather than byte by byte.
+- Every explicit snapshot waits for SPI idle and 250 ms quiet. After 1.5 s, switching may
+  proceed using the last stable save; Save/Export reports an error instead of writing an
+  unfinished snapshot. Quiescence is a heuristic, not a firmware transaction protocol.
+- Visibility changes and pagehide request best-effort snapshots. Browser termination can
+  still lose changes since the last committed quiet autosave.
+- An unsupported DX7 user bank is ignored, preserving the existing boot behavior.
+- Browse saved firmwares exposes exact prior hashes, including older catalog versions and
+  local files replaced by later imports. Cross-version patch migration is deferred until
+  compatible flash layouts can be established; reopening the old version remains supported.

@@ -23,6 +23,8 @@ function storage() {
     async entry(key) { return this.load(this.entries.get(key)); },
     async load(hash) { return structuredClone(this.records.get(hash) || null); },
     async get() { return null; },
+    async remember(hash, entry) { this.entries.set(entry, hash); },
+    async list() { return structuredClone([...this.records.values()]); },
     async save(record, entry) {
       if (this.fail) throw new Error('quota exceeded');
       assert.equal(record.revision, this.records.get(record.hash)?.revision || 0, 'stale write');
@@ -32,7 +34,8 @@ function storage() {
       return revision;
     } };
 }
-async function page(disk = storage(), initialSearch = '', selected = '') {
+async function page(disk = storage(), initialSearch = '', selected = '', manualBootTimeout = false) {
+  let bootTimer;
   const elements = new Map();
   const document = { documentElement: new Element(),
     getElementById(id) { if (!elements.has(id)) elements.set(id, new Element()); return elements.get(id); },
@@ -51,6 +54,7 @@ async function page(disk = storage(), initialSearch = '', selected = '') {
         this.messages.push(message);
         queueMicrotask(() => {
           if (message.type === 'boot') {
+            if (this.hangBoot) return;
             this.seq = message.seq;
             this.base = new Uint8Array(persistence.FLASH_SIZE).fill(170);
             this.flash = this.base.slice();
@@ -68,7 +72,10 @@ async function page(disk = storage(), initialSearch = '', selected = '') {
   }
   const local = new Map(selected ? [['fm1.fw', selected]] : []);
   const location = { search: initialSearch, origin: 'http://localhost', pathname: '/' };
-  const environment = { document, location, history: { replaceState(_a, _b, url) { location.search = url; } },
+  const environment = {
+    setTimeout(fn, ms) { if (manualBootTimeout && ms === 30000) { bootTimer = fn; return 'boot-timer'; } return setTimeout(fn, ms); },
+    clearTimeout(id) { if (id !== 'boot-timer') clearTimeout(id); },
+    document, location, history: { replaceState(_a, _b, url) { location.search = url; } },
     localStorage: { getItem: key => local.get(key), setItem: (key, value) => local.set(key, value) },
     ResizeObserver: class { observe() {} }, scrollY: 0, Option: Element, navigator: {},
     fetch: async url => ({ json: async () => url === 'smk37/firmwares.json' ? { firmwares: [] } : cat,
@@ -85,7 +92,7 @@ async function page(disk = storage(), initialSearch = '', selected = '') {
     get fw() { return fw; }
   }; })()`);
   const api = await run(...Object.values(environment));
-  return { api, disk, elements, location, get audio() { return audio; } };
+  return { api, disk, elements, location, expireBoot: () => bootTimer(), get audio() { return audio; } };
 }
 test('firmware switch, clock reboot and audio-context replacement retain the latest flash', async () => {
   const p = await page(); await p.api.startAudio(); await p.api.boot(); await settle();
@@ -138,4 +145,53 @@ test('reset removes only the selected firmware differences', async () => {
   assert.equal(p.audio.flash[0x74000], 170);
   p.api.setFirmware('b'); await p.api.boot();
   assert.equal(p.audio.flash[0x74000], 11);
+});
+
+test('opening an unchanged second tab does not invalidate the first tab revision', async () => {
+  const disk = storage();
+  const first = await page(disk); await first.api.startAudio(); await first.api.boot(); await settle();
+  const count = disk.writes.length;
+  const second = await page(disk); await second.api.startAudio(); await second.api.boot(); await settle();
+  assert.equal(disk.writes.length, count);
+  first.audio.flash[0x74000] = 91;
+  await first.api.flushRunning();
+  assert.equal(disk.writes.at(-1).record.sectors[0].data[0], 91);
+});
+test('a render failure clears the running session and another firmware boots immediately', async () => {
+  const p = await page(); await p.api.startAudio(); await p.api.boot(); await settle();
+  p.audio.port.onmessage({ data: { type: 'error', seq: p.audio.seq, fatal: true, message: 'render: trap' } });
+  assert.equal(p.api.running, null);
+  p.api.setFirmware('b'); assert.equal(await p.api.boot(), true);
+  assert.equal(p.audio.messages.filter(m => m.type === 'snapshot').length, 0);
+  assert.equal(p.api.running.record.name, 'b');
+});
+
+test('saved firmware library recovers earlier local files after importing another backup', async () => {
+  const p = await page(); await p.api.startAudio(); await p.api.boot();
+  p.audio.flash[0x74000] = 29; await p.api.flushRunning();
+  const firstHash = p.api.running.record.hash;
+  p.api.setFirmware('b'); await p.api.boot();
+  await p.elements.get('browse-saves').listeners.click();
+  const select = p.elements.get('saved-versions');
+  assert.equal(select.options.length, 2);
+  select.value = firstHash;
+  await p.elements.get('open-saved-version').listeners.click();
+  assert.equal(p.api.running.record.hash, firstHash);
+  assert.equal(p.audio.flash[0x74000], 29);
+  await settle();
+  const reloaded = await page(p.disk, '?fw=local', 'local');
+  await reloaded.api.startAudio(); await reloaded.api.boot();
+  assert.equal(reloaded.audio.flash[0x74000], 29);
+});
+
+test('a boot timeout cancels the machine and the next firmware selection recovers', async () => {
+  const p = await page(storage(), '', '', true);
+  await p.api.startAudio(); await p.api.boot(); await settle();
+  p.audio.hangBoot = true;
+  const booting = p.api.boot(); await settle(); p.expireBoot();
+  assert.equal(await booting, false);
+  assert.equal(p.api.running, null);
+  assert.ok(p.audio.messages.some(m => m.type === 'cancel-boot'));
+  p.audio.hangBoot = false; p.api.setFirmware('b');
+  assert.equal(await p.api.boot(), true);
 });

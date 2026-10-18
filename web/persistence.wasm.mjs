@@ -26,6 +26,7 @@ async function boot(sectors = []) {
     base: () => new Uint8Array(x.memory.buffer, x.fm1_flash_base(), x.fm1_flash_len()).slice() };
 }
 const first = await boot();
+const pristineXip = new Uint8Array(first.x.memory.buffer, first.x.fm1_xip(), first.x.fm1_xip_len()).slice();
 const run = seconds => {
   for (let frame = 0; frame < seconds * 44100; frame += 128) first.x.fm1_render(128, 50_000_000);
 };
@@ -41,6 +42,14 @@ const restored = await importSave(exportSave(record));
 const second = await boot(restored.sectors);
 assert.deepEqual(second.flash(), current);
 assert.deepEqual(second.base(), first.base());
+// A saved sector represents a runtime write: every overlapping XIP byte must match
+// raw flash, even when that byte equals the original encrypted package byte.
+const expectedXip = pristineXip.slice();
+for (const s of restored.sectors) {
+  const from = Math.max(s.at, 0x4000), end = Math.min(s.at + 4096, 0x4000 + expectedXip.length);
+  if (from < end) expectedXip.set(s.data.subarray(from - s.at, end - s.at), from - 0x4000);
+}
+assert.deepEqual(new Uint8Array(second.x.memory.buffer, second.x.fm1_xip(), second.x.fm1_xip_len()), expectedXip);
 // Invalid input is rejected atomically, including duplicate sectors and late restores.
 const invalid = new Uint8Array(4100); new DataView(invalid.buffer).setUint32(0, 1, true);
 assert.equal(second.x.fm1_flash_restore(second.copy(invalid), invalid.length), 1);
@@ -48,4 +57,4 @@ assert.deepEqual(second.flash(), current);
 second.x.fm1_render(128, 50_000_000);
 const packed = packSectors(restored.sectors);
 assert.equal(second.x.fm1_flash_restore(second.copy(packed), packed.length), 1);
-console.log(`WASM flash round trip passed: ${restored.sectors.length} sectors; rendered firmware and restored flash byte-for-byte`);
+console.log(`WASM flash round trip passed: ${restored.sectors.length} sectors; rendered firmware and restored raw flash plus XIP byte-for-byte`);

@@ -59,16 +59,15 @@ impl Machine {
             flash0, usr: None, started: false }
     }
 
-    // Copy only changed bytes: the package's raw flash contains encrypted code, while XIP
-    // contains decrypted code. Unchanged bytes in a saved sector must keep their XIP view.
+    // Runtime SPI writes replace complete ranges in XIP, including bytes that happen
+    // to equal the encrypted package. Restore must reproduce that same memory view.
     fn replace_flash(&mut self, at: usize, data: &[u8]) {
-        for (i, &b) in data.iter().enumerate() {
-            let o = at + i;
-            if self.soc.flash.mem[o] != b {
-                self.soc.flash.mem[o] = b;
-                if let Some(x) = o.checked_sub(fm1_soc::XIP_FLASH_OFFSET)
-                    .and_then(|x| self.soc.xip.get_mut(x)) { *x = b; }
-            }
+        self.soc.flash.mem[at..at + data.len()].copy_from_slice(data);
+        let from = at.max(fm1_soc::XIP_FLASH_OFFSET);
+        let end = (at + data.len()).min(fm1_soc::XIP_FLASH_OFFSET + self.soc.xip.len());
+        if from < end {
+            self.soc.xip[from - fm1_soc::XIP_FLASH_OFFSET..end - fm1_soc::XIP_FLASH_OFFSET]
+                .copy_from_slice(&data[from - at..end - at]);
         }
         self.soc.flash.revision = self.soc.flash.revision.wrapping_add(1);
     }
@@ -94,7 +93,12 @@ impl Machine {
         let Some(usr) = self.usr else { return false };
         let mut flash = self.soc.flash.mem.clone();
         if fm1_soc::fwsc::usr_load_syx(&mut flash, usr, bank, 0).is_err() { return false; }
-        self.replace_flash(0, &flash);
+        // Only bank sectors were written; preserve decrypted code elsewhere.
+        for at in (0..flash.len()).step_by(4096) {
+            if flash[at..at + 4096] != self.soc.flash.mem[at..at + 4096] {
+                self.replace_flash(at, &flash[at..at + 4096]);
+            }
+        }
         true
     }
 
@@ -167,6 +171,13 @@ pub extern "C" fn fm1_boot_fwsc(ptr: *mut u8, len: u32, syx: *mut u8, syx_len: u
 pub extern "C" fn fm1_flash() -> *const u8 {
     machine().map_or(std::ptr::null(), |m| m.soc.flash.mem.as_ptr())
 }
+/// Borrowed decrypted/memory-mapped view, for inspection alongside raw flash.
+#[no_mangle]
+pub extern "C" fn fm1_xip() -> *const u8 {
+    machine().map_or(std::ptr::null(), |m| m.soc.xip.as_ptr())
+}
+#[no_mangle]
+pub extern "C" fn fm1_xip_len() -> u32 { machine().map_or(0, |m| m.soc.xip.len() as u32) }
 #[no_mangle]
 pub extern "C" fn fm1_flash_base() -> *const u8 {
     machine().map_or(std::ptr::null(), |m| m.flash0.as_ptr())
@@ -185,7 +196,11 @@ pub extern "C" fn fm1_flash_restore(ptr: *mut u8, len: u32) -> u32 {
 #[no_mangle]
 pub extern "C" fn fm1_load_syx(ptr: *mut u8, len: u32) -> u32 {
     let bytes = unsafe { Vec::from_raw_parts(ptr, len as usize, len as usize) };
-    (!machine().is_some_and(|m| m.load_syx(&bytes))) as u32
+    match machine() {
+        Some(m) if m.usr.is_none() => 2, // unsupported: keep booting without a bank
+        Some(m) => (!m.load_syx(&bytes)) as u32,
+        None => 1,
+    }
 }
 
 /// Compile hot code to WebAssembly (`on` = 1; the host's `env.fm1_jit_compile` does the
@@ -596,17 +611,40 @@ mod persistence_tests {
         bytes
     }
     #[test]
-    fn restore_updates_xip_without_overwriting_unchanged_decrypted_bytes() {
+    fn restore_replaces_complete_xip_sectors_including_raw_equal_bytes() {
         let mut m = blank();
         let mut bytes = record(0x74000, 0xaa);
         bytes[4] = 0x12;
         assert!(m.restore(&bytes));
-        assert_eq!(m.soc.read32(0x02070000), 0x55555512);
+        assert_eq!(m.soc.read32(0x02070000), 0xaaaaaa12);
         assert_eq!(m.soc.flash.mem[0x74000], 0x12);
         assert_eq!(m.flash0[0x74000], 0xaa);
         assert_eq!(m.soc.flash.revision, 1);
         assert!(m.restore(&record(0x75000, 0xff)));
         assert_eq!(m.soc.read32(0x02071000), 0xffffffff);
+    }
+    #[test]
+    fn restored_xip_matches_live_spi_erase_and_program() {
+        let mut live = blank();
+        let mut restored = blank();
+        // The erased byte at +0x10 already equals raw flash, but not decrypted XIP.
+        live.soc.flash.mem[0x74010] = 0xff;
+        restored.soc.flash.mem[0x74010] = 0xff;
+        for cmd in [&[0x06][..], &[0x20, 0x07, 0x40, 0x00], &[0x06],
+            &[0x02, 0x07, 0x40, 0x00, 0x12, 0x34]] {
+            live.soc.write32(0x500c0, 0);
+            for &b in cmd { live.soc.write32(0x11c08, b as u32); }
+            live.soc.write32(0x500c0, 1);
+        }
+        let mut bytes = 0x74000u32.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&live.soc.flash.mem[0x74000..0x75000]);
+        assert!(restored.restore(&bytes));
+        assert_eq!(live.soc.read32(0x02070010), 0xffffffff);
+        for at in (0..4096).step_by(4) {
+            let address = 0x02070000 + at as u32;
+            assert_eq!(restored.soc.read32(address), live.soc.read32(address), "XIP at {address:x}");
+        }
+        assert_eq!(restored.soc.read32(0x02071000), 0x55555555);
     }
     #[test]
     fn invalid_restore_is_atomic_and_restore_is_boot_only() {
@@ -631,6 +669,7 @@ mod persistence_tests {
         fm1_soc::fwsc::usr_load_syx(&mut expected, 0xe0000, &bank, 0).unwrap();
         assert!(m.load_syx(&bank));
         assert_eq!(m.soc.flash.mem, expected);
+        assert_eq!(m.soc.read32(0x02000000), 0x55555555, "bank imports preserve decrypted code");
         assert_eq!(m.soc.flash.mem[0x74000], 0x17);
         assert!(m.flash0.iter().all(|&b| b == 0xaa));
         assert!(!m.load_syx(&[1, 2, 3]));

@@ -47,11 +47,11 @@ test('storage unavailability is an explicit failure', async () => {
 
 // A deliberately controlled transaction: prove we await commit, not request success, and
 // abort before writing any objects when an optimistic revision conflicts with another tab.
-function transactionStore(existing) {
+function transactionStore(existing, packageExists = false) {
   let tx, request, puts = 0;
   const store = new SaveStore(null);
   store.open = async () => ({ transaction() {
-    tx = { objectStore() { return { get() { request = {}; return request; }, put() { puts++; } }; },
+    tx = { objectStore(name) { return { getKey() { const r = {}; queueMicrotask(() => { r.result = packageExists; r.onsuccess(); }); return r; }, get() { const r = {}; if (name === 'states') request = r; else queueMicrotask(() => { r.result = packageExists; r.onsuccess(); }); return r; }, put() { puts++; } }; },
       abort() { queueMicrotask(() => tx.onabort()); } };
     queueMicrotask(() => { request.result = existing; request.onsuccess(); });
     return tx;
@@ -79,4 +79,25 @@ test('a stale tab cannot overwrite a newer save', async () => {
   const h = transactionStore({ revision: 3 });
   await assert.rejects(h.store.save({ hash: 'test', revision: 2, package: new Uint8Array(960), sectors: [] }, 'fm1.local'), /another tab/);
   assert.equal(h.puts(), 0);
+});
+
+test('autosaving an installed firmware writes state and entry without rewriting the package', async () => {
+  const h = transactionStore({ revision: 1 }, true);
+  const pending = h.store.save({ hash: 'test', revision: 1, package: new Uint8Array(960), sectors: [] }, 'fm1.local');
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(h.puts(), 2);
+  h.tx().oncomplete(); assert.equal(await pending, 2);
+});
+
+test('bring-your-own backups omit firmware and require a hash-matching provided package', async () => {
+  const pkg = new Uint8Array(960).fill(93);
+  const record = { hash: await packageHash(pkg), package: pkg, name: 'stock', byo: true, sectors: [sector(4096, 255)] };
+  const text = exportSave(record);
+  assert.equal(JSON.parse(text).package, null);
+  await assert.rejects(importSave(text), /matching .fwsc/);
+  await assert.rejects(importSave(text, async () => new Uint8Array(960)), /hash mismatch/);
+  const restored = await importSave(text, async hash => hash === record.hash ? pkg : null);
+  assert.equal(restored.byo, true);
+  assert.deepEqual(restored.sectors, record.sectors);
+  assert.equal(JSON.parse(exportSave(restored)).package, null);
 });

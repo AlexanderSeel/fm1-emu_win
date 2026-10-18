@@ -45,6 +45,11 @@ try {
   loaded.sectors = [];
   loaded.revision = await second.save(loaded, 'fm1.local');
   check((await first.entry('fm1.local')).sectors.length === 0, 'reset saves an empty difference set');
+  const revision = loaded.revision;
+  await first.remember(hash, 'fm1.local-again');
+  check((await second.entry('fm1.local-again')).revision === revision,
+    'reopening a save updates selection without invalidating other tabs');
+  check((await first.list()).some(r => r.hash === hash), 'saved version library retains prior firmware hashes');
   (await first.open()).close(); (await second.open()).close();
   output.textContent += `\n\nAll ${results.length} browser storage checks passed.`;
 } catch (error) {

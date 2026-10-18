@@ -44,11 +44,15 @@
         <button type="button" id="export-save">Export save…</button>
         <label class="file">Import save… <input type="file" id="import-save" accept=".json,.fm1save"></label>
         <button type="button" id="reset-save">Reset saved flash…</button>
+        <button type="button" id="browse-saves">Browse saved firmwares</button>
+        <select id="saved-versions" aria-label="Saved firmware versions"></select>
+        <button type="button" id="open-saved-version">Open saved firmware</button>
         <button type="button" id="update-firmware">Check for firmware updates</button>
       </div>
       <p>Settings and patches written to flash are saved automatically. Use the firmware’s own save
-        command for patch edits. Backups contain the firmware and its saved flash; they are emulator
-        saves, not firmware update files. Clearing browser data removes local saves.</p>
+        command for patch edits. Backups contain saved flash and community firmware. For M-VAVE firmware, the
+        recipient must open their own matching .fwsc first. Browse saved firmwares to reopen
+        older versions or local files. Clearing browser data removes local saves.</p>
     </details>
     <span id="save-status" role="status" aria-live="polite">Start to restore saved settings and patches</span>
     <span id="about"></span>

@@ -696,16 +696,36 @@ let ac = null, last = null, bootSeq = 0, booting = 0;
 let bootQueue = Promise.resolve(), running = null, requestId = 0;
 const sessions = new Map(), bootWaiters = new Map(), snapshotWaiters = new Map();
 
+function sameSectors(a, b) {
+  return a.length === b.length && a.every((s, i) => {
+    if (s.at !== b[i].at) return false;
+    const left = new DataView(s.data.buffer, s.data.byteOffset, s.data.byteLength);
+    const right = new DataView(b[i].data.buffer, b[i].data.byteOffset, b[i].data.byteLength);
+    for (let at = 0; at < s.data.length; at += 4) if (left.getUint32(at) !== right.getUint32(at)) return false;
+    return true;
+  });
+}
 function saveSnapshot(session, flash, flashRevision) {
   session.flash = flash;
   const sectors = changedSectors(session.base, flash);
   session.record = { ...session.record, sectors };
   memoryRecords.set(session.record.hash, session.record);
+  if (!session.forceSave && session.revision && sameSectors(session.persistedSectors || [], sectors)) {
+    session.pending = Promise.resolve(session.pending).then(() => saveStore.remember(session.record.hash, session.entry));
+    session.pending.then(() => { if (running === session) saveMessage("Saved in this browser"); })
+      .catch(error => { if (running === session) saveFailure(error); });
+    return session.pending;
+  }
+  session.record.unsaved = true;
   if (running === session) saveMessage("Saving…");
   const record = session.record;
   session.pending = (session.pending || Promise.resolve()).catch(() => {}).then(async () => {
-    const revision = await saveStore.save({ ...record, revision: session.revision }, session.entry);
+    const { unsaved: _unsaved, ...stored } = record;
+    const revision = await saveStore.save({ ...stored, revision: session.revision }, session.entry);
     session.revision = revision;
+    record.unsaved = false;
+    session.persistedSectors = record.sectors;
+    session.forceSave = false;
     session.record.revision = revision;
     // Keep the newest memory snapshot, even when an earlier transaction has just completed.
     const latest = memoryRecords.get(record.hash);
@@ -732,7 +752,7 @@ async function flushRunning(pause = false) {
   node.port.postMessage({ type: "snapshot", seq: session.seq, request, pause });
   await response;
   // A storage failure leaves the snapshot in memory, available for export and retry.
-  await session.pending.catch(() => {});
+  await session.pending?.catch(() => {});
 }
 
 // Serialize machine replacement, including the snapshot of the old machine. Requests that
@@ -758,8 +778,9 @@ function boot(options = {}) {
         : memoryRecords.get(hash) || record;
       if (options.reset) record = { ...record, sectors: [] };
       const sectors = record?.sectors || [];
-      const session = { seq, entry: DEV.key + f.id, revision: record?.revision || 0,
-        record: { version: 1, hash, name: f.name, package: got.bytes, url: got.url,
+      const session = { seq, forceSave: !!(options.reset || options.imported || record?.unsaved),
+        persistedSectors: record?.sectors || [], entry: DEV.key + f.id, revision: record?.revision || 0,
+        record: { version: 1, hash, name: f.name, byo: !!(f.byo || record?.byo), device: DEVICE, package: got.bytes, url: got.url,
           sectors, revision: record?.revision || 0 } };
       sessions.set(seq, session);
       loadedUrl = got.url;
@@ -769,7 +790,12 @@ function boot(options = {}) {
       booting = seq;
       perf.reset();
       const ready = new Promise((resolve, reject) => {
-        const timer = setTimeout(() => { bootWaiters.delete(seq); reject(new Error("firmware boot timed out")); }, 30000);
+        const timer = setTimeout(() => {
+          bootWaiters.delete(seq);
+          running = null;
+          node?.port.postMessage({ type: "cancel-boot", seq });
+          reject(new Error("firmware boot timed out"));
+        }, 30000);
         bootWaiters.set(seq, { resolve, reject, timer });
       });
       node.port.postMessage({ type: "boot", seq, wasm: wasm.slice(0), package: got.bytes.slice().buffer,
@@ -809,6 +835,12 @@ async function startAudio() {
 function onWorklet(e) {
   const m = e.data;
   if (m.type === "error") {
+    if (m.fatal && running?.seq === m.seq) {
+      running = null;
+      for (const [id, pending] of snapshotWaiters) if (pending.seq === m.seq) {
+        clearTimeout(pending.timer); snapshotWaiters.delete(id); pending.resolve();
+      }
+    }
     const waiter = bootWaiters.get(m.seq);
     if (waiter) { clearTimeout(waiter.timer); bootWaiters.delete(m.seq); waiter.reject(new Error(m.message)); }
     if (m.seq === bootSeq) status.textContent = `${fw.name}: ${m.message}`;
@@ -822,13 +854,14 @@ function onWorklet(e) {
   }
   if (m.type === "snapshot") {
     const session = sessions.get(m.seq);
-    if (session) {
+    if (session && m.flash) {
       session.observedRevision = m.revision;
       saveSnapshot(session, m.flash, m.revision);
     }
     const waiter = snapshotWaiters.get(m.request);
     if (waiter?.seq === m.seq) {
-      clearTimeout(waiter.timer); snapshotWaiters.delete(m.request); waiter.resolve();
+      clearTimeout(waiter.timer); snapshotWaiters.delete(m.request);
+      if (m.error) waiter.reject(new Error(m.error)); else waiter.resolve();
     }
     return;
   }
@@ -889,7 +922,7 @@ document.getElementById("save-now").addEventListener("click", action(async () =>
 }));
 document.getElementById("export-save").addEventListener("click", action(async () => {
   if (!running) throw new Error("start a firmware first");
-  try { await flushRunning(); } catch (error) { saveFailure(error); }
+  await flushRunning();
   const record = running.record;
   const url = URL.createObjectURL(new Blob([exportSave(record)], { type: "application/json" }));
   const link = document.createElement("a");
@@ -903,12 +936,19 @@ document.getElementById("import-save").addEventListener("change", action(async (
   input.value = "";
   if (!file) return;
   if (file.size > 16 << 20) throw new Error("backup too large");
-  const record = await importSave(await file.text());
+  const record = await importSave(await file.text(), async hash => {
+    const kept = memoryRecords.get(hash) || await saveStore.load(hash);
+    if (kept) return kept.package;
+    if (localFw?.bytes && await packageHash(localFw.bytes) === hash) return localFw.bytes;
+    for (const got of packages.values()) if (await packageHash(got.bytes) === hash) return got.bytes;
+    return null;
+  });
   if (!confirm(`Import “${record.name}”? This replaces any saved flash for the same firmware package.`)) return;
   await bootQueue;
   await flushRunning();
   let existing;
   try { existing = await saveStore.load(record.hash); } catch (error) { saveFailure(error); }
+  record.byo ||= memoryRecords.get(record.hash)?.byo || existing?.byo || false;
   record.revision = memoryRecords.get(record.hash)?.revision || existing?.revision || 0;
   memoryRecords.set(record.hash, record);
   // Explicit imports are always a local entry, independent of the currently selected stock firmware.
@@ -945,3 +985,38 @@ document.getElementById("update-firmware").addEventListener("click", action(asyn
 document.addEventListener("visibilitychange", () => {
   if (document.visibilityState === "hidden" && running) flushRunning().catch(saveFailure);
 });
+
+// Closing a tab is best effort: the browser may terminate the worklet before its reply.
+// Frequent quiet autosaves remain the durable fallback.
+addEventListener("pagehide", () => {
+  if (running) flushRunning().catch(saveFailure);
+});
+
+// Saved hashes remain accessible after catalog updates and subsequent local-file imports.
+const savedVersions = document.getElementById("saved-versions");
+document.getElementById("browse-saves").addEventListener("click", action(async () => {
+  const records = new Map((await saveStore.list()).map(r => [r.hash, r]));
+  for (const [hash, record] of memoryRecords) records.set(hash, record);
+  savedVersions.replaceChildren();
+  for (const record of records.values()) {
+    if (record.device && record.device !== DEVICE) continue;
+    savedVersions.add(new Option(`${record.name} · ${record.hash.slice(0, 12)}`, record.hash));
+  }
+  saveMessage(records.size ? "Choose a saved firmware, then Open saved firmware" : "No saved firmwares yet");
+}));
+document.getElementById("open-saved-version").addEventListener("click", action(async () => {
+  const hash = savedVersions.value;
+  const record = memoryRecords.get(hash) || await saveStore.load(hash);
+  if (!record) throw new Error("choose a saved firmware first");
+  await bootQueue;
+  await flushRunning();
+  localFw = { id: "local", name: record.name, version: "", bytes: record.package };
+  let opt = [...fwSel.options].find(o => o.value === "local");
+  if (!opt) fwSel.add(opt = new Option("", "local"), 0);
+  opt.text = `${record.name} (saved version)`;
+  fw = localFw; fwSel.value = "local";
+  if (!EMBED) store(DEV.key + "fw", "local");
+  bank = null; loadedUrl = null; showFirmware();
+  if (node) await boot();
+  else status.textContent = `${record.name} saved version ready: click Start`;
+}));

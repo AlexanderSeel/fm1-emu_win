@@ -55,10 +55,16 @@ class Fm1 extends AudioWorkletProcessor {
           this.paused = false;
           this.port.postMessage({ type: "error", seq: m.seq, message: `boot: ${err}` });
         }
+      } else if (m.type === "cancel-boot") {
+        ++this.bootToken;
+        this.x = null;
+        this.snapshots = [];
+      } else if (m.type === "snapshot" && !this.x) {
+        this.port.postMessage({ type: "snapshot", seq: m.seq, request: m.request, unavailable: true });
       } else if (this.x) {
         if (m.type === "snapshot") {
           if (m.seq !== this.seq) return;
-          this.snapshots.push(m);
+          this.snapshots.push({ ...m, started: now() });
           this.flushSnapshots();
         } else if (m.type === "cancel-snapshot") this.snapshots = this.snapshots.filter(r => r.request !== m.request);
         else if (m.type === "resume") this.paused = false;
@@ -97,7 +103,7 @@ class Fm1 extends AudioWorkletProcessor {
     if (m.sectors?.byteLength && x.fm1_flash_restore(copy(m.sectors), m.sectors.byteLength) !== 0) {
       throw new Error("invalid saved flash sectors");
     }
-    if (m.syx && x.fm1_load_syx(copy(m.syx), m.syx.byteLength) !== 0) {
+    if (m.syx && x.fm1_load_syx(copy(m.syx), m.syx.byteLength) === 1) {
       throw new Error("this firmware cannot load that DX7 bank");
     }
     this.x = x;                         // (a reboot replaces the whole instance)
@@ -135,12 +141,21 @@ class Fm1 extends AudioWorkletProcessor {
 
   flushSnapshots() {
     const x = this.x;
-    if (!x || x.fm1_flash_busy()) return;
+    if (!x) return;
     this.observeFlash();
-    // A firmware save can span several SPI commands and audio quanta. Give it time to
-    // finish before a firmware/clock/context replacement freezes this machine.
-    if (this.snapshots.some(r => r.pause) && now() - this.flashChangedAt < 250 && !x.fm1_halted()) return;
+    const quiet = now() - this.flashChangedAt >= 250 || x.fm1_halted();
+    const busy = x.fm1_flash_busy();
     for (const request of this.snapshots.splice(0)) {
+      if (busy || !quiet) {
+        if (request.request !== undefined && now() - request.started >= 1500) {
+          // A constantly writing firmware must not prevent switching away. Keep its
+          // last stable save instead of persisting a possibly half-written sector.
+          if (request.pause) this.paused = true;
+          this.port.postMessage({ type: "snapshot", seq: this.seq, request: request.request,
+            unavailable: true, error: request.pause ? null : "flash did not become quiet; try saving again" });
+        } else this.snapshots.push(request);
+        continue;
+      }
       const flash = new Uint8Array(x.memory.buffer, x.fm1_flash(), x.fm1_flash_len()).slice();
       this.flashRevision = x.fm1_flash_revision();
       this.observedRevision = this.flashRevision;
@@ -162,7 +177,10 @@ class Fm1 extends AudioWorkletProcessor {
       have = x.fm1_render(n, this.budget);
     } catch (err) {                       // a trap in the emulator: stop and say so
       this.x = null;
-      this.port.postMessage({ type: "error", seq: this.seq, message: `render: ${err}` });
+      for (const request of this.snapshots.splice(0)) {
+        this.port.postMessage({ type: "snapshot", seq: this.seq, request: request.request, unavailable: true });
+      }
+      this.port.postMessage({ type: "error", seq: this.seq, fatal: true, message: `render: ${err}` });
       return true;
     }
     const buffer = x.memory.buffer, lp = x.fm1_out_l(), rp = x.fm1_out_r();
