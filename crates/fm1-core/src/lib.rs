@@ -384,9 +384,9 @@ impl Cpu {
         let pre = Pre { route, fast, alu4, bittest, pair_head, syntax };
         let fast = fast.map(Fast::specialise);
         // (a predicated block without an else part is a conditional jump: no careful path)
-        let careful = pair_head || matches!(fast, Some(Fast::IfBlk { has_else: true, .. }))
-            || (fast.is_some() && is_flag_producer(syntax) && next_reads_flags(bus, pc + insn.entry.len as u32));
-        self.icache[slot] = Line { pc, len: insn.entry.len, pair_head, careful, fast };
+        let flags_live = fast.is_some() && is_flag_producer(syntax) && flags_read_later(bus, pc + insn.entry.len as u32);
+        let careful = pair_head || matches!(fast, Some(Fast::IfBlk { has_else: true, .. })) || flags_live;
+        self.icache[slot] = Line { pc, len: insn.entry.len, pair_head, careful, flags_live, fast };
         self.icache_x[slot] = Some(LineX { win, entry: insn.entry, pre });
         Ok(slot)
     }
@@ -774,7 +774,8 @@ impl Cpu {
             let mut op = BOp { fast: f, len: l.len, careful: l.careful, pair_head: l.pair_head, glue: false };
             let q = p + l.len as u32;
             glued = false;
-            if l.pair_head && !f.may_jump() && !matches!(f, Fast::IfBlk { .. }) && code(bus, q) {
+            // (a head whose flags are read later keeps the careful path: the JITs do not set them)
+            if l.pair_head && !l.flags_live && !f.may_jump() && !matches!(f, Fast::IfBlk { .. }) && code(bus, q) {
                 let ts = self.fetch_at(bus, q)?;
                 let t = self.icache[ts];
                 if let (Some(tf), false, false) = (t.fast, t.pair_head, t.careful) {
@@ -3766,6 +3767,27 @@ mod tests {
     }
 
     #[test]
+    fn flag_producer_with_a_later_reader_stays_careful() {
+        // FM-106's chorus interpolation (0x2005a8e): clang put a store between a 64-bit add's
+        // halves. `b4 e0 e0 40` r4 = r14 + r0 ; `d0 ec 79 b0` [r7+8] = r11 ;
+        // `b8 f0 f0 51` r5 = r15 + r1 + c. The JITs do not set the flags: the low half must stay
+        // on the careful path, or the high half takes a stale carry.
+        let code = [0xb4, 0xe0, 0xe0, 0x40, 0xd0, 0xec, 0x79, 0xb0, 0xb8, 0xf0, 0xf0, 0x51];
+        let mut mem = vec![0u8; 0x100];
+        mem[..12].copy_from_slice(&code);
+        let mut cpu = Cpu::new(0);
+        let slot = cpu.fetch_at(&mut FlatRam::new(mem), 0).unwrap();
+        assert!(cpu.icache[slot].careful, "producer two instructions before its reader");
+        // another add in between replaces the flags: the first one needs no care
+        let mut mem = vec![0u8; 0x100];
+        mem[..4].copy_from_slice(&code[..4]);
+        mem[4..16].copy_from_slice(&code);
+        let mut cpu = Cpu::new(0);
+        let slot = cpu.fetch_at(&mut FlatRam::new(mem), 0).unwrap();
+        assert!(!cpu.icache[slot].careful, "flags replaced before the reader");
+    }
+
+    #[test]
     fn corpus_unseen_offsets_decode() {
         // forms whose table classes fitted only the corpus operands (found running m6502 and the
         // SID player firmware): `6c e8 18 01` [r0+24] <<= 1, `64 e8 fe 10` [r1+-4] &= r0,
@@ -4246,17 +4268,30 @@ fn is_flag_producer(s: &str) -> bool {
         || s.starts_with("R = #h - ") || s.starts_with("R = #i - ")
 }
 
-/// Does the instruction at pc read the flags (`+ c`, `- !c`, a `psr` read)? A producer right
-/// before one stays off the JIT (which does not model the flags) on the careful path.
-fn next_reads_flags<B: Bus>(bus: &mut B, pc: u32) -> bool {
-    let win = (bus.fetch32(pc + 4) as u64) << 32 | bus.fetch32(pc) as u64;
-    match decode_any(win, pc) {
-        Ok(i) => {
-            let s = i.entry.syntax;
-            s.contains("+ c") || s.contains("- !c") || s.contains("= psr") || s.contains("psr,") || s.contains("{psr")
+/// How far past a flag producer `flags_read_later` looks for a reader.
+const FLAG_SCAN: usize = 8;
+
+/// Does an instruction from pc on read the flags (`+ c`, `- !c`, a `psr` read) before another
+/// add / subtract replaces them? A producer whose flags are read stays off the JITs (which do
+/// not model the flags) on the careful path. The reader need not be the next instruction:
+/// clang schedules other work between a 64-bit add's halves (FM-106's chorus interpolation
+/// stores a field between `r4 = r14 + r0` and `r5 = r15 + r1 + c`; compiled, the high half
+/// took a stale carry). The scan follows the fall-through path through anything: a reader
+/// that is never reached costs only speed.
+fn flags_read_later<B: Bus>(bus: &mut B, mut pc: u32) -> bool {
+    for _ in 0..FLAG_SCAN {
+        let win = (bus.fetch32(pc + 4) as u64) << 32 | bus.fetch32(pc) as u64;
+        let Ok(i) = decode_any(win, pc) else { return false };
+        let s = i.entry.syntax;
+        if s.contains("+ c") || s.contains("- !c") || s.contains("= psr") || s.contains("psr,") || s.contains("{psr") {
+            return true;
         }
-        Err(_) => false,
+        if is_flag_producer(canon_syntax(i.entry)) {
+            return false;
+        }
+        pc = pc.wrapping_add(i.entry.len as u32);
     }
+    false
 }
 
 fn canon_syntax(e: &'static fm1_isa::IsaEntry) -> &'static str {
@@ -4301,13 +4336,15 @@ pub struct Line {
     len: u8,
     pair_head: bool,
     /// Needs the careful path in `run_fast`: a pair head or a predicated
-    /// block (they change the state that holds interrupts back).
+    /// block (they change the state that holds interrupts back), or `flags_live`.
     careful: bool,
+    /// An add / subtract whose flags a later instruction reads (`flags_read_later`).
+    flags_live: bool,
     fast: Option<Fast>,
 }
 
 impl Line {
-    const EMPTY: Line = Line { pc: u32::MAX, len: 0, pair_head: false, careful: false, fast: None };
+    const EMPTY: Line = Line { pc: u32::MAX, len: 0, pair_head: false, careful: false, flags_live: false, fast: None };
 }
 
 /// One micro-op of a block.
