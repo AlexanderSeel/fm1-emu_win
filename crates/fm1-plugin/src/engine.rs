@@ -16,7 +16,6 @@ use std::time::{Duration, Instant};
 
 const RAM_BASE: u32 = 0x01c0_0000;
 const RAM_SIZE: usize = 1 << 20;
-const MHZ: u64 = 240;
 /// The firmware's output rate.
 pub const RATE: f64 = 44_100.0;
 /// Flash sectors, for saving what the firmware wrote (its patches) with the host's project.
@@ -83,14 +82,14 @@ struct Machine {
 }
 
 impl Machine {
-    fn boot(pkg: &[u8], sectors: &[(u32, Vec<u8>)]) -> Result<Self, String> {
+    fn boot(pkg: &[u8], sectors: &[(u32, Vec<u8>)], mhz: u64) -> Result<Self, String> {
         crate::savefile::validate_sectors(&sectors.iter().map(|(at, data)| crate::Sector {
             at: *at, data: Arc::new(data.clone()),
         }).collect::<Vec<_>>())?;
         let st = std::panic::catch_unwind(|| fm1_soc::stock_from_package(pkg, None))
             .map_err(|_| "malformed firmware package".to_owned())??;
         let mut soc = Soc::new(RAM_SIZE, st.xip);
-        soc.periph.hz = MHZ * 1_000_000;
+        soc.periph.hz = mhz * 1_000_000;
         soc.periph.skip_idle = true;
         let mut cpu = Cpu::new(st.entry);
         cpu.jit_on = true;
@@ -207,7 +206,7 @@ pub fn run(
             let (c, prepared, loaded) = match c {
                 Cmd::Load { firmware, sectors, reply } => {
                     let sectors: Sectors = sectors.iter().map(|s| (s.at, s.data.to_vec())).collect();
-                    match Machine::boot(&firmware.pkg, &sectors) {
+                    match Machine::boot(&firmware.pkg, &sectors, params.clock.value().mhz()) {
                         Ok(next) => (Cmd::Boot { pkg: firmware.pkg.clone(), sectors }, Some(next), Some((firmware, reply))),
                         Err(error) => { let _ = reply.send(Err(error)); continue; }
                     }
@@ -217,7 +216,7 @@ pub fn run(
             match c {
                 Cmd::Boot { pkg, sectors } => {
                     cancel_snapshots(&mut pending);
-                    m = prepared.or_else(|| Machine::boot(&pkg, &sectors).ok());
+                    m = prepared.or_else(|| Machine::boot(&pkg, &sectors, params.clock.value().mhz()).ok());
                     active_pkg = m.as_ref().map(|_| pkg);
                     pot = u16::MAX;
                     let mut v = shared.view.lock().unwrap();
@@ -258,6 +257,23 @@ pub fn run(
                     }
                 }
                 Cmd::Lead(l) => lead = l,
+            }
+        }
+        // a new clock: the machine's timers count its cycles, so boot it again on the new one,
+        // with what the firmware wrote to its flash
+        let mhz = params.clock.value().mhz();
+        if let (Some(mm), Some(pkg)) = (m.as_ref(), active_pkg.as_ref()) {
+            if mm.soc.periph.hz != mhz * 1_000_000 && pending.is_empty() {
+                let sectors = mm.changed_sectors();
+                if let Ok(next) = Machine::boot(pkg, &sectors, mhz) {
+                    m = Some(next);
+                    pot = u16::MAX;
+                    due.clear();
+                    let mut v = shared.view.lock().unwrap();
+                    (v.halted, v.speed) = (false, 0.0);
+                    starved0 = v.starved;
+                    (speed_t, speed_ms, busy) = (Instant::now(), 0, Duration::ZERO);
+                }
             }
         }
         snapshots(&mut pending, m.as_ref(), &params, Instant::now());

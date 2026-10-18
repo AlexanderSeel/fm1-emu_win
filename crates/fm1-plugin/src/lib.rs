@@ -57,6 +57,33 @@ pub struct Fm1Params {
     /// 0: channel messages as the host sends them; 1..16: moved to that channel.
     #[id = "channel"]
     pub channel: IntParam,
+    /// The emulated CPU's clock. Changing it reboots the firmware (its flash is kept).
+    #[id = "clock"]
+    pub clock: EnumParam<Clock>,
+}
+
+/// The emulated clock. The emulator runs one instruction a cycle at the chip's nominal 240 MHz,
+/// while the AC791N runs some instructions in dual-issue pairs, so a firmware that runs out of
+/// time can be given more. Each step costs host CPU (X0X on an M4 Pro: ~2.3x real time at 240,
+/// 1.7x at 320, 1.3x at 400).
+#[derive(Enum, Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Clock {
+    #[name = "240 MHz"]
+    Mhz240,
+    #[name = "320 MHz"]
+    Mhz320,
+    #[name = "400 MHz"]
+    Mhz400,
+}
+
+impl Clock {
+    pub fn mhz(self) -> u64 {
+        match self {
+            Clock::Mhz240 => 240,
+            Clock::Mhz320 => 320,
+            Clock::Mhz400 => 400,
+        }
+    }
 }
 
 impl Default for Fm1Params {
@@ -71,6 +98,7 @@ impl Default for Fm1Params {
                 .with_string_to_value(formatters::s2v_f32_percentage()),
             channel: IntParam::new("MIDI channel", 0, IntRange::Linear { min: 0, max: 16 })
                 .with_value_to_string(Arc::new(|v| if v == 0 { "as sent".into() } else { v.to_string() })),
+            clock: EnumParam::new("CPU clock", Clock::Mhz240).non_automatable(),
         }
     }
 }
