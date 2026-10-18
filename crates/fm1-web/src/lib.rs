@@ -33,6 +33,9 @@ struct Machine {
     /// interleaved L/R i16 not yet handed out
     audio: VecDeque<i16>,
     halted: bool,
+    flash0: Vec<u8>,
+    usr: Option<usize>,
+    started: bool,
 }
 
 impl Machine {
@@ -51,7 +54,48 @@ impl Machine {
         if let Some((f, board)) = stock {
             cpu.regs[0] = fm1_soc::stock_boot(&mut soc, f, params, board);
         }
-        Machine { cpu, cpu1: None, soc, pending_tick: false, audio: VecDeque::new(), halted: false }
+        let flash0 = soc.flash.mem.clone();
+        Machine { cpu, cpu1: None, soc, pending_tick: false, audio: VecDeque::new(), halted: false,
+            flash0, usr: None, started: false }
+    }
+
+    // Copy only changed bytes: the package's raw flash contains encrypted code, while XIP
+    // contains decrypted code. Unchanged bytes in a saved sector must keep their XIP view.
+    fn replace_flash(&mut self, at: usize, data: &[u8]) {
+        for (i, &b) in data.iter().enumerate() {
+            let o = at + i;
+            if self.soc.flash.mem[o] != b {
+                self.soc.flash.mem[o] = b;
+                if let Some(x) = o.checked_sub(fm1_soc::XIP_FLASH_OFFSET)
+                    .and_then(|x| self.soc.xip.get_mut(x)) { *x = b; }
+            }
+        }
+        self.soc.flash.revision = self.soc.flash.revision.wrapping_add(1);
+    }
+
+    fn restore(&mut self, bytes: &[u8]) -> bool {
+        const RECORD: usize = 4096 + 4;
+        if self.started || bytes.len() % RECORD != 0 || bytes.len() > RECORD * 256 { return false; }
+        let mut seen = [false; 256];
+        for record in bytes.chunks_exact(RECORD) {
+            let at = u32::from_le_bytes(record[..4].try_into().unwrap()) as usize;
+            if at % 4096 != 0 || at >= fm1_soc::FLASH_SIZE || seen[at / 4096] { return false; }
+            seen[at / 4096] = true;
+        }
+        for record in bytes.chunks_exact(RECORD) {
+            let at = u32::from_le_bytes(record[..4].try_into().unwrap()) as usize;
+            self.replace_flash(at, &record[4..]);
+        }
+        true
+    }
+
+    fn load_syx(&mut self, bank: &[u8]) -> bool {
+        if self.started { return false; }
+        let Some(usr) = self.usr else { return false };
+        let mut flash = self.soc.flash.mem.clone();
+        if fm1_soc::fwsc::usr_load_syx(&mut flash, usr, bank, 0).is_err() { return false; }
+        self.replace_flash(0, &flash);
+        true
     }
 
     /// fm1-live's loop: cpu0's blocks (interrupts exact at block granularity), cpu1 beside.
@@ -80,7 +124,7 @@ fn machine() -> Option<&'static mut Machine> {
     unsafe { M.as_mut() }
 }
 
-/// Bytes for JS to copy a firmware image into (never freed: one image per instance).
+/// Owned bytes for JS to fill, consumed by a boot, restore, bank or script export.
 #[no_mangle]
 pub extern "C" fn fm1_alloc(len: u32) -> *mut u8 {
     let mut v = vec![0u8; len as usize];
@@ -105,13 +149,43 @@ pub extern "C" fn fm1_boot_fwsc(ptr: *mut u8, len: u32, syx: *mut u8, syx_len: u
     // SAFETY: as fm1_boot.
     let pkg = unsafe { Vec::from_raw_parts(ptr, len as usize, len as usize) };
     let bank = (syx_len != 0).then(|| unsafe { Vec::from_raw_parts(syx, syx_len as usize, syx_len as usize) });
-    match fm1_soc::stock_from_package(&pkg, bank.as_deref()) {
+    match fm1_soc::stock_from_package(&pkg, None) {
         Ok(st) => {
-            unsafe { M = Some(Machine::new(st.xip, st.entry, mhz, Some((&st.flash, st.board)))) };
+            let mut m = Machine::new(st.xip, st.entry, mhz, Some((&st.flash, st.board)));
+            m.usr = st.usr;
+            if bank.as_deref().is_some_and(|b| !m.load_syx(b)) { return 1; }
+            unsafe { M = Some(m) };
             0
         }
         Err(_) => 1,
     }
+}
+
+/// Flash persistence. Pointers are borrowed until the instance is replaced. Restores and
+/// bank imports consume fm1_alloc allocations and are only accepted before the first render.
+#[no_mangle]
+pub extern "C" fn fm1_flash() -> *const u8 {
+    machine().map_or(std::ptr::null(), |m| m.soc.flash.mem.as_ptr())
+}
+#[no_mangle]
+pub extern "C" fn fm1_flash_base() -> *const u8 {
+    machine().map_or(std::ptr::null(), |m| m.flash0.as_ptr())
+}
+#[no_mangle]
+pub extern "C" fn fm1_flash_len() -> u32 { fm1_soc::FLASH_SIZE as u32 }
+#[no_mangle]
+pub extern "C" fn fm1_flash_revision() -> u32 { machine().map_or(0, |m| m.soc.flash.revision) }
+#[no_mangle]
+pub extern "C" fn fm1_flash_busy() -> u32 { machine().is_some_and(|m| m.soc.flash.busy()) as u32 }
+#[no_mangle]
+pub extern "C" fn fm1_flash_restore(ptr: *mut u8, len: u32) -> u32 {
+    let bytes = unsafe { Vec::from_raw_parts(ptr, len as usize, len as usize) };
+    (!machine().is_some_and(|m| m.restore(&bytes))) as u32
+}
+#[no_mangle]
+pub extern "C" fn fm1_load_syx(ptr: *mut u8, len: u32) -> u32 {
+    let bytes = unsafe { Vec::from_raw_parts(ptr, len as usize, len as usize) };
+    (!machine().is_some_and(|m| m.load_syx(&bytes))) as u32
 }
 
 /// Compile hot code to WebAssembly (`on` = 1; the host's `env.fm1_jit_compile` does the
@@ -169,6 +243,7 @@ pub extern "C" fn fm1_bench_script(ptr: *mut u8, len: u32) -> u32 {
 #[no_mangle]
 pub extern "C" fn fm1_render(frames: u32, max_insns: u32) -> u32 {
     let Some(m) = machine() else { return 0 };
+    m.started = true;
     #[cfg(target_arch = "wasm32")]
     {
         let per = unsafe { JIT_PER_RENDER };
@@ -504,5 +579,61 @@ pub extern "C" fn panel_slide(i: u32, y: f32) -> u32 {
         0..=3 => panel_smk::fader_value(i as usize, y) as u32,
         4 => panel_smk::wheel_value(true, y) as u32,
         _ => panel_smk::wheel_value(false, y) as u32,
+    }
+}
+
+#[cfg(test)]
+mod persistence_tests {
+    use super::*;
+    fn blank() -> Machine {
+        // Raw flash and its decrypted XIP view deliberately differ.
+        let raw = vec![0xaa; fm1_soc::FLASH_SIZE];
+        Machine::new(vec![0x55; 0x80000], 0x02000120, 100, Some((&raw, fm1_soc::Board::Fm1)))
+    }
+    fn record(at: u32, value: u8) -> Vec<u8> {
+        let mut bytes = at.to_le_bytes().to_vec();
+        bytes.extend(vec![value; 4096]);
+        bytes
+    }
+    #[test]
+    fn restore_updates_xip_without_overwriting_unchanged_decrypted_bytes() {
+        let mut m = blank();
+        let mut bytes = record(0x74000, 0xaa);
+        bytes[4] = 0x12;
+        assert!(m.restore(&bytes));
+        assert_eq!(m.soc.read32(0x02070000), 0x55555512);
+        assert_eq!(m.soc.flash.mem[0x74000], 0x12);
+        assert_eq!(m.flash0[0x74000], 0xaa);
+        assert_eq!(m.soc.flash.revision, 1);
+        assert!(m.restore(&record(0x75000, 0xff)));
+        assert_eq!(m.soc.read32(0x02071000), 0xffffffff);
+    }
+    #[test]
+    fn invalid_restore_is_atomic_and_restore_is_boot_only() {
+        let mut m = blank();
+        for bytes in [record(1, 0), record(1 << 20, 0), vec![0; 10],
+            [record(0, 0), record(0, 1)].concat(), [record(0, 0), record(7, 0)].concat()] {
+            assert!(!m.restore(&bytes));
+            assert_eq!(m.soc.flash.mem, m.flash0);
+        }
+        m.started = true;
+        assert!(!m.restore(&record(0, 0)));
+        assert!(!m.load_syx(&[0; 10]));
+    }
+
+    #[test]
+    fn imported_bank_overlays_restored_flash_and_keeps_the_pristine_baseline() {
+        let mut m = blank();
+        m.usr = Some(0xe0000);
+        assert!(m.restore(&record(0x74000, 0x17)));
+        let bank = vec![0x23; 4096];
+        let mut expected = m.soc.flash.mem.clone();
+        fm1_soc::fwsc::usr_load_syx(&mut expected, 0xe0000, &bank, 0).unwrap();
+        assert!(m.load_syx(&bank));
+        assert_eq!(m.soc.flash.mem, expected);
+        assert_eq!(m.soc.flash.mem[0x74000], 0x17);
+        assert!(m.flash0.iter().all(|&b| b == 0xaa));
+        assert!(!m.load_syx(&[1, 2, 3]));
+        assert_eq!(m.soc.flash.mem, expected, "invalid banks cannot modify saved patches");
     }
 }

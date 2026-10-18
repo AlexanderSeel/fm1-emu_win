@@ -37,6 +37,20 @@
     <label class="file">Open .fwsc… <input type="file" id="open"></label>
     <label class="file" title="A DX7 32-voice bank for M-VAVE's firmware">DX7 bank… <input type="file" id="bank"></label>
     <span id="bankname" class="dim"></span>
+    <details class="save-controls">
+      <summary>Save &amp; backup</summary>
+      <div class="save-actions">
+        <button type="button" id="save-now">Save now</button>
+        <button type="button" id="export-save">Export save…</button>
+        <label class="file">Import save… <input type="file" id="import-save" accept=".json,.fm1save"></label>
+        <button type="button" id="reset-save">Reset saved flash…</button>
+        <button type="button" id="update-firmware">Check for firmware updates</button>
+      </div>
+      <p>Settings and patches written to flash are saved automatically. Use the firmware’s own save
+        command for patch edits. Backups contain the firmware and its saved flash; they are emulator
+        saves, not firmware update files. Clearing browser data removes local saves.</p>
+    </details>
+    <span id="save-status" role="status" aria-live="polite">Start to restore saved settings and patches</span>
     <span id="about"></span>
   </div>
   <div id="perfwarn" role="alert" hidden>
@@ -222,9 +236,9 @@
         the 240×240 screen, the key matrix and encoders, the MASTER knob, the audio output and the MIDI IN port.
         Hot code is compiled to WebAssembly while it runs (a JIT); hover over the status line to see how many
         regions it has compiled.</p>
-      <p>Each firmware boots from its whole update package (<code>.fwsc</code>), fetched from the author's site
-        when you press Start. If the author has moved on to a newer version, the page takes the package the author's
-        installer names now. Packages are unpacked by the page's own unpacker, <code>fwsc.js</code>; Felucca's GPL
+      <p>Each firmware boots from its whole update package (<code>.fwsc</code>), downloaded from the author’s site
+        on first use and kept with its saved flash. “Check for firmware updates” fetches a new copy; a changed
+        package starts a separate save so an update cannot overwrite an older version’s patches. Packages are unpacked by the page's own unpacker, <code>fwsc.js</code>; Felucca's GPL
         package code (<code>fm1pkg.js</code>) stays out of the page.</p>
       <p>The whole story, from recovering an undocumented CPU from its firmware to the two JITs and how each
         step was checked, is in a technical report:

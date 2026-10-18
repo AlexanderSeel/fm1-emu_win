@@ -816,6 +816,8 @@ pub struct Stock {
     /// The board the package is for (its identity), with its identity.
     pub board: Board,
     pub identity: String,
+    /// FM-1 user bank, if this package has one.
+    pub usr: Option<usize>,
 }
 
 pub fn stock_from_package(pkg: &[u8], syx: Option<&[u8]>) -> Result<Stock, String> {
@@ -833,7 +835,8 @@ pub fn stock_from_package(pkg: &[u8], syx: Option<&[u8]>) -> Result<Stock, Strin
         }
     }
     let app = u.entry("app.bin").map(|h| h.offset).unwrap_or(0x120);
-    Ok(Stock { xip: u.xip, flash, entry: XIP_BASE + app as u32, board, identity: u.identity })
+    let usr = fwsc::usr_offset(&u).filter(|_| board == Board::Fm1);
+    Ok(Stock { xip: u.xip, flash, entry: XIP_BASE + app as u32, board, identity: u.identity, usr })
 }
 
 /// Ready a Soc for a package's firmware: its board, its flash chip, and the SPL's boot
@@ -890,5 +893,7 @@ mod tests {
         assert_eq!(soc.read32(0x0207_0000), 0xffff_3412);
         assert_eq!(soc.read32(0x0207_0ffc), 0xffff_ffff, "the rest of the sector erased");
         assert_eq!(soc.read32(0x0207_1000), 0xaaaa_aaaa, "the next sector as installed");
+        assert_eq!(soc.flash.revision, 2, "erase and program persist even after XIP consumes changed");
+        assert!(!soc.flash.busy());
     }
 }

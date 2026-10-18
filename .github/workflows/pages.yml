@@ -33,7 +33,10 @@ jobs:
 
       # The CPU, decoder and peripherals (fm1-live needs ALSA headers, the tests do not).
       - name: Unit tests
-        run: cargo test --release -p fm1-isa -p fm1-core -p fm1-soc
+        run: cargo test --release -p fm1-isa -p fm1-core -p fm1-soc -p fm1-web
+
+      - name: Browser code regression tests
+        run: node --test web/*.test.mjs
 
       # The README's table of firmwares (links that open each one on the page) matches the catalog.
       - name: README firmware table
@@ -46,6 +49,9 @@ jobs:
       # the page does) to audio and a screen, and a MIDI note sounds.
       - name: Test the emulator page
         run: node web/smoke.mjs _site
+
+      - name: WASM save round trip
+        run: node web/persistence.wasm.mjs _site
 
       # The SMK-37 page's wasm boots an SMK-37 build (GHOULBOX, from genkigenki's install page)
       # as the SMK-37 board, and a key on its keybed sounds.

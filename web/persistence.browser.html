@@ -1,0 +1,53 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Browser persistence regression checks</title>
+<h1>Browser persistence regression checks</h1>
+<p>Uses a separate, uniquely named test database. Emulator saves are untouched.</p>
+<pre id="results" role="status">Running…</pre>
+<script type="module">
+import { SaveStore, packageHash } from './persistence.js';
+const output = document.getElementById('results');
+const results = [];
+const check = (condition, label) => { if (!condition) throw new Error(label); results.push(`PASS: ${label}`); output.textContent = results.join('\n'); };
+const databaseName = `fm1-save-test-${crypto.randomUUID()}`;
+const factory = { open: (_name, version) => indexedDB.open(databaseName, version) };
+try {
+  // Recreate the old stock-package database, then upgrade it through the production helper.
+  await new Promise((resolve, reject) => {
+    const r = indexedDB.open(databaseName, 1);
+    r.onupgradeneeded = () => r.result.createObjectStore('packages');
+    r.onerror = () => reject(r.error);
+    r.onsuccess = () => {
+      const tx = r.result.transaction('packages', 'readwrite');
+      tx.objectStore('packages').put(new Uint8Array([17, 18]), 'mvave');
+      tx.oncomplete = () => { r.result.close(); resolve(); };
+      tx.onabort = () => reject(tx.error);
+    };
+  });
+  const first = new SaveStore(factory);
+  check((await first.get('packages', 'mvave'))[1] === 18, 'v1 stock package survives v2 migration');
+  const pkg = new Uint8Array(960).fill(42);
+  const hash = await packageHash(pkg);
+  const record = { version: 1, hash, package: pkg, name: 'test', revision: 0,
+    sectors: [{ at: 4096, data: new Uint8Array(4096).fill(23) }] };
+  record.revision = await first.save(record, 'fm1.local');
+  check(record.revision === 1, 'firmware, sectors and entry commit together');
+  const second = new SaveStore(factory);
+  const loaded = await second.entry('fm1.local');
+  check(loaded.hash === hash && loaded.package[0] === 42 && loaded.sectors[0].data[0] === 23,
+    'fresh connection restores firmware and binary sectors');
+  let conflict = false;
+  try { await second.save({ ...loaded, revision: 0 }, 'fm1.local'); }
+  catch (error) { conflict = error.message.includes('another tab'); }
+  check(conflict, 'stale connection cannot overwrite a newer save');
+  check((await first.load(hash)).revision === 1, 'aborted conflict preserves stored state');
+  check(await second.entry('smk37.local') === null, 'device entry selections are independent');
+  loaded.sectors = [];
+  loaded.revision = await second.save(loaded, 'fm1.local');
+  check((await first.entry('fm1.local')).sectors.length === 0, 'reset saves an empty difference set');
+  (await first.open()).close(); (await second.open()).close();
+  output.textContent += `\n\nAll ${results.length} browser storage checks passed.`;
+} catch (error) {
+  output.textContent += `\nFAIL: ${error.stack || error}`;
+}
+</script>

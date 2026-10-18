@@ -35,6 +35,8 @@ pub struct SpiFlash {
     /// The flash range the last erase or page program changed (`Soc` mirrors it into the XIP
     /// window), taken by the reader.
     pub changed: Option<(usize, usize)>,
+    /// Persistence generation, independent of the range consumed by XIP synchronization.
+    pub revision: u32,
 }
 
 impl SpiFlash {
@@ -52,6 +54,7 @@ impl SpiFlash {
             jedec: [0x85, 0x60, 0x14],
             trace: std::env::var_os("FM1_FLASH_TRACE").is_some(),
             changed: None,
+            revision: 0,
         }
     }
 
@@ -60,6 +63,8 @@ impl SpiFlash {
         let n = image.len().min(self.mem.len());
         self.mem[..n].copy_from_slice(&image[..n]);
     }
+
+    pub fn busy(&self) -> bool { self.cs_low }
 
     pub fn set_cs(&mut self, low: bool) {
         if !low && self.cs_low && self.trace && self.nbytes > 0 {
@@ -78,6 +83,7 @@ impl SpiFlash {
             }
             let a = self.addr as usize & (FLASH_SIZE - 1);
             self.changed = Some((a, (a + self.pending_prog.len()).min(FLASH_SIZE)));
+            self.revision = self.revision.wrapping_add(1);
             self.pending_prog.clear();
             self.wel = false;
         }
@@ -146,6 +152,7 @@ impl SpiFlash {
             *b = 0xff;
         }
         self.changed = Some((base, (base + size).min(FLASH_SIZE)));
+        self.revision = self.revision.wrapping_add(1);
         self.wel = false;
     }
 

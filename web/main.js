@@ -4,6 +4,7 @@
 // in the wasm: a catalog entry's fetched from its author's site, or one opened from this
 // computer (M-VAVE's own: their server does not let other pages fetch it).
 import { fetchPackage } from "./fwsc.js";
+import { SaveStore, packageHash, changedSectors, packSectors, exportSave, importSave } from "./persistence.js";
 
 const CLOCKS = [60, 80, 100, 120, 160, 200, 240];
 // The device this page is for: the FM-1 (index.html) or the SMK-37 (smk37/index.html, <html
@@ -44,6 +45,11 @@ const title = document.getElementById("title");
 const openInput = document.getElementById("open");
 const bankInput = document.getElementById("bank");
 const bankName = document.getElementById("bankname");
+const saveStatus = document.getElementById("save-status");
+const saveStore = new SaveStore();
+const memoryRecords = new Map();
+const saveMessage = (text, failed = false) => { saveStatus.textContent = text; saveStatus.dataset.error = String(failed); };
+const saveFailure = error => saveMessage(`Not saved in browser: ${error.message}. Export a backup to keep your changes.`, true);
 
 const wasm = await (await fetch("fm1_web.wasm")).arrayBuffer();   // the worklet gets its own copy
 // (the panel's instance runs no machine: its JIT import is never called)
@@ -150,48 +156,44 @@ if (DEVICE === "fm1") {
   }
 }
 
-// the package of catalog entry f, fetched from its author's site (nothing is hosted with this
-// page); kept per session. A package opened from this computer is the entry `local`. A `byo`
-// entry (M-VAVE's own: their server does not let pages fetch it) is the copy the visitor opened,
-// kept in this browser (IndexedDB) for the next visit.
+// Cached packages are pinned to their exact bytes. Checking for updates is explicit.
 const packages = new Map();
+let localFw = null;
 class NeedFile extends Error {}
+async function keptEntry(id) {
+  try { return await saveStore.entry(DEV.key + id); }
+  catch (error) { saveFailure(error); return null; }
+}
 async function packageOf(f) {
   if (f.id === "local") return { bytes: f.bytes, url: null };
-  if (f.byo) {
-    if (!packages.has(f.id)) {
-      const kept = await idb("get", f.id);
-      if (!kept) throw new NeedFile();
-      packages.set(f.id, { bytes: kept, url: null });
-    }
-    return packages.get(f.id);
+  if (packages.has(f.id)) return packages.get(f.id);
+  const kept = await keptEntry(f.id);
+  if (kept) {
+    const got = { bytes: kept.package, url: kept.url };
+    packages.set(f.id, got);
+    return got;
   }
-  if (!packages.has(f.id)) packages.set(f.id, await fetchPackage(f));
-  return packages.get(f.id);
+  if (f.byo) {
+    // Migration: old versions stored only uploaded stock packages, by catalog ID.
+    let bytes;
+    try { bytes = await saveStore.get("packages", f.id); } catch (error) { saveFailure(error); }
+    if (!bytes) throw new NeedFile();
+    const got = { bytes, url: null };
+    packages.set(f.id, got);
+    return got;
+  }
+  const got = await fetchPackage(f);
+  packages.set(f.id, got);
+  return got;
 }
-// a tiny key-value store in IndexedDB; any failure (private mode, blocked storage) is "nothing kept"
-function idb(op, key, value) {
-  return new Promise((done) => {
-    try {
-      const open = indexedDB.open("fm1-emulator", 1);
-      open.onupgradeneeded = () => open.result.createObjectStore("packages");
-      open.onerror = () => done(null);
-      open.onsuccess = () => {
-        try {
-          const tx = open.result.transaction("packages", op === "get" ? "readonly" : "readwrite");
-          const st = tx.objectStore("packages");
-          const r = op === "get" ? st.get(key) : op === "put" ? st.put(value, key) : st.delete(key);
-          r.onsuccess = () => done(op === "get" ? r.result || null : true);
-          r.onerror = () => done(null);
-        } catch { done(null); }
-      };
-    } catch { done(null); }
-  });
+const keptLocal = await keptEntry("local");
+if (keptLocal) {
+  localFw = { id: "local", name: keptLocal.name, version: "", bytes: keptLocal.package };
+  fwSel.add(new Option(`${localFw.name} (your file)`, "local"), 0);
+  if (params.get("fw") === "local" || (!params.has("fw") && stored(DEV.key + "fw") === "local")) { fw = localFw; fwSel.value = "local"; }
 }
-// a kept copy of a byo entry: known at once, so the page can say so before Start
-for (const f of catalog.firmwares.filter((f) => f.byo)) {
-  const kept = await idb("get", f.id);
-  if (kept) packages.set(f.id, { bytes: kept, url: null });
+for (const f of catalog.firmwares.filter(f => f.byo)) {
+  try { await packageOf(f); } catch { /* user has not opened a stock package yet */ }
 }
 let bank = null;                           // a DX7 32-voice bank for the stock firmware, or null
 
@@ -207,7 +209,7 @@ function showFirmware() {
   b.textContent = `${fw.name} ${fw.version}`.trim();
   let parts;
   if (fw.id === "local") {
-    parts = [b, " · opened from this computer; it stays in this page."];
+    parts = [b, " · opened from this computer; kept with its saved flash after Start."];
   } else if (fw.byo) {
     const dl = document.createElement("a");
     dl.href = fw.download;
@@ -233,12 +235,11 @@ function showFirmware() {
     parts.push(" Running ", p, ".");
   }
   about.replaceChildren(...parts);
-  if (fw.id === "local") return;           // (not something a link can bring back)
   const q = new URLSearchParams(location.search);
   q.set("fw", fw.id);
   q.set("mhz", mhz);
   history.replaceState(null, "", `?${q}`);
-  document.getElementById("fullpage").href = `./?fw=${fw.id}`;
+  document.getElementById("fullpage").href = fw.id === "local" ? "./" : `./?fw=${fw.id}`;
 }
 showFirmware();
 
@@ -260,14 +261,12 @@ mhzSel.addEventListener("change", () => {
 
 // a package from this computer: the file picker or a drop on the panel. With M-VAVE's entry
 // chosen, or a file named like theirs, it is that entry's copy and is kept for next time.
-let localFw = null;
 async function openLocal(file) {
   if (!file) return;
   const mv = catalog.firmwares.find((f) => f.byo);
   if (mv && (fw.byo || DEV.stockFile.test(file.name))) {
     const bytes = new Uint8Array(await file.arrayBuffer());
     packages.set(mv.id, { bytes, url: null });
-    idb("put", mv.id, bytes);
     fw = mv;
     fwSel.value = mv.id;
     if (!EMBED) store(DEV.key + "fw", mv.id);
@@ -283,6 +282,7 @@ async function openLocal(file) {
   opt.text = `${localFw.name} (your file)`;
   fwSel.value = "local";
   fw = localFw;
+  if (!EMBED) store(DEV.key + "fw", "local");
   loadedUrl = null;
   showFirmware();
   if (node) boot();
@@ -676,11 +676,14 @@ function setClock(c) {
   boot();
 }
 async function setLatency(l) {
+  await bootQueue;
+  await flushRunning(true);
   latency = l;
   store("fm1.latency", l);
   // a larger buffer needs a new audio context: rebuild the graph, boot again
   node.port.onmessage = null;
   node.disconnect();
+  running = null;
   await ac.close();
   await startAudio();
   await boot();
@@ -690,35 +693,103 @@ async function setLatency(l) {
 // ---------------------------------------------------------------- audio: start on a click
 let ac = null, last = null, bootSeq = 0, booting = 0;
 
-// (re)boot the machine in the audio thread with the selected firmware and clock
-async function boot() {
-  const seq = ++bootSeq;
-  const f = fw;
-  if (f.id !== "local" && !f.byo) status.textContent = `downloading ${f.name} from ${new URL(f.package || f.installer).host}…`;
-  let got;
-  try {
-    got = await packageOf(f);
-  } catch (err) {
-    if (seq !== bootSeq) return;
-    status.textContent = err instanceof NeedFile ? `${f.name}: open your FM-1.fwsc to boot it` :
-      `${f.name}: could not load it (${err.message})`;
-    return;
-  }
-  showFirmware();                                  // (says whether a kept copy is in use)
-  if (seq !== bootSeq) return;                     // another choice came in meanwhile
-  loadedUrl = got.url;
-  showFirmware();
-  down.fill(0);                                    // nothing held or turned across a reboot
-  holds.fill(0);
-  pointers.clear();
-  encClicks.fill(0);
-  frame = null;
-  last = null;
-  booting = seq;                                   // (frames of the old machine still on their way)
-  perf.reset();
-  node.port.postMessage({ type: "boot", seq, wasm: wasm.slice(0), package: got.bytes.slice().buffer,
-    syx: bank ? bank.slice().buffer : null, mhz, jit: params.get("jit") !== "0" });
-  status.textContent = `booting ${f.name}…`;
+let bootQueue = Promise.resolve(), running = null, requestId = 0;
+const sessions = new Map(), bootWaiters = new Map(), snapshotWaiters = new Map();
+
+function saveSnapshot(session, flash, flashRevision) {
+  session.flash = flash;
+  const sectors = changedSectors(session.base, flash);
+  session.record = { ...session.record, sectors };
+  memoryRecords.set(session.record.hash, session.record);
+  if (running === session) saveMessage("Saving…");
+  const record = session.record;
+  session.pending = (session.pending || Promise.resolve()).catch(() => {}).then(async () => {
+    const revision = await saveStore.save({ ...record, revision: session.revision }, session.entry);
+    session.revision = revision;
+    session.record.revision = revision;
+    // Keep the newest memory snapshot, even when an earlier transaction has just completed.
+    const latest = memoryRecords.get(record.hash);
+    if (latest) latest.revision = revision;
+    if (running === session && session.record === record && session.observedRevision === flashRevision) saveMessage("Saved in this browser");
+  });
+  session.pending.catch(error => { if (running === session) saveFailure(error); });
+  return session.pending;
+}
+
+async function flushRunning(pause = false) {
+  const session = running;
+  if (!session) return;
+  if (ac.state === "suspended") await ac.resume();
+  const request = ++requestId;
+  const response = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      snapshotWaiters.delete(request);
+      node?.port.postMessage({ type: "cancel-snapshot", request });
+      reject(new Error("flash snapshot timed out"));
+    }, 10000);
+    snapshotWaiters.set(request, { seq: session.seq, resolve, reject, timer });
+  });
+  node.port.postMessage({ type: "snapshot", seq: session.seq, request, pause });
+  await response;
+  // A storage failure leaves the snapshot in memory, available for export and retry.
+  await session.pending.catch(() => {});
+}
+
+// Serialize machine replacement, including the snapshot of the old machine. Requests that
+// became obsolete while downloading are skipped; every actual boot receives an acknowledgement.
+function boot(options = {}) {
+  const seq = ++bootSeq, f = fw, clock = mhz;
+  const task = async () => {
+    if (seq !== bootSeq) return false;
+    const importedBank = bank;
+    let got;
+    try {
+      got = await packageOf(f);
+      const hash = await packageHash(got.bytes);
+      let record = memoryRecords.get(hash);
+      if (!record) {
+        try { record = await saveStore.load(hash); } catch (error) { saveFailure(error); }
+      }
+      if (seq !== bootSeq) return false;
+      await flushRunning(true);
+      // flushRunning may have updated this firmware's most recent snapshot.
+      record = options.imported
+        ? { ...options.imported, revision: memoryRecords.get(hash)?.revision || options.imported.revision }
+        : memoryRecords.get(hash) || record;
+      if (options.reset) record = { ...record, sectors: [] };
+      const sectors = record?.sectors || [];
+      const session = { seq, entry: DEV.key + f.id, revision: record?.revision || 0,
+        record: { version: 1, hash, name: f.name, package: got.bytes, url: got.url,
+          sectors, revision: record?.revision || 0 } };
+      sessions.set(seq, session);
+      loadedUrl = got.url;
+      showFirmware();
+      down.fill(0); holds.fill(0); pointers.clear(); encClicks.fill(0);
+      frame = last = null;
+      booting = seq;
+      perf.reset();
+      const ready = new Promise((resolve, reject) => {
+        const timer = setTimeout(() => { bootWaiters.delete(seq); reject(new Error("firmware boot timed out")); }, 30000);
+        bootWaiters.set(seq, { resolve, reject, timer });
+      });
+      node.port.postMessage({ type: "boot", seq, wasm: wasm.slice(0), package: got.bytes.slice().buffer,
+        sectors: packSectors(sectors).buffer, syx: importedBank ? importedBank.slice().buffer : null,
+        mhz: clock, jit: params.get("jit") !== "0" });
+      status.textContent = `booting ${f.name}…`;
+      await ready;
+      if (bank === importedBank) bank = null; // imports seed flash once; saved edits win on later boots
+      return true;
+    } catch (error) {
+      if (bank === importedBank) bank = null;
+      booting = 0;
+      node?.port.postMessage({ type: "resume" });
+      if (seq === bootSeq) status.textContent = error instanceof NeedFile
+        ? `${f.name}: open your ${DEV.stock} to boot it` : `${f.name}: ${error.message}`;
+      return false;
+    }
+  };
+  bootQueue = bootQueue.then(task, task);
+  return bootQueue;
 }
 
 // the audio graph: a context with the chosen buffer, the emulator's worklet node in it
@@ -729,24 +800,55 @@ async function startAudio() {
   node.connect(ac.destination);
   node.port.onmessage = onWorklet;
   perf.reset();
+  // Boot now waits for a worklet acknowledgement; let its thread run even on browsers
+  // that create an AudioContext suspended until the Start gesture is resumed explicitly.
+  await ac.resume();
 }
 
 // what the audio thread sends: the screen and LEDs with its timing, boot and error news
 function onWorklet(e) {
   const m = e.data;
   if (m.type === "error") {
-    status.textContent = `${fw.name}: ${m.message}`;
+    const waiter = bootWaiters.get(m.seq);
+    if (waiter) { clearTimeout(waiter.timer); bootWaiters.delete(m.seq); waiter.reject(new Error(m.message)); }
+    if (m.seq === bootSeq) status.textContent = `${fw.name}: ${m.message}`;
+    return;
+  }
+  if (m.type === "flash-changed") {
+    const session = sessions.get(m.seq);
+    if (session) session.observedRevision = m.revision;
+    if (session === running) saveMessage("Saving…");
+    return;
+  }
+  if (m.type === "snapshot") {
+    const session = sessions.get(m.seq);
+    if (session) {
+      session.observedRevision = m.revision;
+      saveSnapshot(session, m.flash, m.revision);
+    }
+    const waiter = snapshotWaiters.get(m.request);
+    if (waiter?.seq === m.seq) {
+      clearTimeout(waiter.timer); snapshotWaiters.delete(m.request); waiter.resolve();
+    }
     return;
   }
   if (m.type === "booted") {
+    const session = sessions.get(m.seq), waiter = bootWaiters.get(m.seq);
+    if (!session || !waiter) return;
+    running = session;
+    for (const key of sessions.keys()) if (key !== m.seq) sessions.delete(key);
+    session.base = m.base;
+    session.observedRevision = m.revision;
+    saveSnapshot(session, m.flash, m.revision);
+    clearTimeout(waiter.timer); bootWaiters.delete(m.seq); waiter.resolve();
     if (m.seq === bootSeq) {
       booting = 0;
-      setBoard(m.board);                     // (the package's board: an SMK-37 one opened here too)
+      setBoard(m.board);
       if (m.board === 1) for (let i = 16; i < 22; i++) send({ type: "analog", idx: i, value: analog[i] });
     }
     return;
   }
-  if (m.type !== "frame" || booting) return;
+  if (m.type !== "frame" || booting || m.seq !== bootSeq) return;
   // Preserve an update not yet drawn when a status-only message arrives.
   if (!m.lcd && frame?.lcd) m.lcd = frame.lcd;
   frame = m;
@@ -769,11 +871,77 @@ function onWorklet(e) {
 startBtn.addEventListener("click", async () => {
   startBtn.disabled = true;
   status.textContent = "starting audio…";
-  await startAudio();
-  await boot();
+  if (!node) await startAudio();
+  const started = await boot();
+  if (!started) { startBtn.disabled = false; return; }
   if (midiSel.value) midiOpen();                  // (an input picked on an earlier visit)
   await ac.resume();
   startBtn.hidden = true;
   // a phone on its side: the synth fills the screen, so bring all of it into view
   if (matchMedia("(orientation: landscape) and (max-height: 560px)").matches) canvas.scrollIntoView({ block: "center" });
+});
+
+// Persistence controls use the running machine's identity, even while another firmware is selected.
+const action = fn => async () => { try { await fn(); } catch (error) { saveFailure(error); } };
+document.getElementById("save-now").addEventListener("click", action(async () => {
+  if (!running) throw new Error("start a firmware first");
+  await flushRunning();
+}));
+document.getElementById("export-save").addEventListener("click", action(async () => {
+  if (!running) throw new Error("start a firmware first");
+  try { await flushRunning(); } catch (error) { saveFailure(error); }
+  const record = running.record;
+  const url = URL.createObjectURL(new Blob([exportSave(record)], { type: "application/json" }));
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `${record.name.replace(/[^a-z0-9_-]/gi, '_')}.fm1save`;
+  link.click();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}));
+document.getElementById("import-save").addEventListener("change", action(async () => {
+  const input = document.getElementById("import-save"), file = input.files[0];
+  input.value = "";
+  if (!file) return;
+  if (file.size > 16 << 20) throw new Error("backup too large");
+  const record = await importSave(await file.text());
+  if (!confirm(`Import “${record.name}”? This replaces any saved flash for the same firmware package.`)) return;
+  await bootQueue;
+  await flushRunning();
+  let existing;
+  try { existing = await saveStore.load(record.hash); } catch (error) { saveFailure(error); }
+  record.revision = memoryRecords.get(record.hash)?.revision || existing?.revision || 0;
+  memoryRecords.set(record.hash, record);
+  // Explicit imports are always a local entry, independent of the currently selected stock firmware.
+  localFw = { id: "local", name: record.name, version: "", bytes: record.package };
+  let opt = [...fwSel.options].find(o => o.value === "local");
+  if (!opt) fwSel.add(opt = new Option("", "local"), 0);
+  opt.text = `${record.name} (your file)`;
+  fw = localFw; fwSel.value = "local";
+  if (!EMBED) store(DEV.key + "fw", "local");
+  bank = null;
+  loadedUrl = null;
+  showFirmware();
+  if (node) await boot({ imported: record });
+  else status.textContent = `${record.name} backup ready: click Start`;
+}));
+document.getElementById("reset-save").addEventListener("click", action(async () => {
+  if (!running || running.entry !== DEV.key + fw.id) throw new Error("start the selected firmware first");
+  if (!confirm(`Reset saved settings and patches for “${running.record.name}”? Export a backup first if you want to keep them.`)) return;
+  bank = null;
+  await boot({ reset: true });
+}));
+document.getElementById("update-firmware").addEventListener("click", action(async () => {
+  if (fw.id === "local" || fw.byo) throw new Error("open a new .fwsc file to update this firmware");
+  const selected = fw;
+  saveMessage(`Checking ${selected.name}…`);
+  const got = await fetchPackage(selected);
+  const hash = await packageHash(got.bytes);
+  packages.set(selected.id, got);
+  if (fw !== selected) return;
+  if (running?.record.hash === hash) { saveMessage("Firmware is up to date"); return; }
+  if (node) await boot();
+  else saveMessage("Firmware ready: click Start");
+}));
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden" && running) flushRunning().catch(saveFailure);
 });
