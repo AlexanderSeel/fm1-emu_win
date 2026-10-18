@@ -61,7 +61,6 @@ impl SpiFlash {
         self.mem[..n].copy_from_slice(&image[..n]);
     }
 
-    /// A selected flash command is still in progress. Snapshots wait for CS release.
     pub fn busy(&self) -> bool { self.cs_low }
 
     pub fn set_cs(&mut self, low: bool) {
