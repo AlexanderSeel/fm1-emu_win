@@ -1,0 +1,31 @@
+name: Plugin tests
+
+on:
+  pull_request:
+    paths:
+      - 'crates/fm1-plugin/**'
+      - 'crates/fm1-core/**'
+      - 'crates/fm1-soc/**'
+      - 'tools/build_plugin.sh'
+      - '.github/workflows/plugin-tests.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  plugin:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Build prerequisites
+        run: brew install cmake ninja
+      - name: Firmware for engine tests
+        run: node tools/fetch_firmwares.mjs felucca
+      - name: Unit and engine tests
+        run: cargo test --manifest-path crates/fm1-plugin/Cargo.toml --release --locked
+      - name: Build CLAP, AU and VST3 without installation
+        run: env NO_INSTALL=1 tools/build_plugin.sh

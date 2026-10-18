@@ -16,6 +16,7 @@ use std::sync::{mpsc, Arc, Mutex};
 
 mod editor;
 pub mod engine;
+pub mod savefile;
 #[path = "../../fm1-live/src/panel.rs"]
 #[allow(dead_code)]
 mod panel;

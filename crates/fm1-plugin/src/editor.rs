@@ -4,7 +4,7 @@
 //! that is the host's "Master" parameter), and a bar to load a firmware package.
 
 use crate::engine::Cmd;
-use crate::{panel, panel_smk, Firmware, Fm1Params, Link};
+use crate::{panel, panel_smk, Fm1Params, Link};
 use fm1_soc::Board;
 use nih_plug::prelude::*;
 use nih_plug_egui::{create_egui_editor, egui, widgets};
@@ -32,8 +32,10 @@ struct Ui {
     grab: Option<Grab>,
     wheel_acc: f32,
     msg: String,
+    msg_until: Option<std::time::Instant>,
     /// the file dialog's answer, while it is open
-    picking: Option<Answer>,
+    picking: Option<(FileAction, Answer)>,
+    job: Option<Job>,
 }
 
 impl Default for Ui {
@@ -54,7 +56,9 @@ impl Default for Ui {
             grab: None,
             wheel_acc: 0.0,
             msg: String::new(),
+            msg_until: None,
             picking: None,
+            job: None,
         }
     }
 }
@@ -82,17 +86,36 @@ pub fn create(params: Arc<Fm1Params>, link: Arc<Link>) -> Option<Box<dyn Editor>
         let (w, h) = if smk { (panel_smk::W, panel_smk::H) } else { (panel::W, panel::H) };
 
         egui::TopBottomPanel::top("bar").show(ctx, |bar| {
-            bar.horizontal(|bar| {
-                if bar.add_enabled(ui.picking.is_none(), egui::Button::new("Load firmware…")).clicked() {
-                    ui.picking = Some(pick());
+            bar.horizontal_wrapped(|bar| {
+                if ui.msg_until.is_some_and(|until| std::time::Instant::now() >= until) {
+                    ui.msg.clear(); ui.msg_until = None;
                 }
-                if let Some(answer) = ui.picking.as_ref().and_then(|a| a.lock().unwrap().take()) {
-                    ui.picking = None;
-                    if let Some(path) = answer {
-                        load(&params, &link, &path, &mut ui.msg);
-                    }
+                if let Some(result) = ui.job.as_ref().and_then(|job| job.lock().unwrap().take()) {
+                    ui.job = None;
+                    ui.msg_until = result.as_ref().ok().map(|_| std::time::Instant::now() + std::time::Duration::from_secs(3));
+                    ui.msg = match result { Ok(message) => message, Err(error) => format!("Save file: {error}") };
                 }
                 let name = params.firmware.lock().unwrap().name.clone();
+                let idle = ui.picking.is_none() && ui.job.is_none();
+                if bar.add_enabled(idle, egui::Button::new("Load firmware / save…"))
+                    .on_hover_text("Open a .fwsc firmware package or a shared .fm1save setup").clicked() {
+                    ui.picking = Some((FileAction::Load, pick(FileAction::Load, &name)));
+                }
+                let has_firmware = !params.firmware.lock().unwrap().pkg.is_empty();
+                if bar.add_enabled(idle && has_firmware, egui::Button::new("Export save…"))
+                    .on_hover_text("Share the running firmware, patches and settings as a .fm1save file").clicked() {
+                    ui.picking = Some((FileAction::Export, pick(FileAction::Export, &name)));
+                }
+                let chosen = ui.picking.as_ref().and_then(|(action, answer)|
+                    answer.lock().unwrap().take().map(|path| (*action, path)));
+                if let Some((action, path)) = chosen {
+                    ui.picking = None;
+                    if let Some(path) = path {
+                        ui.msg_until = None;
+                        ui.msg = if matches!(action, FileAction::Load) { "Loading save…" } else { "Exporting live flash…" }.into();
+                        ui.job = Some(file_job(action, path, params.clone(), link.clone()));
+                    }
+                }
                 bar.label(egui::RichText::new(if name.is_empty() { "no firmware".into() } else { name }).strong());
                 bar.separator();
                 bar.label("MIDI channel");
@@ -101,7 +124,7 @@ pub fn create(params: Arc<Fm1Params>, link: Arc<Link>) -> Option<Box<dyn Editor>
                 let status = if !ui.msg.is_empty() {
                     ui.msg.clone()
                 } else if !booted {
-                    "Load a .fwsc package (a community firmware, or M-VAVE's own) to start".into()
+                    "Open a .fwsc firmware or shared .fm1save to start".into()
                 } else if halted {
                     "The firmware stopped: an instruction the emulator does not know".into()
                 } else {
@@ -269,11 +292,22 @@ pub fn create(params: Arc<Fm1Params>, link: Arc<Link>) -> Option<Box<dyn Editor>
 /// in the frame then (in GarageBand's AU host that aborts). On macOS it opens from the main queue
 /// once the frame is done; the answer lands in the returned slot (a path, or None if cancelled).
 type Answer = Arc<std::sync::Mutex<Option<Option<std::path::PathBuf>>>>;
-fn pick() -> Answer {
+type Job = Arc<std::sync::Mutex<Option<Result<String, String>>>>;
+#[derive(Clone, Copy)]
+enum FileAction { Load, Export }
+
+fn pick(action: FileAction, name: &str) -> Answer {
     let answer: Answer = Default::default();
     let slot = answer.clone();
+    let name: String = name.chars().take(100).map(|c|
+        if c.is_alphanumeric() || " _-".contains(c) { c } else { '_' }).collect();
     let ask = move || {
-        let path = rfd::FileDialog::new().add_filter("FM-1 firmware package", &["fwsc"]).pick_file();
+        let path = match action {
+            FileAction::Load => rfd::FileDialog::new()
+                .add_filter("FM-1 firmware or shared save", &["fwsc", "fm1save", "json"]).pick_file(),
+            FileAction::Export => rfd::FileDialog::new().add_filter("FM-1 shared save", &["fm1save"])
+                .set_file_name(format!("{}.fm1save", if name.is_empty() { "FM-1" } else { &name })).save_file(),
+        };
         *slot.lock().unwrap() = Some(path);
     };
     #[cfg(target_os = "macos")]
@@ -283,27 +317,41 @@ fn pick() -> Answer {
     answer
 }
 
-/// Check that a package unpacks, and boot it (the project keeps it from now on).
-fn load(params: &Fm1Params, link: &Link, path: &std::path::Path, msg: &mut String) {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(e) => {
-            *msg = format!("{}: {e}", path.display());
-            return;
-        }
-    };
-    if let Err(e) = fm1_soc::stock_from_package(&bytes, None) {
-        *msg = format!("{}: not a firmware package ({e})", path.display());
-        return;
-    }
-    msg.clear();
-    let fw = Firmware {
-        name: path.file_stem().map_or_else(String::new, |s| s.to_string_lossy().into_owned()),
-        pkg: Arc::new(bytes),
-    };
-    params.flash.lock().unwrap().clear();
-    *params.firmware.lock().unwrap() = fw.clone();
-    link.boot(&fw, &[]);
+// File I/O, hashing and serialization never run in the audio callback or window frame.
+// The machine acknowledges imports only after a validated boot has replaced the old setup.
+fn file_job(action: FileAction, mut path: std::path::PathBuf, params: Arc<Fm1Params>, link: Arc<Link>) -> Job {
+    let job: Job = Default::default();
+    let result = job.clone();
+    std::thread::spawn(move || {
+        if matches!(action, FileAction::Export) && path.extension().is_none() { path.set_extension("fm1save"); }
+        let run = || -> Result<String, String> {
+            match action {
+                FileAction::Load => {
+                    let current = params.firmware.lock().unwrap().clone();
+                    let data = crate::savefile::read_with_firmware(&path, Some(&current))?;
+                    let firmware = data.firmware.clone();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    link.cmds.send(Cmd::Load { firmware: data.firmware, sectors: data.sectors, reply: tx })
+                        .map_err(|_| "the machine stopped".to_owned())?;
+                    rx.recv().map_err(|_| "the machine stopped while loading".to_owned())??;
+                    *link.running.lock().unwrap() = Some(firmware.pkg);
+                    Ok(format!("Loaded {}", firmware.name))
+                }
+                FileAction::Export => {
+                    let firmware = params.firmware.lock().unwrap().clone();
+                    if firmware.pkg.is_empty() { return Err("load a firmware first".into()); }
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    link.cmds.send(Cmd::Snapshot { pkg: firmware.pkg.clone(), reply: tx })
+                        .map_err(|_| "the machine stopped".to_owned())?;
+                    let sectors = rx.recv().map_err(|_| "the machine stopped while exporting".to_owned())??;
+                    crate::savefile::write(&path, &crate::savefile::SaveData { firmware, sectors })?;
+                    Ok(format!("Exported {}", path.file_name().unwrap_or_default().to_string_lossy()))
+                }
+            }
+        };
+        *result.lock().unwrap() = Some(run());
+    });
+    job
 }
 
 /// fm1-web's `panel_hit` codes: -1 nothing, 0..6 an encoder (FM-1; SMK-37 0..7 K1..K8), 7 the

@@ -167,7 +167,7 @@ other synth:
 | **CLAP** | Bitwig, Reaper, FL Studio, Studio One… |
 
 **What it does:**
-- **The firmware:** **Load firmware…** in the plugin's window picks a `.fwsc` package: any
+- **The firmware:** **Load firmware / save…** in the plugin’s window picks a `.fwsc` package: any
   community firmware (the table above links each author's) or M-VAVE's own. An SMK-37 package
   gets the SMK-37's panel.
 - **Playing it:** MIDI from the DAW plays it, as through the FM-1's MIDI IN. A *MIDI channel*
@@ -175,6 +175,9 @@ other synth:
   page's, played with the mouse: keys, buttons, knobs, and on the SMK-37 the pads, faders and
   wheels.
 - **Automation:** *Master* (the MASTER pot) is a parameter the DAW can automate.
+- **Share setups with the browser or another DAW.** “Load firmware / save…” opens a `.fwsc`
+  package or `.fm1save` setup. “Export save…” writes the firmware and its latest saved patches
+  and settings to one portable file. Edits in RAM need the firmware’s own Save command first.
 - **The project keeps the firmware and its patches.** The package and every flash sector the
   firmware has written are saved with the song, so it reopens with the same sounds.
 - **Timing:** the emulator runs a little ahead of the DAW and reports that delay as the plugin's
@@ -201,7 +204,7 @@ This builds the plugin and installs `FM-1.component`, `FM-1.vst3` and `FM-1.clap
 1. *Settings → Audio/MIDI*: tick *Enable Audio Units*, then quit and reopen GarageBand.
 2. Make a *Software Instrument* track and open its Smart Controls (**B**).
 3. Click the *Instrument* slot and choose *AU Instruments → fm1-emu → FM-1*.
-4. Click the slot to open its window, then *Load firmware…*.
+4. Click the slot to open its window, then *Load firmware / save…*.
 5. Play it with **⌘K** (Musical Typing) or a MIDI keyboard.
 
 **In Logic:** a Software Instrument track's instrument slot, *AU Instruments → fm1-emu → FM-1*.

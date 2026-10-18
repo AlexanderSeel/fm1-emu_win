@@ -34,6 +34,10 @@ pub struct Midi {
 pub enum Cmd {
     /// Boot a package (.fwsc), with flash sectors saved from an earlier run written over it.
     Boot { pkg: Arc<Vec<u8>>, sectors: Vec<(u32, Vec<u8>)> },
+    /// Validate and replace a shared setup, including a different save of the same package.
+    Load { firmware: crate::Firmware, sectors: Vec<crate::Sector>, reply: mpsc::Sender<Result<(), String>> },
+    /// Capture live flash, rather than the host-state copy refreshed every two seconds.
+    Snapshot { pkg: Arc<Vec<u8>>, reply: mpsc::Sender<Result<Vec<crate::Sector>, String>> },
     Key { id: u8, down: bool },
     Enc { enc: u8, clicks: i32 },
     /// SMK-37: an analog input (fm1_soc::smk's ANALOG_*), the next keys' velocity (µs)
@@ -80,7 +84,11 @@ struct Machine {
 
 impl Machine {
     fn boot(pkg: &[u8], sectors: &[(u32, Vec<u8>)]) -> Result<Self, String> {
-        let st = fm1_soc::stock_from_package(pkg, None)?;
+        crate::savefile::validate_sectors(&sectors.iter().map(|(at, data)| crate::Sector {
+            at: *at, data: Arc::new(data.clone()),
+        }).collect::<Vec<_>>())?;
+        let st = std::panic::catch_unwind(|| fm1_soc::stock_from_package(pkg, None))
+            .map_err(|_| "malformed firmware package".to_owned())??;
         let mut soc = Soc::new(RAM_SIZE, st.xip);
         soc.periph.hz = MHZ * 1_000_000;
         soc.periph.skip_idle = true;
@@ -91,12 +99,7 @@ impl Machine {
         soc.write32(params, params + 0x40);
         cpu.regs[0] = fm1_soc::stock_boot(&mut soc, &st.flash, params, st.board);
         let flash0 = soc.flash.mem.clone();
-        for (at, data) in sectors {
-            let at = *at as usize;
-            if at + data.len() <= soc.flash.mem.len() {
-                soc.flash.mem[at..at + data.len()].copy_from_slice(data);
-            }
-        }
+        restore_flash(&mut soc, sectors);
         Ok(Machine { cpu, cpu1: None, soc, pending_tick: false, halted: false, flash0 })
     }
 
@@ -116,6 +119,64 @@ impl Machine {
             .map(|s| ((s * SECTOR) as u32, now[s * SECTOR..(s + 1) * SECTOR].to_vec()))
             .collect()
     }
+}
+
+fn restore_flash(soc: &mut Soc, sectors: &[(u32, Vec<u8>)]) {
+    for (at, data) in sectors {
+        let at = *at as usize;
+        soc.flash.mem[at..at + data.len()].copy_from_slice(data);
+        let from = at.max(fm1_soc::XIP_FLASH_OFFSET);
+        let end = (at + data.len()).min(fm1_soc::XIP_FLASH_OFFSET + soc.xip.len());
+        if from < end {
+            soc.xip[from - fm1_soc::XIP_FLASH_OFFSET..end - fm1_soc::XIP_FLASH_OFFSET]
+                .copy_from_slice(&data[from - at..end - at]);
+        }
+    }
+}
+
+struct Snapshot {
+    pkg: Arc<Vec<u8>>,
+    reply: mpsc::Sender<Result<Vec<crate::Sector>, String>>,
+    flash: Vec<u8>,
+    started: Instant,
+    quiet_since: Instant,
+    polled: Instant,
+}
+
+fn project_sectors(sectors: &Sectors) -> Vec<crate::Sector> {
+    sectors.iter().map(|(at, data)| crate::Sector { at: *at, data: Arc::new(data.clone()) }).collect()
+}
+
+fn cancel_snapshots(pending: &mut Vec<Snapshot>) {
+    for request in pending.drain(..) {
+        let _ = request.reply.send(Err("firmware changed during export; try again".into()));
+    }
+}
+
+fn snapshots(pending: &mut Vec<Snapshot>, machine: Option<&Machine>, params: &crate::Fm1Params, now: Instant) {
+    pending.retain_mut(|request| {
+        if now.duration_since(request.started) >= Duration::from_secs(5) {
+            let _ = request.reply.send(Err("flash did not finish saving; try exporting again".into()));
+            return false;
+        }
+        let Some(m) = machine else {
+            let _ = request.reply.send(Err("no firmware is running".into()));
+            return false;
+        };
+        if now.duration_since(request.polled) < Duration::from_millis(20) { return true; }
+        request.polled = now;
+        if request.flash != m.soc.flash.mem {
+            request.flash.copy_from_slice(&m.soc.flash.mem);
+            request.quiet_since = now;
+        }
+        // A firmware save may span several SPI commands and render batches.
+        if m.soc.flash.busy() || now.duration_since(request.quiet_since) < Duration::from_millis(250) { return true; }
+        let sectors = project_sectors(&m.changed_sectors());
+        let fw = params.firmware.lock().unwrap();
+        if *fw.pkg == *request.pkg { *params.flash.lock().unwrap() = sectors.clone(); }
+        let _ = request.reply.send(Ok(sectors));
+        false
+    });
 }
 
 /// The thread: commands in, MIDI in (stamped), frames out.
@@ -138,12 +199,26 @@ pub fn run(
     let mut last_take = Instant::now();
     let mut free: Option<(Instant, u64)> = None;
     let mut last_flash = Instant::now();
+    let mut active_pkg: Option<Arc<Vec<u8>>> = None;
+    let mut pending = Vec::new();
     let (mut speed_t, mut speed_ms, mut busy, mut starved0) = (Instant::now(), 0u64, Duration::ZERO, 0u64);
     while !shared.quit.load(Ordering::Relaxed) {
         while let Ok(c) = cmds.try_recv() {
+            let (c, prepared, loaded) = match c {
+                Cmd::Load { firmware, sectors, reply } => {
+                    let sectors: Sectors = sectors.iter().map(|s| (s.at, s.data.to_vec())).collect();
+                    match Machine::boot(&firmware.pkg, &sectors) {
+                        Ok(next) => (Cmd::Boot { pkg: firmware.pkg.clone(), sectors }, Some(next), Some((firmware, reply))),
+                        Err(error) => { let _ = reply.send(Err(error)); continue; }
+                    }
+                }
+                other => (other, None, None),
+            };
             match c {
                 Cmd::Boot { pkg, sectors } => {
-                    m = Machine::boot(&pkg, &sectors).ok();
+                    cancel_snapshots(&mut pending);
+                    m = prepared.or_else(|| Machine::boot(&pkg, &sectors).ok());
+                    active_pkg = m.as_ref().map(|_| pkg);
                     pot = u16::MAX;
                     let mut v = shared.view.lock().unwrap();
                     v.booted = m.is_some();
@@ -157,8 +232,23 @@ pub fn run(
                     v.board = m.as_ref().map_or(Board::Fm1, |m| m.soc.board);
                     saved = sectors;
                     due.clear();
+                    if let Some((firmware, reply)) = loaded {
+                        *params.firmware.lock().unwrap() = firmware;
+                        *params.flash.lock().unwrap() = project_sectors(&saved);
+                        let _ = reply.send(Ok(()));
+                    }
                     // (the frame count goes on: the host's stamps are against it)
                 }
+                Cmd::Snapshot { pkg, reply } => {
+                    if active_pkg.as_ref().is_some_and(|active| **active == *pkg) {
+                        if let Some(machine) = &m {
+                            let now = Instant::now();
+                            pending.push(Snapshot { pkg, reply, flash: machine.soc.flash.mem.clone(),
+                                started: now, quiet_since: now, polled: now });
+                        }
+                    } else { let _ = reply.send(Err("firmware changed before export; try again".into())); }
+                }
+                Cmd::Load { .. } => unreachable!(), // normalized above, after validation
                 Cmd::Key { id, down } => apply(&mut m, Action::Key { id, down }),
                 Cmd::Enc { enc, clicks } => apply(&mut m, Action::Enc { enc, clicks }),
                 Cmd::Analog { idx, value } => apply(&mut m, Action::Adc { ch: idx, value: value.min(1023) }),
@@ -170,6 +260,7 @@ pub fn run(
                 Cmd::Lead(l) => lead = l,
             }
         }
+        snapshots(&mut pending, m.as_ref(), &params, Instant::now());
         // the MASTER pot, a host parameter
         let p = (params.master.value() * 1023.0).round().clamp(0.0, 1023.0) as u16;
         if p != pot && m.as_ref().is_some_and(|m| m.soc.board == Board::Fm1) {
@@ -272,4 +363,64 @@ fn apply(m: &mut Option<Machine>, a: Action) {
 /// Frames waiting in the ring.
 fn rtrb_fill(p: &rtrb::Producer<[f32; 2]>) -> usize {
     p.buffer().capacity() - p.slots()
+}
+
+#[cfg(test)]
+mod portable_tests {
+    use super::*;
+    fn machine() -> Machine {
+        let soc = Soc::new(RAM_SIZE, vec![0x55; 0x80000]);
+        let flash0 = soc.flash.mem.clone();
+        Machine { cpu: Cpu::new(0x02000120), cpu1: None, soc, pending_tick: false, halted: false, flash0 }
+    }
+    #[test]
+    fn restored_sectors_update_the_entire_xip_sector() {
+        let mut m = machine();
+        let mut sector = vec![0xff; 4096]; sector[0] = 0x12;
+        restore_flash(&mut m.soc, &[(0x74000, sector)]);
+        assert_eq!(m.soc.read32(0x02070000), 0xffffff12);
+        assert_eq!(m.soc.read32(0x02070010), 0xffffffff);
+        assert_eq!(m.changed_sectors()[0].0, 0x74000);
+    }
+    #[test]
+    fn snapshot_captures_live_spi_writes_and_waits_for_idle() {
+        let mut m = machine();
+        let pkg = Arc::new(vec![42; 960]);
+        let params = crate::Fm1Params::default();
+        *params.firmware.lock().unwrap() = crate::Firmware { name: "live".into(), pkg: pkg.clone() };
+        let (tx, rx) = mpsc::channel();
+        let start = Instant::now();
+        let mut pending = vec![Snapshot { pkg, reply: tx, flash: m.soc.flash.mem.clone(),
+            started: start, quiet_since: start, polled: start }];
+        for cmd in [&[0x06][..], &[0x02, 0x0f, 0x90, 0x00, 0x12]] {
+            m.soc.write32(0x500c0, 0);
+            for &byte in cmd { m.soc.write32(0x11c08, byte as u32); }
+            m.soc.write32(0x500c0, 1);
+        }
+        assert!(params.flash.lock().unwrap().is_empty(), "the periodic project-state copy is still old");
+        snapshots(&mut pending, Some(&m), &params, start + Duration::from_millis(300));
+        assert!(rx.try_recv().is_err());
+        m.soc.write32(0x500c0, 0); // a subsequent SPI command is still selected
+        snapshots(&mut pending, Some(&m), &params, start + Duration::from_millis(600));
+        assert!(rx.try_recv().is_err());
+        m.soc.write32(0x500c0, 1);
+        snapshots(&mut pending, Some(&m), &params, start + Duration::from_millis(650));
+        let sectors = rx.try_recv().unwrap().unwrap();
+        assert_eq!(sectors[0].at, 0xf9000);
+        assert_eq!(sectors[0].data[0], 0x12);
+        assert_eq!(params.flash.lock().unwrap()[0].data[0], 0x12);
+        assert!(pending.is_empty());
+    }
+    #[test]
+    fn an_unfinished_flash_command_times_out_without_exporting() {
+        let m = machine();
+        let params = crate::Fm1Params::default();
+        let (tx, rx) = mpsc::channel();
+        let start = Instant::now();
+        let mut pending = vec![Snapshot { pkg: Arc::new(vec![]), reply: tx,
+            flash: m.soc.flash.mem.clone(), started: start, quiet_since: start, polled: start }];
+        snapshots(&mut pending, Some(&m), &params, start + Duration::from_secs(6));
+        assert!(rx.try_recv().unwrap().is_err());
+        assert!(pending.is_empty());
+    }
 }
