@@ -175,6 +175,8 @@ other synth:
   page's, played with the mouse: keys, buttons, knobs, and on the SMK-37 the pads, faders and
   wheels.
 - **Automation:** *Master* (the MASTER pot) is a parameter the DAW can automate.
+- **CPU clock:** the emulated clock, 240 MHz as on the chip by default; 320 or 400 give a
+  firmware that runs out of time more, at the cost of more of the computer's CPU.
 - **Share setups with the browser or another DAW.** “Load firmware / save…” opens a `.fwsc`
   package or `.fm1save` setup. “Export save…” writes the firmware and its latest saved patches
   and settings to one portable file. Edits in RAM need the firmware’s own Save command first.
