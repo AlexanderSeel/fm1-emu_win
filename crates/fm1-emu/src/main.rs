@@ -58,8 +58,8 @@ struct Args {
     snap: Vec<u64>,
     /// a flaky core 1 (fm1_soc::flaky): the chance that one of its RAM loads misreads
     flaky_core1: Option<f64>,
-    /// the flaky core's generator seed (the same seed, the same misreads)
-    seed: u64,
+    /// the flaky core's generator seed (the same seed, the same misreads; default 1)
+    seed: Option<u64>,
 }
 
 fn main() -> ExitCode {
@@ -192,6 +192,10 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if args.seed.is_some() && args.flaky_core1.is_none() {
+        eprintln!("error: --seed needs --flaky-core1 (it seeds its misreads)");
+        return ExitCode::from(2);
+    }
 
     let mut flash_image: Option<Vec<u8>> = None;
     let mut stock: Option<fm1_soc::Stock> = None;
@@ -259,7 +263,7 @@ fn main() -> ExitCode {
     image.resize(image.len().max(1) , 0);
 
     let mut soc = Soc::new(args.ram, image);
-    soc.flaky_core1 = args.flaky_core1.map(|rate| fm1_soc::flaky::FlakyCore1::new(rate, args.seed));
+    soc.flaky_core1 = args.flaky_core1.map(|rate| fm1_soc::flaky::FlakyCore1::new(rate, args.seed.unwrap_or(1)));
     if let Some(f) = &flash_image {
         soc.flash.load(f);
     }
@@ -587,7 +591,7 @@ fn main() -> ExitCode {
             let by: Vec<String> = by.iter().take(8).map(|((c, n), k)| format!("c{c} irq {n} x{k}")).collect();
             println!("interrupts by source: {}", by.join(", "));
             if let Some(f) = &soc.flaky_core1 {
-                println!("flaky core 1 (seed {}): {} misreads in {} RAM loads", args.seed, f.misreads, f.loads);
+                println!("flaky core 1 (seed {}): {} misreads in {} RAM loads", args.seed.unwrap_or(1), f.misreads, f.loads);
             }
             if let Some(w) = &args.wav {
                 match write_wav(w, &soc.periph.audio) {
@@ -795,7 +799,7 @@ fn parse_args() -> Option<Args> {
         keys: Vec::new(),
         snap: Vec::new(),
         flaky_core1: None,
-        seed: 1,
+        seed: None,
     };
     let mut have_bin = false;
     while i < a.len() {
@@ -873,7 +877,7 @@ fn parse_args() -> Option<Args> {
                 i += 2;
             }
             "--seed" => {
-                args.seed = a.get(i + 1)?.parse().ok()?;
+                args.seed = Some(a.get(i + 1)?.parse().ok()?);
                 i += 2;
             }
             "--snap" => {

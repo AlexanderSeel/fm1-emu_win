@@ -63,8 +63,8 @@ struct Opts {
     midi_ch: u8,
     /// a flaky core 1 (fm1_soc::flaky): the chance that one of its RAM loads misreads
     flaky_core1: Option<f64>,
-    /// its generator's seed
-    seed: u64,
+    /// its generator's seed (default 1)
+    seed: Option<u64>,
 }
 
 /// The firmware catalog web/firmwares.json as (id, name, version, image path): each image is
@@ -91,7 +91,7 @@ fn parse() -> Option<Opts> {
     let a: Vec<String> = std::env::args().collect();
     let mut o = Opts { bin: "work/felucca_xip.bin".into(), entry: 0x0200_0120, mhz: 240, bench: None, shot: None,
                        name: "Felucca".into(), fwsc: None, syx: None, midi: "all".into(), midi_ch: 0,
-                       flaky_core1: None, seed: 1 };
+                       flaky_core1: None, seed: None };
     let mut i = 1;
     while i < a.len() {
         match a[i].as_str() {
@@ -126,7 +126,7 @@ fn parse() -> Option<Opts> {
             "--bench" => o.bench = Some(a.get(i + 1)?.parse().ok()?),
             "--shot" => o.shot = Some(a.get(i + 1)?.parse().ok()?),
             "--flaky-core1" => o.flaky_core1 = Some(a.get(i + 1)?.parse::<f64>().ok().filter(|r| (0.0..=1.0).contains(r))?),
-            "--seed" => o.seed = a.get(i + 1)?.parse().ok()?,
+            "--seed" => o.seed = Some(a.get(i + 1)?.parse().ok()?),
             _ => return None,
         }
         i += 2;
@@ -170,7 +170,7 @@ impl Machine {
         let mut soc = Soc::new(RAM_SIZE, image);
         soc.periph.hz = o.mhz * 1_000_000;
         soc.periph.skip_idle = true;
-        soc.flaky_core1 = o.flaky_core1.map(|rate| fm1_soc::flaky::FlakyCore1::new(rate, o.seed));
+        soc.flaky_core1 = o.flaky_core1.map(|rate| fm1_soc::flaky::FlakyCore1::new(rate, o.seed.unwrap_or(1)));
         let mut cpu = Cpu::new(stock.as_ref().map_or(o.entry, |st| st.entry));
         cpu.jit_on = std::env::var("FM1_NO_JIT").is_err();
         // the SPL hands cpu0 over in user mode (see fm1-emu)
@@ -634,6 +634,10 @@ fn main() {
         eprintln!("usage: fm1-live [--fw ID | --fw list | --bin work/felucca_xip.bin] [--entry 0x02000120] [--mhz 240] [--bench MS] [--midi all|none|NAME] [--midi-ch N] [--flaky-core1 RATE [--seed N]]");
         std::process::exit(2);
     };
+    if o.seed.is_some() && o.flaky_core1.is_none() {
+        eprintln!("error: --seed needs --flaky-core1 (it seeds its misreads)");
+        std::process::exit(2);
+    }
     if let Some(ms) = o.shot {
         return shot(&o, ms);
     }

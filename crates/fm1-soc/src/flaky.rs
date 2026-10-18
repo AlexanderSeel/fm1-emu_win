@@ -8,11 +8,16 @@
 //! The model: each load core 1 makes from RAM (0x01C00000.., not flash, not peripherals, not an
 //! instruction fetch) returns its value with bit 21 flipped (0x00200000, the bit Jangada saw) with
 //! probability `rate`, drawn from a seeded generator so a run can be reproduced. A byte or
-//! halfword load sees the flip only when it covers that bit (the byte at offset 2 of the word, the
-//! halfword at offset 2). Core 0 and every write are untouched. "More often under load" is not
-//! modelled separately: the rate is per load, so a core 1 that reads more misreads more.
+//! halfword load sees the flip only when the lane it returns holds that bit (the byte at offset 2
+//! of the word; the halfword at offsets 2 and 3, as `Soc::read16` returns the half at `addr & 2`),
+//! and only then counts as a misread. Core 0 is untouched, and a write stores what core 1 gives it:
+//! a read-modify-write on core 1 (a bit set or clear in memory, `testset`) that misread writes the
+//! wrong value back, where core 0 then sees it, as a corrupted read written back plausibly is on the
+//! hardware too. "More often under load" is not modelled separately: the rate is per load, so a
+//! core 1 that reads more misreads more.
 //!
-//! Off (the default, `Soc::flaky_core1` None) nothing changes, not even the core's speed.
+//! Off (the default, `Soc::flaky_core1` None) the output is the same as without this; core 1's
+//! interpreted RAM loads only pay a check that the option is off.
 
 /// The bit a misread flips: Jangada's 0x00200000 where core 0 read 0.
 pub const MISREAD_BIT: u32 = 0x0020_0000;
@@ -53,11 +58,11 @@ impl FlakyCore1 {
         if draw >= self.threshold && self.threshold != u64::MAX {
             return value;
         }
-        // the flipped bit, as this load sees it (little-endian lanes of the word)
-        let lane = MISREAD_BIT >> ((addr & 3) * 8);
+        // the flipped bit, as this load sees it: the lane of the word it returns (a byte at
+        // `addr & 3`, a halfword at `addr & 2`: Soc::read8 / read16), little-endian
         let mask = match size {
-            1 => lane & 0xff,
-            2 => lane & 0xffff,
+            1 => (MISREAD_BIT >> ((addr & 3) * 8)) & 0xff,
+            2 => (MISREAD_BIT >> ((addr & 2) * 8)) & 0xffff,
             _ => MISREAD_BIT,
         };
         if mask != 0 {
@@ -85,13 +90,32 @@ mod tests {
         let mut f = FlakyCore1::new(1.0, 7);
         assert_eq!(f.load(0x01c0_0100, 4, 0), 0x0020_0000);
         assert_eq!(f.load(0x01c0_0100, 4, 0x0020_0001), 1);
-        // the byte and halfword lanes that hold bit 21, and those that don't
-        assert_eq!(f.load(0x01c0_0102, 1, 0), 0x20);
-        assert_eq!(f.load(0x01c0_0101, 1, 0), 0);
-        assert_eq!(f.load(0x01c0_0103, 1, 0), 0);
-        assert_eq!(f.load(0x01c0_0102, 2, 0), 0x20);
-        assert_eq!(f.load(0x01c0_0100, 2, 0), 0);
-        assert_eq!((f.loads, f.misreads), (7, 4));
+        assert_eq!((f.loads, f.misreads), (2, 2));
+    }
+
+    /// Every byte and halfword offset, against what the SoC returns for it: the flip lands on
+    /// bit 21 of the word, and counts, only when the lane returned holds it.
+    #[test]
+    fn byte_and_halfword_lanes() {
+        use fm1_core::Bus;
+        let mut soc = crate::Soc::new(1 << 16, vec![0; 16]);
+        let base = crate::RAM_BASE + 0x100;
+        for (size, off, flips) in [(1, 0, false), (1, 1, false), (1, 2, true), (1, 3, false),
+                                   (2, 0, false), (2, 1, false), (2, 2, true), (2, 3, true)] {
+            let addr = base + off;
+            let mut f = FlakyCore1::new(1.0, 7);
+            // what the load returns with bit 21 of the word set: the lane's own view of the bit
+            soc.write32(base, MISREAD_BIT);
+            let lane_bit = if size == 1 { soc.read8(addr) as u32 } else { soc.read16(addr) as u32 };
+            soc.write32(base, 0);
+            let got = if size == 1 { soc.read8(addr) as u32 } else { soc.read16(addr) as u32 };
+            assert_eq!(got, 0);
+            let v = f.load(addr, size, got);
+            assert_eq!(v, lane_bit, "size {size} offset {off}");
+            assert_eq!(v != 0, flips, "size {size} offset {off}");
+            assert_eq!(f.misreads, flips as u64, "size {size} offset {off}: counted only when it flips");
+            assert_eq!(f.loads, 1);
+        }
     }
 
     #[test]
