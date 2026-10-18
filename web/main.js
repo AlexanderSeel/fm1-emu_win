@@ -106,6 +106,7 @@ const MIDI_NOTES = {
   choralroot: NO_NOTE, hortator: NO_NOTE, "sloop-alg": NO_NOTE, x0x: NO_NOTE,
 };
 const cards = new Map();
+const hubCard = (f) => `https://thefirmwarehub.com/#fw-${f.hub}`;
 // the FM-1 page: which entries have an SMK-37 build (that catalog names them)
 const twins = new Map();
 if (DEVICE === "fm1") {
@@ -134,16 +135,17 @@ if (DEVICE === "fm1") {
       scrollTo({ top: 0, behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth" });
     });
     const links = el("div", "links");
-    if (f.byo) links.append(link(f.download, `download ${DEV.stock}`), link(f.repo, "notes"));
+    if (f.byo) links.append(link(f.download, `download ${DEV.stock}`), link(f.repo, "notes ↗"));
     else {
-      links.append(link(f.repo, "source"));
-      if (f.installer) links.append(link(f.installer, "install"));
-      if (f.hub) links.append(link(`https://thefirmwarehub.com/#fw-${f.hub}`, "on the Hub"));
+      links.append(link(f.repo, `source · ${f.license} ↗`));
+      // the Hub's card has the details and installs it on a real FM-1; the author's installer otherwise
+      if (f.hub) links.append(link(hubCard(f), "details & install on the Hub ↗"));
+      else if (f.installer) links.append(link(f.installer, "install ↗"));
     }
     // the same firmware on the other device (an SMK-37 build's `fm1`, or an FM-1 entry it names)
     const twin = DEVICE === "smk37" ? f.fm1 : twins.get(f.id);
     if (twin) links.append(link(`${DEV.other.href}?fw=${twin}`, `also on the ${DEV.other.name}`));
-    const by = [f.author + (f.base ? ` (${f.base})` : ""), f.porter && `SMK-37 port: ${f.porter}`, f.license].filter(Boolean).join(" · ");
+    const by = [f.author + (f.base ? ` (${f.base})` : ""), f.porter && `SMK-37 port: ${f.porter}`].filter(Boolean).join(" · ");
     const card = el("li", "",
       el("div", "head", el("b", "", f.name), el("span", "dim", f.version), play),
       el("div", "by", by),
@@ -209,7 +211,7 @@ function showFirmware() {
   b.textContent = `${fw.name} ${fw.version}`.trim();
   let parts;
   if (fw.id === "local") {
-    parts = [b, " · opened from this computer; kept with its saved flash after Start."];
+    parts = [b, "Opened from this computer; kept with its saved flash after Start."];
   } else if (fw.byo) {
     const dl = document.createElement("a");
     dl.href = fw.download;
@@ -219,14 +221,26 @@ function showFirmware() {
     doc.textContent = "how it runs";
     const have = packages.has(fw.id) ? " Your copy is kept in this browser; open another .fwsc to replace it." :
       " Then click \u201cOpen .fwsc\u2026\u201d (or drop the file on the synth); this browser keeps it for next time.";
-    parts = [b, " · M-VAVE's own firmware. This page does not host it and cannot fetch it: ", dl, "." + have +
+    parts = [b, "M-VAVE's own firmware. This page does not host it and cannot fetch it: ", dl, "." + have +
       (DEVICE === "fm1" ? " It starts with a small patch bank of the emulator's own; \u201cDX7 bank\u2026\u201d loads a 32-voice .syx · " :
         " (A MIDI controller: its notes go to USB / Bluetooth MIDI, so no sound here; slower than real time in the browser so far.) · "), doc];
   } else {
+    const links = document.createElement("span");
+    links.className = "links";
     const a = document.createElement("a");
     a.href = fw.repo;
-    a.textContent = "source";
-    parts = [b, ` by ${fw.author} · ${fw.license} · `, a, ` · ${fw.about}`];
+    a.textContent = `source · ${fw.license} ↗`;
+    links.append(a);
+    if (fw.hub) {
+      const h = document.createElement("a");
+      h.href = hubCard(fw);
+      h.textContent = "on the Hub ↗";
+      links.append(h);
+    }
+    const what = document.createElement("span");
+    what.className = "what";
+    what.textContent = fw.about;
+    parts = [b, `by ${fw.author}`, links, what];
   }
   if (loadedUrl) {
     const p = document.createElement("a");
