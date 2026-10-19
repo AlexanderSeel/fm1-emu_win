@@ -134,6 +134,43 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
+    // `--sem-run FILE`: lines `HEX R0 .. R15 C` (an instruction, then the registers and the carry,
+    // hex): run the instruction once (a dual-issue head with a nop after it) and print
+    // `R0 .. R15 C` afterwards, or `err ...` (tools/sem_check.py compares this with the vendor
+    // disassembler's text)
+    if let Some(i) = std::env::args().position(|a| a == "--sem-run") {
+        let path = std::env::args().nth(i + 1).unwrap_or_default();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            eprintln!("cannot read {path}");
+            return ExitCode::FAILURE;
+        };
+        for line in text.lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() != 18 {
+                println!("err input");
+                continue;
+            }
+            let mut image: Vec<u8> = (0..f[0].len() / 2).filter_map(|k| u8::from_str_radix(&f[0][2 * k..2 * k + 2], 16).ok()).collect();
+            image.resize(64, 0);
+            let mut soc = Soc::new(64 * 1024, image);
+            let mut cpu = Cpu::new(XIP_BASE);
+            cpu.sp = RAM_BASE + 0x8000;
+            for (k, r) in cpu.regs.iter_mut().enumerate() {
+                *r = u32::from_str_radix(f[1 + k], 16).unwrap_or(0);
+            }
+            cpu.flags = if f[17] == "1" { fm1_core::F_C } else { 0 };
+            let mut r = cpu.step(&mut soc);
+            if r.is_ok() && cpu.pair_pending.is_some() {
+                r = cpu.step(&mut soc);
+            }
+            match r {
+                Ok(()) => println!("{} {}", cpu.regs.iter().map(|v| format!("{v:x}")).collect::<Vec<_>>().join(" "),
+                                   (cpu.flags & fm1_core::F_C != 0) as u8),
+                Err(e) => println!("err {}", format!("{e:?}").split_whitespace().next().unwrap_or("")),
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
     // `--list IMAGE START END`: a linear listing with the emulator's own decoder (it knows the
     // FPU and the float compares objdump cannot print): address, bytes, syntax, slot values,
     // and the micro-op the core runs
