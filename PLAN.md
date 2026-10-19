@@ -705,6 +705,37 @@ and its controls (inline <head> script sets data-embed before the first paint; n
 for the Hub's "Try in browser" window; each card links to its Hub card (#fw-<id>). Checked in
 headless Chrome over the DevTools protocol (node + built-in WebSocket).
 
+## 5.22 Decoder fuzzing against the vendor objdump (2026-10-19)
+
+Issue #16 (edco): github.com/edco/ghidra-jieli, a SLEIGH description of the whole pi32v2 ISA (834
+constructors; our corpus classes match 328: the rest are mostly DSP / SIMD / MAC forms clang never
+emits, in vendor libraries byte-identical in every firmware). `tools/fuzz_decode.py` makes test
+instructions (every corpus class's samples with each bit flipped, and N random encodings per
+SLEIGH constructor with `--sleigh DIR`), has the vendor toolchain's objdump decode them (Docker,
+as probe_build.sh) and the emulator (`fm1-emu --check-decode`: length, class, one step's
+outcome), and reports gaps (objdump decodes, we don't), length disagreements, decodes without
+semantics, junk we accept, then runs audit_decode.py over the listing. 161774 instructions:
+no length disagreements. Fixed, each with the vendor's layout (`vendor_encodings` test):
+- `d8..df ec` word post-increments: inc = sext11 (byte0 bit 2 the sign), route 19 had sext10:
+  `dc/dd` (-1024..-513) went positive, `da/db` (+512..+1023) negative. In Felucca, DUELL, JIANT,
+  ChoralRoot, Melodee, April, Bubba, fm1doom (`r11 = [r12++=-820]`, `r0 = [r1++=516]`); none on
+  the 8 s bench paths (all 49 firmwares' audio byte-identical before / after).
+- `r_mov_b_sp_u` (`dc e9 00 R0`): its register slot, solved from r0, r1, r2, r12, swapped bits 30
+  and 31 (r4 <-> r8). `d8|d9|dc|dd e9` now decode by `sp_mem_raw` (route 37) before the table;
+  `d8 e9` (h[sp+off] (u) loads and stores, bit 0) was missing.
+- `5e ec` `d[R++=R]`: bits 1-2 of byte 0 are the mode (00 index, 10 pre, 11 post); bit 2 alone
+  had made it a pre-increment.
+- `h[R+off] = R.h` at an offset the corpora lacked (route 35, no micro-op) panicked the step
+  (`unreachable!`): now Fast::Raw.
+- fallbacks widened to the vendor ranges: `d0..d7 ec` (route 18), `d0..d7 ed`, `d0..d5 ee`,
+  `d8..df ec` bit 17 clear (route 19).
+Left: shift-immediate field 0 is `<< 32` to objdump, 0 to us (clang never emits it, the hardware
+unconfirmed; the JITs would need a special case); 6-byte call targets beyond +-128 MB; the
+flag-condition branches (`ifcs/ifle/... goto`) have no semantics (rare, in hand-written code).
+audit_decode.py now compares the pre- / post-increment accesses too (`describe`'s `Q`, from the
+same `decode_inc_mem` routes 18 / 19 run): +7610 compared in the stock app's listing, all agree;
+with route 19's old sext10 put back it reports 135 disagreements in the fuzz listing.
+
 ## 6. Phase 5 — Boot & integration
 
 - Boot stock firmware to a stable idle/main-loop state.
