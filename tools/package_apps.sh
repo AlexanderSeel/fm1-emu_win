@@ -25,12 +25,18 @@ allow it. In this folder, run once:
   linux-arm64)
     speed="It has the same AArch64 JIT as on a Mac; on a slower machine, if the sound stutters,
 lower the clock: --mhz 160."
-    setup='It needs ALSA and X11 (Debian / Ubuntu: sudo apt install libasound2 libx11-6 libxkbcommon0).'
+    setup='It needs ALSA and X11. Debian 12, Ubuntu 22.04:
+    sudo apt install libasound2 libx11-6 libxkbcommon0 libxcursor1 libxrandr2 libxi6
+Ubuntu 24.04 and later: libasound2t64 in place of libasound2.'
     ;;
   linux-x86_64)
-    speed="There is no JIT for x86-64 yet (planned): it interprets, about 1.3x real time for Felucca
-on a fast PC. If the sound stutters, lower the clock: --mhz 160."
-    setup='It needs ALSA and X11 (Debian / Ubuntu: sudo apt install libasound2 libx11-6 libxkbcommon0).'
+    speed="There is no JIT for x86-64 yet (planned for the next release): it interprets, at a
+quarter to half of the JIT's speed. The lighter firmwares keep up; the heavier ones (Felucca needs
+about 220 M instructions a second at 240 MHz) may not, even on a fast PC. If the sound stutters,
+lower the clock: --mhz 160, or 120."
+    setup='It needs ALSA and X11. Debian 12, Ubuntu 22.04:
+    sudo apt install libasound2 libx11-6 libxkbcommon0 libxcursor1 libxrandr2 libxi6
+Ubuntu 24.04 and later: libasound2t64 in place of libasound2.'
     ;;
   *) echo "unknown platform $platform" >&2; exit 1 ;;
 esac
