@@ -66,6 +66,37 @@ Users: the stock firmware (synth rendering on cpu1), X0X, Melodee 1.0.1, ChoralR
 cores the JIT and the interpreter interleave them at slightly different points, so their audio is
 no longer byte-identical for those firmwares (each is deterministic); single-core firmwares are.
 
+### A flaky core 1 (`--flaky-core1`, `fm1_soc::flaky`)
+
+On some FM-1s core 1 reads words that are not in RAM: Jangada measured 0x00200000 where core 0
+reads 0, idle now and then and more often under load (fm1-x0x#10; Felucca's and X0X's
+`fm1_cpu1.h` describe it and the check word they guard each job with). Firmwares that use core 1
+fall back to one core when they see it. `--flaky-core1 RATE [--seed N]` (fm1-emu and fm1-live)
+makes the emulated core 1 such a unit, so that fallback can be tried on any machine:
+
+- each load core 1 makes from RAM returns its value with bit 21 (0x00200000) flipped, with
+  probability RATE (`1e-6`, `0.001`, …), from a generator seeded with N (default 1): the same
+  seed, the same misreads (fm1-emu runs are deterministic; fm1-live is paced by the wall clock,
+  so its runs differ anyway). A byte or halfword load sees the flip only when the lane it
+  returns holds bit 21 (a byte at offset 2; a halfword at offset 2 or 3, which reads the upper
+  half), and only then counts as a misread. `--seed` without `--flaky-core1` is an error.
+- Not touched: core 0, instruction fetches (`Bus::fetch32`), flash and peripherals. A write
+  stores what core 1 gives it, so a read-modify-write on core 1 (a bit set or clear in memory,
+  `testset`) that misread writes the wrong value back, and core 0 sees it: a corrupted read that
+  is written back plausibly is stored on the hardware too.
+- "More often under load" is not modelled on its own: the rate is per load, so a core 1 that
+  reads more misreads more.
+- With the option, core 1 runs interpreted (`Core1Bus::jit_mem` is None: compiled code reads RAM
+  without the bus), so it is slower. Without it the output is the same as before; core 1's
+  interpreted RAM loads only pay a check that the option is off.
+
+fm1-emu prints `flaky core 1 (seed N): M misreads in L RAM loads` at the end of a run.
+
+Checked with Felucca 1.6.1, MENU > SYSTEM > 2ND CORE ON (its settings sector, flash 0xFC000, in
+`--raw-flash`) and notes on four tracks so it hands core 1 parts: with `--flaky-core1 1e-5
+--seed 7` it shows `2ND CORE MISREAD: OFF` as the notes start and plays on with one core; without
+the option its audio and screens are byte-identical to before.
+
 ## Verifying
 
 - Felucca: `fm1-live --bench 6000 --mhz 240` with `FM1_BENCH_WAV`, byte-identical to before.
