@@ -2337,7 +2337,7 @@ impl Cpu {
                 };
             }
             27 if insn.entry.len == 4 => self.exec_raw(bus, RAW_POP_RETS_MASK, insn.raw as u32),
-            16 | 18 | 19 | 21 | 22 | 27 | 32 => self.exec_raw(bus, pre.route as u8, insn.raw as u32),
+            16 | 18 | 19 | 21 | 22 | 27 | 32 | 39 | 40 => self.exec_raw(bus, pre.route as u8, insn.raw as u32),
             17 =>
             {
                 // 4-byte offset loads/stores `R = [rB+#i]` / `[rB+#i] = R` with
@@ -2678,10 +2678,26 @@ impl Cpu {
                 //            clang's `acc - (u64)a * b`, probes/mul64.c)
                 //   `f6 e1`: rP = rQ / rB (u|s) — q = bits(21,23), b = bits(24,27),
                 //            pair = bits(29,31), signed = bit28
+                //   `de e1`: rD = rQ >> n (s|u), the pair shifted and saturated into one
+                //            register — d = bits(28,31), q = bits(21,23), n = bits(16,19) |
+                //            bits(24,25)<<4, signed = bit27 (vendor assembler, work/probe/dsp.S;
+                //            FM1 Open's mixers: `r3 = r7_r6 >> 29 (s)`)
                                 let p = ((raw >> 29) & 7) as usize;
                 let (hi, lo) = (2 * p + 1, 2 * p);
                 let signed = (raw >> 28) & 1 != 0;
                 match raw & 0xff {
+                    0xde => {
+                        // saturated: the vendor clang never picks it for a plain C truncation
+                        // (it shifts the pair, work/probe/pairx.c), only DSP assembly uses it
+                        let q = ((raw >> 21) & 7) as usize;
+                        let x = (self.regs[2 * q + 1] as u64) << 32 | self.regs[2 * q] as u64;
+                        let n = ((raw >> 16) & 0xf) | (((raw >> 24) & 3) << 4);
+                        self.regs[((raw >> 28) & 0xf) as usize] = if raw & 0x0800_0000 != 0 {
+                            ((x as i64) >> n).clamp(i32::MIN as i64, i32::MAX as i64) as u32
+                        } else {
+                            (x >> n).min(u32::MAX as u64) as u32
+                        };
+                    }
                     0xd0 | 0xd8 => {
                         let by_reg = raw & 0xff == 0xd8;
                         let n = if by_reg { self.regs[((raw >> 24) & 0xf) as usize] & 63 }
@@ -2734,6 +2750,16 @@ impl Cpu {
                 }
                 self.rets = bus.read32(self.sp);
                 self.sp = self.sp.wrapping_add(4);
+            }
+            39 => {
+                // `39 e4|f4 AO DB`: rD = rA +|- rB (ssat), subtract with bit 19
+                let (a, b) = (self.regs[((raw >> 20) & 0xf) as usize] as i32, self.regs[((raw >> 24) & 0xf) as usize] as i32);
+                self.regs[((raw >> 28) & 0xf) as usize] = if raw & 0x8_0000 != 0 { a.saturating_sub(b) } else { a.saturating_add(b) } as u32;
+            }
+            40 => {
+                // `20 e0 II DN`: byte N (bits 26,27) of rD (bits 28,31) = II
+                let (d, k) = (((raw >> 28) & 0xf) as usize, 8 * ((raw >> 26) & 3) as u32);
+                self.regs[d] = self.regs[d] & !(0xff << k) | (((raw >> 16) & 0xff) as u32) << k;
             }
             RAW_POP_RETS_MASK => {
                 // `d1 e8 <mask>`: {rets, registers of mask} = [sp++], the registers from
@@ -2836,6 +2862,12 @@ fn decode_any(win: u64, pc: u32) -> Result<fm1_isa::Instruction, fm1_isa::Decode
         // fitted on r0, r1, r6 and r7, swapped bits 1 and 2 of the register (`sp = r5` set sp from
         // r3: M-VAVE's FM1 Open moved its stack up over its own frame) and knew no r8..r15
         None if let Some(entry) = sreg_move_raw(win) => Ok(fm1_isa::Instruction { addr: pc, raw: win & 0xffff_ffff, entry }),
+        // `39 e4 AO DB` (`39 f4`, a dual-issue pair's head): rD = rA + rB / rA - rB (ssat), the
+        // subtract with bit 19 (vendor assembler, work/probe/dsp.S). Before the table: its one
+        // class, an add, fit only the corpus registers (FM1 Open's mixers saturate r5 + r3)
+        None if matches!(win & 0xffff, 0xe439 | 0xf439) => {
+            Ok(fm1_isa::Instruction { addr: pc, raw: win & 0xffff_ffff, entry: if win & 0xffff == 0xf439 { &SSAT_PAIR_CRAW } else { &SSAT_CRAW } })
+        }
         None => fm1_isa::decode_win_cached(win, pc),
     };
     let raw = |entry| Ok(fm1_isa::Instruction { addr: pc, raw: win & 0xffff_ffff, entry });
@@ -2843,7 +2875,7 @@ fn decode_any(win: u64, pc: u32) -> Result<fm1_isa::Instruction, fm1_isa::Decode
         Ok(i) => Ok(i),
         // 64-bit pair ops the corpora never showed (e.g. `r3_r2 >>>= 39`)
         // share one raw layout; decode them without a table class
-        Err(_) if matches!((win >> 8) & 0xff, 0xe1 | 0xf1) && matches!(win & 0xff, 0xd0 | 0xd8 | 0xf8 | 0xfc | 0xfe | 0xf6) => {
+        Err(_) if matches!((win >> 8) & 0xff, 0xe1 | 0xf1) && matches!(win & 0xff, 0xd0 | 0xd8 | 0xf8 | 0xfc | 0xfe | 0xf6 | 0xde) => {
             // (`f1`: a dual-issue pair's head, e.g. `fe f1 40 61` r7_r6 -= r4 * r1 (u) #)
             let entry = if (win >> 8) & 0xff == 0xf1 { &PAIR_OP_PAIR_RAW } else { &PAIR_OP_RAW };
             Ok(fm1_isa::Instruction { addr: pc, raw: win, entry })
@@ -2919,9 +2951,45 @@ fn decode_any(win: u64, pc: u32) -> Result<fm1_isa::Instruction, fm1_isa::Decode
         Err(_) if (win >> 8) & 0xff == 0xff && (win & 0xff) >> 4 == 4 && (win >> 16) & 0xff == 0 => {
             Ok(fm1_isa::Instruction { addr: pc, raw: win & 0xffff_ffff_ffff, entry: &CMP_RR_BRANCH6_CRAW })
         }
+        // `c4 e1 SN DM` / `c4 f1` (a dual-issue pair's head), bit 27 clear: rD = rS <> n, the
+        // field layout `R = R <> #i` already executes from; the classes fit only the corpus
+        // registers (FM1 Open's sha256 `r6 = r7 <> 19`). Bit 27 set is `<c>`, through carry.
+        Err(_) if matches!(win & 0xffff, 0xe1c4 | 0xf1c4) && win & 0x0e00_0000 == 0 => {
+            raw(if win & 0xffff == 0xf1c4 { &ROT_PAIR_CRAW } else { &ROT_CRAW })
+        }
+        // `78..7b e0 0S DS`: rD = sat16(rS) (route 34); the class fit few registers
+        Err(_) if sat16_raw(win & 0xffff_ffff).is_some() => raw(&SAT16_CRAW),
+        // `20 e0 II DN`: rD.bN = #i, a byte of rD replaced (route 40; vendor assembler,
+        // work/probe/dsp.S: FM1 Open's `r14.b3 = 208`)
+        Err(_) if win & 0xffff == 0xe020 && (win >> 24) & 3 == 0 => raw(&BYTE_SET_CRAW),
         Err(e) => Err(e),
     }
 }
+
+static SSAT_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "ssat_craw", syntax: "R = R +|- R (ssat)", len: 4, count: 0, mask: 0, match_: 0,
+    group: "alu", alt: &[], samples: &[], slots: &[],
+};
+static SSAT_PAIR_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "ssat_craw", syntax: "R = R +|- R (ssat)  #", len: 4, count: 0, mask: 0, match_: 0,
+    group: "alu", alt: &[], samples: &[], slots: &[],
+};
+static ROT_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "rot_craw", syntax: "R = R <> #i", len: 4, count: 0, mask: 0, match_: 0,
+    group: "alu", alt: &[], samples: &[], slots: &[],
+};
+static ROT_PAIR_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "rot_pair_craw", syntax: "R = R <> #i  #", len: 4, count: 0, mask: 0, match_: 0,
+    group: "alu", alt: &[], samples: &[], slots: &[],
+};
+static SAT16_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "sat16_craw", syntax: "R = sat16(R) (raw)", len: 4, count: 0, mask: 0, match_: 0,
+    group: "alu", alt: &[], samples: &[], slots: &[],
+};
+static BYTE_SET_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "byte_set_craw", syntax: "R.b# = #i (raw)", len: 4, count: 0, mask: 0, match_: 0,
+    group: "alu", alt: &[], samples: &[], slots: &[],
+};
 
 /// `dc` `[++rB=rI]` / `de` `[rB++=rI]` loads and stores (byte1 ec word, ed half, ee byte):
 /// data = bits(28,31), base = bits(20,23), index = bits(24,27); bits(16,19): bit16 store,
@@ -3289,6 +3357,8 @@ fn decode_alu4(raw: u64) -> Option<Alu4> {
                 (0x90, 0) | (0x94, 0) => Op::Or,
                 (0x90, 1) | (0x94, 1) => Op::Xor,
                 (0x90, 2) | (0x94, 2) => Op::And,
+                // `94 e1 A3 DB`: rD = rA & ~(1 << rB) (FM1 Open's groove capture)
+                (0x94, 3) => Op::AndNot,
                 (0xf0, 0) => Op::Mul,
                 (0xc8, 0) => Op::Shl,
                 (0xc8, 2) => Op::Shr,
@@ -4216,6 +4286,52 @@ mod tests {
         (cpu, ram)
     }
 
+    /// One instruction with chosen registers (the rest as `run1` sets them).
+    fn run_regs(bytes: &[u8], regs: &[(usize, u32)]) -> Cpu {
+        let mut mem = vec![0u8; 0x4000];
+        mem[..bytes.len()].copy_from_slice(bytes);
+        let mut ram = FlatRam::new(mem);
+        let mut cpu = Cpu::new(0);
+        for (n, r) in cpu.regs.iter_mut().enumerate() {
+            *r = 0x1000 + 0x100 * n as u32;
+        }
+        for &(r, v) in regs {
+            cpu.regs[r] = v;
+        }
+        cpu.sp = 0x2000;
+        cpu.step(&mut ram).unwrap();
+        cpu
+    }
+
+    #[test]
+    fn dsp_encodings() {
+        // FM1 Open's engine (libfm1_engine.a); the encodings from the vendor assembler
+        // (work/probe/dsp.S). `de e1 6d 39` r3 = r7_r6 >> 29 (s): shifted, then saturated
+        assert_eq!(run_regs(&[0xde, 0xe1, 0x6d, 0x39], &[(7, 1), (6, 0)]).regs[3], 8);
+        assert_eq!(run_regs(&[0xde, 0xe1, 0x6d, 0x39], &[(7, 0x4000_0000), (6, 0)]).regs[3], i32::MAX as u32);
+        assert_eq!(run_regs(&[0xde, 0xe1, 0x6d, 0x39], &[(7, 0xffff_ffff), (6, 0xe000_0000)]).regs[3], u32::MAX);
+        assert_eq!(run_regs(&[0xde, 0xe1, 0x6d, 0x39], &[(7, 0x8000_0000), (6, 0)]).regs[3], i32::MIN as u32);
+        // `de e1 01 02` r0 = r1_r0 >> 33 (u)
+        assert_eq!(run_regs(&[0xde, 0xe1, 0x01, 0x02], &[(1, 0xffff_fffe), (0, 5)]).regs[0], 0x7fff_ffff);
+        // `39 e4 20 13` r1 = r2 + r3 (ssat), `39 e4 28 13` r1 = r2 - r3 (ssat)
+        assert_eq!(run_regs(&[0x39, 0xe4, 0x20, 0x13], &[(2, 0x7fff_fff0), (3, 0x100)]).regs[1], 0x7fff_ffff);
+        assert_eq!(run_regs(&[0x39, 0xe4, 0x20, 0x13], &[(2, 5), (3, -7i32 as u32)]).regs[1], -2i32 as u32);
+        assert_eq!(run_regs(&[0x39, 0xe4, 0x28, 0x13], &[(2, 0x8000_0010), (3, 0x100)]).regs[1], 0x8000_0000);
+        // `39 e4 e0 f9` r15 = r14 + r9 (ssat)
+        assert_eq!(run_regs(&[0x39, 0xe4, 0xe0, 0xf9], &[(14, 3), (9, 4)]).regs[15], 7);
+        // `c4 e1 73 61` r6 = r7 <> 19, `c4 e1 af 91` r9 = r10 <> 31
+        assert_eq!(run_regs(&[0xc4, 0xe1, 0x73, 0x61], &[(7, 0x0008_0001)]).regs[6], 0x0008_0001u32.rotate_right(19));
+        assert_eq!(run_regs(&[0xc4, 0xe1, 0xaf, 0x91], &[(10, 1)]).regs[9], 2);
+        // `78 e0 01 35` r3 = sat16(r5) (s), `78 e0 00 35` (u)
+        assert_eq!(run_regs(&[0x78, 0xe0, 0x01, 0x35], &[(5, 0x12345)]).regs[3], 32767);
+        assert_eq!(run_regs(&[0x78, 0xe0, 0x00, 0x35], &[(5, -5i32 as u32)]).regs[3], 0);
+        // `20 e0 d0 ec` r14.b3 = 208, `20 e0 ff 24` r2.b1 = 255
+        assert_eq!(run_regs(&[0x20, 0xe0, 0xd0, 0xec], &[(14, 0x1234_5678)]).regs[14], 0xd034_5678);
+        assert_eq!(run_regs(&[0x20, 0xe0, 0xff, 0x24], &[(2, 0x1234_5678)]).regs[2], 0x1234_ff78);
+        // `94 e1 13 16` r1 = r1 & ~(1 << r6)
+        assert_eq!(run_regs(&[0x94, 0xe1, 0x13, 0x16], &[(1, 0xff), (6, 3)]).regs[1], 0xf7);
+    }
+
     #[test]
     fn vendor_encodings() {
         // `dc ec cc bc` r11 = [r12++=-820] (the corpus's: dc's bit 2 is the increment's sign)
@@ -4515,7 +4631,7 @@ fn route_of(insn: &Instruction, alu4: &Option<Alu4>, bittest: &Option<BitTest>) 
             _ if insn.entry.len == 4 && insn.raw & 0xff == 0xd8
                 && matches!((insn.raw >> 8) & 0xff, 0xec | 0xed | 0xee) => 20,
             _ if insn.entry.len == 4 && matches!((insn.raw >> 8) & 0xff, 0xe1 | 0xf1)
-                && matches!(insn.raw & 0xff, 0xd0 | 0xd8 | 0xf8 | 0xfc | 0xfe | 0xf6)
+                && matches!(insn.raw & 0xff, 0xd0 | 0xd8 | 0xf8 | 0xfc | 0xfe | 0xf6 | 0xde)
                 && insn.entry.syntax.starts_with('r') && has(insn.entry.syntax, "_r") => 21,
             _ if insn.entry.len == 4 && (insn.raw & 0xffff) == 0xe070 || (insn.raw & 0xffff) == 0xf070 => 22,
             "testset_b_r" | "testset_r" => 23,
@@ -4532,6 +4648,8 @@ fn route_of(insn: &Instruction, alu4: &Option<Alu4>, bittest: &Option<BitTest>) 
             "clz_pair_craw" => 36,
             "sp_load_craw" => 37,
             "mov2_craw" => 38,
+            "ssat_craw" => 39,
+            "byte_set_craw" => 40,
             "rep_i_r" | "rep_i_i" => 29,
             n if n.starts_with("fpu_") => ROUTE_FPU,
             _ => ROUTE_SYNTAX,
@@ -4784,7 +4902,7 @@ fn fast_raw(route: u16, insn: &Instruction, alu4: &Option<Alu4>, bittest: &Optio
         2 => Some(Fast::Nop),
         // (the arms read bits below 32 only; route 21's table-less form carries the whole window)
         27 if insn.entry.len == 4 => Some(Fast::Raw { route: RAW_POP_RETS_MASK, raw: raw as u32 }),
-        16 | 18 | 19 | 21 | 22 | 27 | 32 => Some(Fast::Raw { route: route as u8, raw: raw as u32 }),
+        16 | 18 | 19 | 21 | 22 | 27 | 32 | 39 | 40 => Some(Fast::Raw { route: route as u8, raw: raw as u32 }),
         26 if insn.entry.len == 4 => Some(Fast::PushMask { mask: ((raw >> 16) & 0xffff) as u16 }),
         28 if insn.entry.len == 4 => Some(Fast::PopMask { mask: ((raw >> 16) & 0xffff) as u16 }),
         35 => {
