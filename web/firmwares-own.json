@@ -1,5 +1,6 @@
 {
-  "note": "Our own list: firmwares the FM-1 Firmware Hub does not list (this repository's FM-1 SID, M-VAVE's own, and a few from fm1-editor.com/firmware). Edit this file to add one; node tools/hub_catalog.mjs appends these to the Hub's list in web/firmwares.json. An entry whose id the Hub lists too keeps its texts here and takes the Hub's package.",
+  "note": "Our own list: firmwares the FM-1 Firmware Hub does not list (this repository's FM-1 SID, M-VAVE's own, and a few from fm1-editor.com/firmware). Edit this file to add one; node tools/hub_catalog.mjs appends these to the Hub's list in web/firmwares.json. An entry whose id the Hub lists too keeps its texts here and takes the Hub's package. \"default\": the firmware the page starts with.",
+  "default": "felucca",
   "firmwares": [
     {
       "id": "mvave",

@@ -40,9 +40,9 @@ synth, with a step sequencer and stereo chorus, delay and reverb, that also play
 runs here (its packages, fetched from the Hub; `tools/hub_catalog.mjs` follows its catalog), and a
 few more from [fm1-editor.com/firmware](https://fm1-editor.com/firmware/). Also FM-1 SID, and
 M-VAVE's stock firmware (V13 and V15) with both CPU cores running. The ones the Hub doesn't list
-are our own list, `web/firmwares-own.json`: add a firmware there, and the tool appends it. Each name below opens the page
-with that firmware picked; press Start. (`?fw=` takes the Hub's ids too; `&embed=1` shows only
-the device and its controls, for a window on another site.)
+are our own list, `web/firmwares-own.json`: add a firmware there, and the tool appends it. Each
+name below opens the page with that firmware picked; press Start. (`?fw=` takes the Hub's ids
+too; `&embed=1` shows only the device and its controls, for a window on another site.)
 
 <!-- firmwares: node tools/readme_firmwares.mjs -->
 | Firmware (opens it on the page) | By | What it is |
