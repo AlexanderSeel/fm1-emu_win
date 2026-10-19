@@ -1,0 +1,81 @@
+{
+  "note": "Our own list: firmwares the FM-1 Firmware Hub does not list (this repository's FM-1 SID, M-VAVE's own, and a few from fm1-editor.com/firmware). Edit this file to add one; node tools/hub_catalog.mjs appends these to the Hub's list in web/firmwares.json. An entry whose id the Hub lists too keeps its texts here and takes the Hub's package. \"default\": the firmware the page starts with.",
+  "default": "felucca",
+  "firmwares": [
+    {
+      "id": "mvave",
+      "name": "M-VAVE stock firmware",
+      "version": "",
+      "author": "M-VAVE",
+      "license": "M-VAVE's own",
+      "about": "The firmware the FM-1 ships with: a DX7-style FM synth, both cores running. This page does not host it and cannot download it (M-VAVE's server does not allow other pages to): download FM-1.fwsc from M-VAVE, then open it here; this browser keeps it for next time. Its patches live in flash an update does not carry, so it starts with a small bank of the emulator's own; \"DX7 bank…\" loads a 32-voice .syx.",
+      "repo": "https://github.com/joakimeriksson/fm1-emu/blob/master/docs/stock-firmware.md",
+      "byo": true,
+      "download": "https://yms-file-store.oss-cn-hongkong.aliyuncs.com/software/firmware/FM-1.fwsc"
+    },
+    {
+      "id": "april",
+      "name": "April OS",
+      "version": "BETA 1.1",
+      "author": "beashoko",
+      "license": "MIT (its repository, which holds the installer page; the firmware source is not published)",
+      "about": "A sampler inspired by the Casio SK-1: no synth engines, only samples, recorded through the installer page's microphone bridge.",
+      "repo": "https://github.com/beashoko/april-os",
+      "installer": "https://beashoko.github.io/april-os/",
+      "embedded": "DEFAULT_FIRMWARE"
+    },
+    {
+      "id": "fm1doom",
+      "name": "FM-1 Doom",
+      "version": "0.5",
+      "author": "zvenson",
+      "license": "GPL-3.0",
+      "about": "Doom on the FM-1: one arena from FreeDM, played on the keys and a knob, on the FM-1's screen, with synthesised sound effects and no music.",
+      "repo": "https://github.com/zvenson/fm1doom",
+      "package": "https://raw.githubusercontent.com/zvenson/dxsloop/main/docs/doom/firmware/fm1doom-0.5.fwsc"
+    },
+    {
+      "id": "purplemonkey",
+      "name": "PurpleMonkey",
+      "version": "0.11",
+      "author": "Quixotic7",
+      "license": "GPL-3.0",
+      "about": "A firmware for kids.",
+      "repo": "https://github.com/Quixotic7/PurpleMonkeyFM1",
+      "package": "https://quixotic7.github.io/PurpleMonkeyFM1/firmware/purplemonkey-0.11.fwsc",
+      "installer": "https://quixotic7.github.io/PurpleMonkeyFM1/webapp/installer/"
+    },
+    {
+      "id": "quest",
+      "name": "FM1 Quest",
+      "version": "0.21",
+      "author": "hericdk",
+      "license": "GPL-3.0",
+      "about": "A live RPG adventure inside the synth.",
+      "repo": "https://github.com/hericdk/fm1-quest",
+      "package": "https://fm1.quest/firmware/fm1-quest-0.21.fwsc",
+      "installer": "https://fm1.quest/webapp/installer/"
+    },
+    {
+      "id": "sid",
+      "name": "FM-1 SID",
+      "version": "0.1",
+      "author": "joakimeriksson",
+      "license": "GPL-3.0",
+      "about": "A SID chip on the FM-1, as a synth: the keys play 12 instruments, KNOB1-4 are cutoff, resonance, attack, release; FX opens chorus, delay and reverb. HOME turns it into a C64 tune player (reSID 0.16 and a 6502 running the tune's own code), starting with its own tune. Built in this repository (fm1-sid/), not on fm1-editor.com's list; its own page plays all of HVSC: joakimeriksson.github.io/fm1-emu/fm1-sid/",
+      "repo": "https://github.com/joakimeriksson/fm1-emu/tree/master/fm1-sid",
+      "package": "https://joakimeriksson.github.io/fm1-emu/fm1-sid/sidplayer.fwsc"
+    },
+    {
+      "id": "sloop-alg",
+      "name": "SLOOP ALG",
+      "version": "ALG05-TEST",
+      "author": "shaw-core",
+      "license": "none stated (a SLOOP fork)",
+      "about": "A SLOOP test build with extra FM algorithms.",
+      "repo": "https://github.com/shaw-core/Sloop_ALG02",
+      "package": "https://shaw-core.github.io/Sloop_ALG02/firmware/sloop-ALG05-TEST.fwsc",
+      "installer": "https://shaw-core.github.io/Sloop_ALG02/webapp/installer/"
+    }
+  ]
+}

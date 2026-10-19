@@ -1,16 +1,18 @@
 // The FM-1 page's catalog (web/firmwares.json) from the FM-1 Firmware Hub's (thefirmwarehub.com,
 // zvenson's): every firmware it lists that runs here, its package fetched from the Hub (whose
-// packages never change under their name, sent with Access-Control-Allow-Origin: *). Firmwares
-// the Hub does not list (M-VAVE's own, FM-1 SID, ...) stay as they are; for one it lists, what
-// is ours is kept (the page's description, the licence, the installer link) and the rest comes
-// from the Hub. The Hub's catalog changes every few hours: run this when it has.
+// packages never change under their name, sent with Access-Control-Allow-Origin: *), then our
+// own list, web/firmwares-own.json (hand-edited: FM-1 SID, M-VAVE's own, ... the firmwares the Hub
+// does not list). For a firmware the Hub lists, what is ours is kept (the page's description, the
+// licence, the installer link; from our own list, else from the last web/firmwares.json) and the
+// rest comes from the Hub. The Hub's catalog changes every few hours: run this when it has.
 //   node tools/hub_catalog.mjs [--check] [--catalog=hub.json]
 // (--check: only say whether the file is current; --catalog: the Hub's catalog from a file)
 import { readFileSync, writeFileSync } from "node:fs";
 
 const HUB = "https://thefirmwarehub.com/";
 const OUT = new URL("../web/firmwares.json", import.meta.url);
-// our ids where the Hub's differ (the page takes either in ?fw=)
+const OWN = new URL("../web/firmwares-own.json", import.meta.url);
+// our ids where the Hub's differ (the page takes either in ?fw=; see ourId for the rest)
 const OURS = { salt: "felucca-salt", floyd: "sloop-floyd", sloopbanks: "sloop-banks" };
 // listed on the Hub, not run here yet
 const SKIP = { bubba: "boots to a black screen, no sound" };
@@ -20,7 +22,32 @@ const FIRST = ["mvave", "felucca", "felucca-salt"];
 const arg = process.argv.find((a) => a.startsWith("--catalog="));
 const hub = arg ? JSON.parse(readFileSync(arg.slice(10))) : await (await fetch(HUB + "catalog.json")).json();
 const cur = JSON.parse(readFileSync(OUT));
-const old = new Map(cur.firmwares.map((f) => [f.id, f]));
+const ownFile = JSON.parse(readFileSync(OWN));
+const own = ownFile.firmwares;
+const old = new Map([...cur.firmwares, ...own].map((f) => [f.id, f]));
+
+// Our id for a Hub firmware: OURS, else the id of the entry the Hub's id was recorded on ("hub"),
+// else one of our own list's by the same id or the same name (letters and digits only, so the Hub's
+// "fm1-sid" or "FM1 SID" is our "FM-1 SID"); else the Hub's. One in our own list with the same
+// repository but neither is reported, to be told apart by hand ("hub" on the entry).
+const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+const ghRepo = (u) => String(u || "").replace(/^https:\/\/github\.com\//, "").split("/").slice(0, 2).join("/").toLowerCase();
+function ourId(h) {
+  if (OURS[h.id]) return OURS[h.id];
+  const rec = [...old.values()].find((f) => f.hub === h.id);
+  if (rec) return rec.id;
+  const m = own.find((f) => f.id === h.id) || own.find((f) => norm(f.name) === norm(h.name));
+  if (m) {
+    if (m.id !== h.id) console.log(`  (the Hub's ${h.id} is our ${m.id}: the same name)`);
+    return m.id;
+  }
+  for (const f of own) {
+    if (h.repo && ghRepo(f.repo) === h.repo.toLowerCase())
+      console.log(`  CHECK: the Hub's ${h.id} ("${h.name}") has the repository of our ${f.id} ("${f.name}"); ` +
+        `if it is the same firmware, add "hub": "${h.id}" to it in web/firmwares-own.json`);
+  }
+  return h.id;
+}
 
 // a repository's licence (GitHub's SPDX id), for firmwares new to the list
 async function licence(repo) {
@@ -38,7 +65,7 @@ const firmwares = [];
 const listed = new Set();
 for (const h of hub.firmwares) {
   if (!h.pkg) continue;
-  const id = OURS[h.id] || h.id;
+  const id = ourId(h);
   listed.add(id);
   if (SKIP[h.id]) continue;
   const o = old.get(id) || {};
@@ -55,11 +82,23 @@ for (const h of hub.firmwares) {
     hub: h.id,
   });
 }
-for (const f of cur.firmwares) {
-  if (!listed.has(f.id)) firmwares.push(f);
+// our own list, after the Hub's (an id the Hub lists too: the Hub's entry above, our texts)
+// (a "hub" on one: the Hub's id it was listed under, gone from the Hub now: no card to link)
+for (const f of own) {
+  if (!listed.has(f.id)) {
+    const { hub: _, ...rest } = f;
+    firmwares.push(rest);
+  }
 }
 const rank = (f) => (FIRST.includes(f.id) ? FIRST.indexOf(f.id) : FIRST.length);
 firmwares.sort((a, b) => rank(a) - rank(b) || a.id.localeCompare(b.id));
+// the page picks a firmware by its id: two of one (two Hub firmwares matched to one of ours, a
+// Hub id that is one of our own list's for another firmware) would hide one of them
+const dup = firmwares.map((f) => f.id).filter((id, i, a) => a.indexOf(id) !== i);
+if (dup.length) {
+  console.error(`two firmwares with the id ${[...new Set(dup)].join(", ")}: tell them apart in OURS or with "hub" in web/firmwares-own.json`);
+  process.exit(2);
+}
 
 // The file's layout, as it was written by hand: an entry a few lines, `{ "id": ...` opening each
 // (fm1-live's small reader scans for that, and `"key": "value"`), the description and the source
@@ -72,13 +111,21 @@ const entry = (f) => {
     .join("\n").replace(/,\n      \s*}$/, " }");
 };
 const note = "Community firmwares for the M-VAVE FM-1: the FM-1 Firmware Hub's list (thefirmwarehub.com, " +
-  "tools/hub_catalog.mjs; its packages fetched from the Hub), plus a few more (fm1-editor.com/firmware) " +
-  "and this repository's FM-1 SID (fm1-sid/). The web page fetches each package when started and " +
+  "tools/hub_catalog.mjs; its packages fetched from the Hub), then our own list (web/firmwares-own.json: " +
+  "this repository's FM-1 SID, M-VAVE's own, a few from fm1-editor.com/firmware). Generated: edit " +
+  "web/firmwares-own.json (the default too), not this file. The web page fetches each package when started and " +
   "unpacks it with web/fwsc.js; tools/fetch_firmwares.mjs does the same into reference/firmwares for " +
   "fm1-live. \"hub\": the firmware's id on the Hub (its card: thefirmwarehub.com/#fw-<hub>).";
-const json = `{\n  "note": ${JSON.stringify(note)},\n  "default": ${JSON.stringify(cur.default)},\n  "firmwares": [\n` +
+const json = `{\n  "note": ${JSON.stringify(note)},\n  "default": ${JSON.stringify(ownFile.default ?? cur.default)},\n  "firmwares": [\n` +
   firmwares.map(entry).join(",\n") + "\n  ]\n}\n";
 JSON.parse(json); // (still JSON)
+
+// what the last list had and this one doesn't (gone from the Hub, or its package; skipped): its
+// ?fw= links stop working
+const ids = new Set(firmwares.map((f) => f.id));
+for (const f of cur.firmwares) {
+  if (!ids.has(f.id)) console.log(`  dropped: ${f.id} (${SKIP[f.hub] ? `skipped: ${SKIP[f.hub]}` : "no longer on the Hub with a package"})`);
+}
 
 if (process.argv.includes("--check")) {
   let now = "";
