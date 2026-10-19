@@ -69,6 +69,35 @@ jobs:
         with:
           path: _site
 
+  # The AArch64 JIT on Linux (the Macs test it in plugin-tests): the core's tests, then FM-1 SID's
+  # committed package played with the JIT and interpreted, the same audio (the interpreter is the
+  # JIT's oracle; one run may end half a buffer later, so the shorter one's length is compared).
+  linux-arm64:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust and ALSA headers
+        run: |
+          command -v cargo || { curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"; }
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libasound2-dev pkg-config
+
+      - name: Core tests
+        run: cargo test --release -p fm1-isa -p fm1-core -p fm1-soc
+
+      - name: JIT against the interpreter
+        run: |
+          cargo build --release -p fm1-live
+          pkg=fm1-sid/web/sidplayer.fwsc
+          FM1_BENCH_WAV=jit.raw target/release/fm1-live --fwsc $pkg --bench 4000 | tee jit.txt
+          FM1_NO_JIT=1 FM1_BENCH_WAV=int.raw target/release/fm1-live --fwsc $pkg --bench 4000 | tee int.txt
+          n=$(stat -c %s jit.raw int.raw | sort -n | head -1)
+          test "$n" -gt 100000
+          cmp -n "$n" jit.raw int.raw
+          # (the JIT ran: well over the interpreter's speed)
+          awk '/real time/ { for (i = 1; i <= NF; i++) if ($i ~ /x$/ && $(i+1) == "real") print $i + 0 }' jit.txt int.txt | paste -sd' ' - | awk 'NF == 2 { ok = $1 > 1.5 * $2 } END { exit !ok }'
+
   deploy:
     if: github.event_name != 'pull_request'
     needs: build

@@ -63,8 +63,12 @@ const _: () = assert!(std::mem::offset_of!(Ctx, slot) == OFF_SLOT as usize);
 // ------------------------------------------------------------------ executable memory
 // macOS (Apple silicon): a MAP_JIT mapping, writable or executable per thread, toggled around a
 // write. Linux: a plain read-write-execute mapping (a hardened kernel that refuses one, SELinux's
-// execmem, leaves the interpreter running: `new` gives None). Both flush the instruction cache
-// for what was written.
+// execmem, leaves the interpreter running: `new` gives None). That gives up W^X there: a stray
+// write into the code cache would be executable (an mprotect toggle around each write would keep
+// it, at a system call per compiled block). Both flush the instruction cache for what was
+// written. (Code is only appended, so a missing flush would seldom show: the tests cannot prove
+// it. Tested on Apple silicon's cores only, which need the instruction side, CTR_EL0.DIC = 0, but
+// not the data side, IDC = 1; Cortex-A cores such as a Raspberry Pi's need both.)
 extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut c_void;
 }
