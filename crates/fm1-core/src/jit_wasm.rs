@@ -1,7 +1,7 @@
 //! WebAssembly JIT for the blocks of micro-ops `Cpu::run_fast` interprets: the wasm32 build's
 //! counterpart of jit.rs, with the same rules and the interpreter as the oracle (the two must
 //! leave the same machine state; like the AArch64 JIT it leaves the add / subtract flags alone:
-//! a producer right before a consumer stays on the careful path).
+//! a producer whose flags a later instruction reads stays on the careful path).
 //!
 //! A hot block becomes a region: the block and the blocks reachable from it over fixed edges
 //! (fall-through, branch, goto and call targets), compiled together as one function in a small
