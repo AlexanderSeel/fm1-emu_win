@@ -12,7 +12,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 const HUB = "https://thefirmwarehub.com/";
 const OUT = new URL("../web/firmwares.json", import.meta.url);
 const OWN = new URL("../web/firmwares-own.json", import.meta.url);
-// our ids where the Hub's differ (the page takes either in ?fw=)
+// our ids where the Hub's differ (the page takes either in ?fw=; see ourId for the rest)
 const OURS = { salt: "felucca-salt", floyd: "sloop-floyd", sloopbanks: "sloop-banks" };
 // listed on the Hub, not run here yet
 const SKIP = { bubba: "boots to a black screen, no sound" };
@@ -24,6 +24,29 @@ const hub = arg ? JSON.parse(readFileSync(arg.slice(10))) : await (await fetch(H
 const cur = JSON.parse(readFileSync(OUT));
 const own = JSON.parse(readFileSync(OWN)).firmwares;
 const old = new Map([...cur.firmwares, ...own].map((f) => [f.id, f]));
+
+// Our id for a Hub firmware: OURS, else the id of the entry the Hub's id was recorded on ("hub"),
+// else one of our own list's by the same id or the same name (letters and digits only, so the Hub's
+// "fm1-sid" or "FM1 SID" is our "FM-1 SID"); else the Hub's. One in our own list with the same
+// repository but neither is reported, to be told apart by hand ("hub" on the entry).
+const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+const ghRepo = (u) => String(u || "").replace(/^https:\/\/github\.com\//, "").split("/").slice(0, 2).join("/").toLowerCase();
+function ourId(h) {
+  if (OURS[h.id]) return OURS[h.id];
+  const rec = [...old.values()].find((f) => f.hub === h.id);
+  if (rec) return rec.id;
+  const m = own.find((f) => f.id === h.id) || own.find((f) => norm(f.name) === norm(h.name));
+  if (m) {
+    if (m.id !== h.id) console.log(`  (the Hub's ${h.id} is our ${m.id}: the same name)`);
+    return m.id;
+  }
+  for (const f of own) {
+    if (h.repo && ghRepo(f.repo) === h.repo.toLowerCase())
+      console.log(`  CHECK: the Hub's ${h.id} ("${h.name}") has the repository of our ${f.id} ("${f.name}"); ` +
+        `if it is the same firmware, add "hub": "${h.id}" to it in web/firmwares-own.json`);
+  }
+  return h.id;
+}
 
 // a repository's licence (GitHub's SPDX id), for firmwares new to the list
 async function licence(repo) {
@@ -41,7 +64,7 @@ const firmwares = [];
 const listed = new Set();
 for (const h of hub.firmwares) {
   if (!h.pkg) continue;
-  const id = OURS[h.id] || h.id;
+  const id = ourId(h);
   listed.add(id);
   if (SKIP[h.id]) continue;
   const o = old.get(id) || {};
