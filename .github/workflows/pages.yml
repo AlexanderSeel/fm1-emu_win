@@ -96,7 +96,7 @@ jobs:
           test "$n" -gt 100000
           cmp -n "$n" jit.raw int.raw
           # (the JIT ran: well over the interpreter's speed)
-          awk '/real time/ { for (i = 1; i <= NF; i++) if ($i ~ /x$/ && $(i+1) == "real") print $i + 0 }' jit.txt int.txt | paste -sd' ' - | awk 'NF == 2 { ok = $1 > 1.5 * $2 } END { exit !ok }'
+          awk '/ms emulated/ { for (i = 1; i <= NF; i++) if ($i ~ /x$/ && $(i+1) == "real") print $i + 0 }' jit.txt int.txt | paste -sd' ' - | awk 'NF == 2 { ok = $1 > 1.5 * $2 } END { exit !ok }'
 
   deploy:
     if: github.event_name != 'pull_request'
