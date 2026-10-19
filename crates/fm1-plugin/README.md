@@ -55,18 +55,14 @@ signed with an Apple Developer ID and notarized.
 
 ## Releases
 
-`.github/workflows/plugin-release.yml` runs on a tag `plugin-v<version>`, with the version taken
-from this crate's `Cargo.toml`. On an Apple silicon runner it:
+The plugin is released with the rest of the emulator (`.github/workflows/release.yml`, on a tag
+`v<version>`; [docs/releases/README.md](../../docs/releases/README.md) has the steps). Its
+version, in this crate's `Cargo.toml`, is the workspace's. On an Apple silicon runner the
+workflow:
 1. runs the tests;
 2. builds and installs the plugin and runs Apple's AU validator;
 3. builds Steinberg's validator and runs it on the VST3;
-4. packages the zip (`tools/package_plugin.sh`: the three plugins and an `INSTALL.txt`);
-5. publishes a GitHub Release with the zip and the notes the packaging writes.
-
-```sh
-# bump version in crates/fm1-plugin/Cargo.toml, commit, then
-git tag plugin-v0.1.0 && git push origin plugin-v0.1.0
-```
+4. packages the zip (`tools/package_plugin.sh`: the three plugins and an `INSTALL.txt`).
 
 Without signing secrets the release is unsigned (`INSTALL.txt` gives the command that lets macOS
 open it). With these repository secrets it's signed with a Developer ID and notarized:

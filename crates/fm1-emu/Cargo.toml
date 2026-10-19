@@ -1,7 +1,7 @@
 [package]
 name = "fm1-emu"
 description = "FM-1 emulator binary: firmware runner + debugger CLI"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 

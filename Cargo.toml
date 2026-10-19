@@ -13,6 +13,8 @@ members = [
 exclude = ["crates/fm1-plugin"]
 
 [workspace.package]
+# the release's version (a tag v<version> releases it; crates/fm1-plugin keeps the same)
+version = "0.2.0"
 edition = "2021"
 license = "MIT"
 
