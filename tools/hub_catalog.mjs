@@ -1,15 +1,17 @@
 // The FM-1 page's catalog (web/firmwares.json) from the FM-1 Firmware Hub's (thefirmwarehub.com,
 // zvenson's): every firmware it lists that runs here, its package fetched from the Hub (whose
-// packages never change under their name, sent with Access-Control-Allow-Origin: *). Firmwares
-// the Hub does not list (M-VAVE's own, FM-1 SID, ...) stay as they are; for one it lists, what
-// is ours is kept (the page's description, the licence, the installer link) and the rest comes
-// from the Hub. The Hub's catalog changes every few hours: run this when it has.
+// packages never change under their name, sent with Access-Control-Allow-Origin: *), then our
+// own list, web/firmwares-own.json (hand-edited: FM-1 SID, M-VAVE's own, ... the firmwares the Hub
+// does not list). For a firmware the Hub lists, what is ours is kept (the page's description, the
+// licence, the installer link; from our own list, else from the last web/firmwares.json) and the
+// rest comes from the Hub. The Hub's catalog changes every few hours: run this when it has.
 //   node tools/hub_catalog.mjs [--check] [--catalog=hub.json]
 // (--check: only say whether the file is current; --catalog: the Hub's catalog from a file)
 import { readFileSync, writeFileSync } from "node:fs";
 
 const HUB = "https://thefirmwarehub.com/";
 const OUT = new URL("../web/firmwares.json", import.meta.url);
+const OWN = new URL("../web/firmwares-own.json", import.meta.url);
 // our ids where the Hub's differ (the page takes either in ?fw=)
 const OURS = { salt: "felucca-salt", floyd: "sloop-floyd", sloopbanks: "sloop-banks" };
 // listed on the Hub, not run here yet
@@ -20,7 +22,8 @@ const FIRST = ["mvave", "felucca", "felucca-salt"];
 const arg = process.argv.find((a) => a.startsWith("--catalog="));
 const hub = arg ? JSON.parse(readFileSync(arg.slice(10))) : await (await fetch(HUB + "catalog.json")).json();
 const cur = JSON.parse(readFileSync(OUT));
-const old = new Map(cur.firmwares.map((f) => [f.id, f]));
+const own = JSON.parse(readFileSync(OWN)).firmwares;
+const old = new Map([...cur.firmwares, ...own].map((f) => [f.id, f]));
 
 // a repository's licence (GitHub's SPDX id), for firmwares new to the list
 async function licence(repo) {
@@ -55,7 +58,8 @@ for (const h of hub.firmwares) {
     hub: h.id,
   });
 }
-for (const f of cur.firmwares) {
+// our own list, after the Hub's (an id the Hub lists too: the Hub's entry above, our texts)
+for (const f of own) {
   if (!listed.has(f.id)) firmwares.push(f);
 }
 const rank = (f) => (FIRST.includes(f.id) ? FIRST.indexOf(f.id) : FIRST.length);
@@ -72,8 +76,9 @@ const entry = (f) => {
     .join("\n").replace(/,\n      \s*}$/, " }");
 };
 const note = "Community firmwares for the M-VAVE FM-1: the FM-1 Firmware Hub's list (thefirmwarehub.com, " +
-  "tools/hub_catalog.mjs; its packages fetched from the Hub), plus a few more (fm1-editor.com/firmware) " +
-  "and this repository's FM-1 SID (fm1-sid/). The web page fetches each package when started and " +
+  "tools/hub_catalog.mjs; its packages fetched from the Hub), then our own list (web/firmwares-own.json: " +
+  "this repository's FM-1 SID, M-VAVE's own, a few from fm1-editor.com/firmware). Generated: edit " +
+  "web/firmwares-own.json, not this file. The web page fetches each package when started and " +
   "unpacks it with web/fwsc.js; tools/fetch_firmwares.mjs does the same into reference/firmwares for " +
   "fm1-live. \"hub\": the firmware's id on the Hub (its card: thefirmwarehub.com/#fw-<hub>).";
 const json = `{\n  "note": ${JSON.stringify(note)},\n  "default": ${JSON.stringify(cur.default)},\n  "firmwares": [\n` +

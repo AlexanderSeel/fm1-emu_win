@@ -39,7 +39,8 @@ synth, with a step sequencer and stereo chorus, delay and reverb, that also play
 47 community firmwares: every one on [the FM-1 Firmware Hub](https://thefirmwarehub.com/) that
 runs here (its packages, fetched from the Hub; `tools/hub_catalog.mjs` follows its catalog), and a
 few more from [fm1-editor.com/firmware](https://fm1-editor.com/firmware/). Also FM-1 SID, and
-M-VAVE's stock firmware (V13 and V15) with both CPU cores running. Each name below opens the page
+M-VAVE's stock firmware (V13 and V15) with both CPU cores running. The ones the Hub doesn't list
+are our own list, `web/firmwares-own.json`: add a firmware there, and the tool appends it. Each name below opens the page
 with that firmware picked; press Start. (`?fw=` takes the Hub's ids too; `&embed=1` shows only
 the device and its controls, for a window on another site.)
 

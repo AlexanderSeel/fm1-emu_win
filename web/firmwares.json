@@ -1,5 +1,5 @@
 {
-  "note": "Community firmwares for the M-VAVE FM-1: the FM-1 Firmware Hub's list (thefirmwarehub.com, tools/hub_catalog.mjs; its packages fetched from the Hub), plus a few more (fm1-editor.com/firmware) and this repository's FM-1 SID (fm1-sid/). The web page fetches each package when started and unpacks it with web/fwsc.js; tools/fetch_firmwares.mjs does the same into reference/firmwares for fm1-live. \"hub\": the firmware's id on the Hub (its card: thefirmwarehub.com/#fw-<hub>).",
+  "note": "Community firmwares for the M-VAVE FM-1: the FM-1 Firmware Hub's list (thefirmwarehub.com, tools/hub_catalog.mjs; its packages fetched from the Hub), then our own list (web/firmwares-own.json: this repository's FM-1 SID, M-VAVE's own, a few from fm1-editor.com/firmware). Generated: edit web/firmwares-own.json, not this file. The web page fetches each package when started and unpacks it with web/fwsc.js; tools/fetch_firmwares.mjs does the same into reference/firmwares for fm1-live. \"hub\": the firmware's id on the Hub (its card: thefirmwarehub.com/#fw-<hub>).",
   "default": "felucca",
   "firmwares": [
     { "id": "mvave", "name": "M-VAVE stock firmware", "version": "", "author": "M-VAVE", "license": "M-VAVE's own",
