@@ -407,7 +407,7 @@ fn main() -> ExitCode {
     let dump_every: u64 = 1 << 20;
     let mut stop = false;
     for _ in 0..args.steps {
-        if !cpu1_started && soc.read32(0x10008) & 8 != 0 {
+        if !cpu1_started && (std::mem::take(&mut soc.cpu1_release) || soc.read32(0x10008) & 8 != 0) {
             // Where cpu1 really starts is not settled (docs/isa-notes.md):
             // the vector at 0x02000098 `rti`s into the middle of an
             // instruction of cpu_ipc_call_sync. The routine that
@@ -429,7 +429,7 @@ fn main() -> ExitCode {
             cpus.push(c1);
             cpu1_started = true;
             if !args.quiet {
-                println!("cpu1 released at step {total_steps} (0x10008 bit 3 set)");
+                println!("cpu1 released at step {total_steps}");
             }
         }
         for ci in 0..cpus.len() {

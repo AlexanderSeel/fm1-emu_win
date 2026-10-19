@@ -2832,6 +2832,10 @@ fn decode_any(win: u64, pc: u32) -> Result<fm1_isa::Instruction, fm1_isa::Decode
         // `r_mov_b_sp_u`'s register slot, solved from r0, r1, r2 and r12 alone, swapped bits 30
         // and 31 (`r4 = b[sp]` loaded r8; tools/fuzz_decode.py against the vendor objdump)
         None if sp_mem_raw(win).is_some() => Ok(fm1_isa::Instruction { addr: pc, raw: win & 0xffff_ffff, entry: &SP_LOAD_CRAW }),
+        // `64 e0 00|80 XY`, the special-register moves, before the table too: its `sp = R` class,
+        // fitted on r0, r1, r6 and r7, swapped bits 1 and 2 of the register (`sp = r5` set sp from
+        // r3: M-VAVE's FM1 Open moved its stack up over its own frame) and knew no r8..r15
+        None if let Some(entry) = sreg_move_raw(win) => Ok(fm1_isa::Instruction { addr: pc, raw: win & 0xffff_ffff, entry }),
         None => fm1_isa::decode_win_cached(win, pc),
     };
     let raw = |entry| Ok(fm1_isa::Instruction { addr: pc, raw: win & 0xffff_ffff, entry });
