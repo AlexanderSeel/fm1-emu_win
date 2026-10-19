@@ -5,8 +5,9 @@
 
 Runs `fm1-emu --describe OBJDUMP` (what the emulator decodes each instruction into) and compares
 it with what objdump printed for the same address: branch / call targets, load and store
-operands (register, base, offset, width, sign), and register constants. Prints the mismatches
-grouped by encoding (first two bytes) with examples, and a summary.
+operands (register, base, offset or pre- / post-increment step, width, sign), and register
+constants. Prints the mismatches grouped by encoding (first two bytes) with examples, and a
+summary.
 """
 import collections, re, subprocess, sys
 
@@ -42,6 +43,16 @@ def pair_text(pre, base, post, x):
     if x and x.startswith("r"):
         return f"{b} +{x}"
     return f"{b} {int(x or 0)}"
+
+
+# accesses with a base update: [++R=#] [++R=R] (pre-increment), [R++=#] [R++=R] (post)
+INC_MEM = r"\[(\+\+)?(r\d+)(\+\+)?=(-?\d+|r\d+)\]"
+INC_LD = re.compile(rf"^r(\d+) = ([bh]?){INC_MEM}(?: \(([us])\))?$")
+INC_ST = re.compile(rf"^([bh]?){INC_MEM} = r(\d+)$")
+
+
+def inc_text(pre, base, x):
+    return "%s %s %s" % ("pre" if pre else "post", base, x if x.startswith("r") else int(x))
 
 
 LDX = re.compile(r"^r(\d+) = ([bh]?)\[r(\d+)\+r(\d+)(?:<<(\d+))?\](?: \(([us])\))?$")
@@ -85,6 +96,12 @@ def theirs(text):
     m = ST.match(t)
     if m:
         return "S r%s %s %d w%d" % (m[4], m[2], int(m[3] or 0), WIDTH[m[1]])
+    m = INC_LD.match(t)
+    if m and bool(m[3]) != bool(m[5]):
+        return "Q ld r%s %s w%d %s" % (m[1], inc_text(m[3], m[4], m[6]), WIDTH[m[2]], m[7] or "u")
+    m = INC_ST.match(t)
+    if m and bool(m[2]) != bool(m[4]):
+        return "Q st r%s %s w%d" % (m[6], inc_text(m[2], m[3], m[5]), WIDTH[m[1]])
     m = MOVI.match(t)
     if m:
         return "I r%s %d" % (m[1], int(m[2]) & 0xFFFFFFFF)

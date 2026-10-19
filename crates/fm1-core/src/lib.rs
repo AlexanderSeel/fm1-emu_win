@@ -2571,92 +2571,25 @@ impl Cpu {
                     self.regs[hi] = bus.read32(addr.wrapping_add(4));
                 }
             }
-            18 =>
+            18 | 19 =>
             {
-                // 4-byte pre-increment loads/stores `R = [++rB=#i]` /
-                // `[++rB=#i] = R` (446 corpus samples, 0 mismatches):
-                //   half/byte `58..5f ed/ee`: the post-increment field model
-                //   below, the base advanced before the access;
-                //   word `d0..d7 ec`: store = bit16, bit17 = pre-increment (clear: a plain
-                //   offset, `[rB+-#i]`, no write-back), off = 4*sext9(bits(18,19) |
-                //   bits(24,27)<<2 | bit0<<6 | bit1<<7 | bit2<<8): the pair accesses' field
-                //   (27884 corpus samples, 0 mismatches; Felucca 1.6's `[r5+-128] = r3`)
-                                let w = match (raw >> 8) & 0xff { 0xec => 4u8, 0xed => 2, _ => 1 };
-                let d = ((raw >> 28) & 0xf) as usize;
-                let b = ((raw >> 20) & 0xf) as usize;
-                let f = (((raw >> 16) & 0xf) | (((raw >> 24) & 0xf) << 4)) as u32;
-                let word_off = w == 4 && (raw >> 17) & 1 == 0;
-                let (store, inc, signed) = if w == 4 {
-                    let o = ((raw >> 18) & 3) | (((raw >> 24) & 0xf) << 2) | ((raw & 1) << 6) | (((raw >> 1) & 1) << 7)
-                        | (((raw >> 2) & 1) << 8);
-                    let o = if o & 0x100 != 0 { o as i32 - 0x200 } else { o as i32 };
-                    ((raw >> 16) & 1 != 0, 4 * o, false)
-                } else if w == 1 {
-                    let inc = if raw & 1 != 0 { f as i32 - 256 } else { f as i32 }; // bit0 = bit 8 of a 9-bit two's complement (b[r4+-163] = 93-256)
-                    ((raw >> 1) & 1 != 0, inc, (raw >> 2) & 1 != 0)
-                } else {
-                    let v = (f & !1) | (((raw & 1) as u32) << 8) | ((((raw >> 1) & 1) as u32) << 9);
-                    let inc = if v & 0x200 != 0 { v as i32 - 0x400 } else { v as i32 };
-                    ((raw >> 16) & 1 != 0, inc, (raw >> 2) & 1 != 0)
-                };
-                let addr = self.regs[b].wrapping_add(inc as u32);
-                if !word_off {
-                    self.regs[b] = addr;
+                // single-register accesses with a base update (see `decode_inc_mem`): a
+                // pre-increment updates the base before the access, a post-increment after
+                let m = decode_inc_mem(route, raw);
+                let base = self.regs[m.b];
+                let next = base.wrapping_add(m.inc as u32);
+                let a = if m.post { base } else { next };
+                if m.pre {
+                    self.regs[m.b] = next;
                 }
-                if store {
-                    match w { 1 => bus.write8(addr, self.regs[d] as u8), 2 => bus.write16(addr, self.regs[d] as u16), _ => bus.write32(addr, self.regs[d]) }
+                if m.store {
+                    st_w(bus, m.w, a, self.regs[m.d]);
                 } else {
-                    self.regs[d] = match (w, signed) {
-                        (1, false) => bus.read8(addr) as u32,
-                        (1, true) => bus.read8(addr) as i8 as i32 as u32,
-                        (2, false) => bus.read16(addr) as u32,
-                        (2, true) => bus.read16(addr) as i16 as i32 as u32,
-                        _ => bus.read32(addr),
-                    };
+                    self.regs[m.d] = ld_w(bus, m.w, m.signed, a);
                 }
-            }
-            19 =>
-            {
-                // 4-byte post-increment loads/stores `R = [rB++=#i]` /
-                // `[rB++=#i] = R` with b/h variants (`dx ec/ed/ee`; fitted
-                // on all 145 V13 corpus samples): data = bits(28,31),
-                // base = bits(20,23), f = bits(16,19) | bits(24,27)<<4.
-                //   half: store = bit16; inc = sext10(f&~1 | bit0<<8 | bit1<<9);
-                //         bit2 = signed (loads)
-                //   word (`d8..df ec`): store = bit16; inc = sext11(f&~1 | bit0<<8 | bit1<<9 |
-                //         bit2<<10) (the vendor objdump's, tools/fuzz_decode.py; sext10 had sent
-                //         Felucca's `r11 = [r12++=-820]` to +204 and DUELL's `[r1++=516]` to -508)
-                //   byte:      store = bit1; bit2 = signed load;
-                //              inc = bit0 ? sext8(f) : f
-                                let w = match (raw >> 8) & 0xff { 0xec => 4u8, 0xed => 2, _ => 1 };
-                let d = ((raw >> 28) & 0xf) as usize;
-                let b = ((raw >> 20) & 0xf) as usize;
-                let f = (((raw >> 16) & 0xf) | (((raw >> 24) & 0xf) << 4)) as u32;
-                let (store, inc, signed) = if w == 1 {
-                    let inc = if raw & 1 != 0 { f as i32 - 256 } else { f as i32 }; // bit0 = bit 8 of a 9-bit two's complement (b[r4+-163] = 93-256)
-                    ((raw >> 1) & 1 != 0, inc, (raw >> 2) & 1 != 0)
-                } else if w == 4 {
-                    let v = (f & !1) | (((raw & 7) as u32) << 8);
-                    let inc = if v & 0x400 != 0 { v as i32 - 0x800 } else { v as i32 };
-                    ((raw >> 16) & 1 != 0, inc, false)
-                } else {
-                    let v = (f & !1) | (((raw & 1) as u32) << 8) | ((((raw >> 1) & 1) as u32) << 9);
-                    let inc = if v & 0x200 != 0 { v as i32 - 0x400 } else { v as i32 };
-                    ((raw >> 16) & 1 != 0, inc, (raw >> 2) & 1 != 0)
-                };
-                let addr = self.regs[b];
-                if store {
-                    match w { 1 => bus.write8(addr, self.regs[d] as u8), 2 => bus.write16(addr, self.regs[d] as u16), _ => bus.write32(addr, self.regs[d]) }
-                } else {
-                    self.regs[d] = match (w, signed) {
-                        (1, false) => bus.read8(addr) as u32,
-                        (1, true) => bus.read8(addr) as i8 as i32 as u32,
-                        (2, false) => bus.read16(addr) as u32,
-                        (2, true) => bus.read16(addr) as i16 as i32 as u32,
-                        _ => bus.read32(addr),
-                    };
+                if m.post {
+                    self.regs[m.b] = next;
                 }
-                self.regs[b] = addr.wrapping_add(inc as u32);
             }
             35 =>
             {
@@ -3228,7 +3161,8 @@ struct PairMem { pair: usize, store: bool, base: Option<usize>, off: i32, index:
 ///   58..5f, bit17 clear `d[R++=#]` (post-increment, 29); set: the index register
 ///   bits(24,27), bits(1,2) the mode: `58` `d[R+R]`, `5c` `d[++R=R]` (8 + 3 samples), `5e`
 ///   `d[R++=R]` (none in the corpus; the vendor objdump's, found by tools/fuzz_decode.py: bit 2
-///   alone had made it a pre-increment).
+///   alone had made it a pre-increment). The vendor knows no other: `59 5a 5b 5d 5f` are not
+///   instructions, decoded here by bits(1,2) all the same (`5a` as `d[R+R]`).
 /// `d0 e9`: sp-relative, off = bits(17,27)<<1 (all 810 corpus samples; the earlier
 /// bits(17,23)<<1 | bit24<<8 fit only offsets below 512 and sent Felucca's
 /// `d[sp+1056] = r11_r10` to sp+32: its LED arrays kept the last frame's keys lit).
@@ -4235,16 +4169,17 @@ mod tests {
     }
 
     /// Encodings checked against the vendor objdump (tools/fuzz_decode.py): one instruction at 0,
-    /// registers r0..r15 = 0x1000 + 0x100 * n, memory word at a = a.
-    fn run1(bytes: &[u8]) -> (Cpu, FlatRam) {
+    /// registers r0..r15 = 0x1000 + 0x100 * n, memory word at a = a (pokes: other words, to see a
+    /// load's sign).
+    fn run1(bytes: &[u8], pokes: &[(usize, u32)]) -> (Cpu, FlatRam) {
         let mut mem = vec![0u8; 0x4000];
         for a in (0x40..0x4000).step_by(4) {
             mem[a..a + 4].copy_from_slice(&(a as u32).to_le_bytes());
         }
-        mem[..bytes.len()].copy_from_slice(bytes);
-        for k in bytes.len()..0x40 {
-            mem[k] = 0;
+        for &(a, v) in pokes {
+            mem[a..a + 4].copy_from_slice(&v.to_le_bytes());
         }
+        mem[..bytes.len()].copy_from_slice(bytes);
         let mut ram = FlatRam::new(mem);
         let mut cpu = Cpu::new(0);
         for (n, r) in cpu.regs.iter_mut().enumerate() {
@@ -4258,30 +4193,34 @@ mod tests {
     #[test]
     fn vendor_encodings() {
         // `dc ec cc bc` r11 = [r12++=-820] (the corpus's: dc's bit 2 is the increment's sign)
-        let (c, _) = run1(&[0xdc, 0xec, 0xcc, 0xbc]);
+        let (c, _) = run1(&[0xdc, 0xec, 0xcc, 0xbc], &[]);
         assert_eq!(c.regs[11], 0x1c00);
         assert_eq!(c.regs[12], 0x1c00 - 820);
         // `df ec 00 4f` r4 = [r0++=-16]
-        let (c, _) = run1(&[0xdf, 0xec, 0x00, 0x4f]);
+        let (c, _) = run1(&[0xdf, 0xec, 0x00, 0x4f], &[]);
         assert_eq!((c.regs[4], c.regs[0]), (0x1000, 0x1000 - 16));
         // `d8 ec 05 1f` [r0++=244] = r1
-        let (c, mut m) = run1(&[0xd8, 0xec, 0x05, 0x1f]);
+        let (c, mut m) = run1(&[0xd8, 0xec, 0x05, 0x1f], &[]);
         assert_eq!((m.read32(0x1000), c.regs[0]), (0x1100, 0x1000 + 244));
         // `5e ec 02 21` r3_r2 = d[r0++=r1] (post-increment; `5c` is the pre-increment)
-        let (c, _) = run1(&[0x5e, 0xec, 0x02, 0x21]);
+        let (c, _) = run1(&[0x5e, 0xec, 0x02, 0x21], &[]);
         assert_eq!((c.regs[2], c.regs[3], c.regs[0]), (0x1000, 0x1004, 0x2100));
         // `dc e9 00 40` r4 = b[sp] (u), `dc e9 00 80` r8 = b[sp] (u): the corpus class had
         // swapped them
-        let (c, _) = run1(&[0xdc, 0xe9, 0x00, 0x40]);
+        let (c, _) = run1(&[0xdc, 0xe9, 0x00, 0x40], &[]);
         assert_eq!((c.regs[4], c.regs[8]), (0x00, 0x1800));
-        // `d8 e9 00 f4` r15 = h[sp+1024] (u); `d8 e9 03 40` h[sp+2] = r4
-        let (c, _) = run1(&[0xd8, 0xe9, 0x00, 0xf4]);
-        assert_eq!(c.regs[15], 0x2400);
-        let (_, mut m) = run1(&[0xd8, 0xe9, 0x03, 0x40]);
+        // `d8 e9 00 f4` r15 = h[sp+1024] (u), `d9 e9 00 f4` (s); `d8 e9 03 40` h[sp+2] = r4
+        let (c, _) = run1(&[0xd8, 0xe9, 0x00, 0xf4], &[(0x2400, 0x9234)]);
+        assert_eq!(c.regs[15], 0x9234);
+        let (c, _) = run1(&[0xd9, 0xe9, 0x00, 0xf4], &[(0x2400, 0x9234)]);
+        assert_eq!(c.regs[15], 0xffff_9234);
+        let (_, mut m) = run1(&[0xd8, 0xe9, 0x03, 0x40], &[]);
         assert_eq!(m.read32(0x2000), 0x1400 << 16 | 0x2000);
-        // `d0 ed 02 39` r3 = h[r0++=146] (u)
-        let (c, _) = run1(&[0xd0, 0xed, 0x02, 0x39]);
-        assert_eq!((c.regs[3], c.regs[0]), (0x1000, 0x1000 + 146));
+        // `d0 ed 02 39` r3 = h[r0++=146] (u), `d4 ed 02 39` (s)
+        let (c, _) = run1(&[0xd0, 0xed, 0x02, 0x39], &[(0x1000, 0x8001)]);
+        assert_eq!((c.regs[3], c.regs[0]), (0x8001, 0x1000 + 146));
+        let (c, _) = run1(&[0xd4, 0xed, 0x02, 0x39], &[(0x1000, 0x8001)]);
+        assert_eq!((c.regs[3], c.regs[0]), (0xffff_8001, 0x1000 + 146));
     }
 }
 
@@ -5030,6 +4969,49 @@ fn sp_mem_raw(raw: u64) -> Option<SpMem> {
     }
 }
 
+/// Routes 18 and 19, the 4-byte single-register accesses with an increment: data = bits(28,31),
+/// base = bits(20,23), f = bits(16,19) | bits(24,27)<<4; the width from byte 1 (`ec` word, `ed`
+/// half, `ee` byte).
+/// Route 18, pre-increment `R = [++rB=#i]` / `[++rB=#i] = R` (446 corpus samples, 0 mismatches):
+///   half/byte `58..5f ed/ee`: route 19's fields, the base advanced before the access;
+///   word `d0..d7 ec`: store = bit16, bit17 = pre-increment (clear: a plain offset, `[rB+-#i]`,
+///   no write-back), off = 4*sext9(bits(18,19) | bits(24,27)<<2 | bit0<<6 | bit1<<7 | bit2<<8):
+///   the pair accesses' field (27884 corpus samples, 0 mismatches; Felucca 1.6's `[r5+-128] = r3`).
+/// Route 19, post-increment `R = [rB++=#i]` / `[rB++=#i] = R` (`dx ec/ed/ee`; fitted on all 145
+/// V13 corpus samples):
+///   half: store = bit16; inc = sext10(f&~1 | bit0<<8 | bit1<<9); bit2 = signed (loads)
+///   word (`d8..df ec`): store = bit16; inc = sext11(f&~1 | bit0<<8 | bit1<<9 | bit2<<10) (the
+///     vendor objdump's, tools/fuzz_decode.py; sext10 had sent Felucca's `r11 = [r12++=-820]` to
+///     +204 and DUELL's `[r1++=516]` to -508)
+///   byte: store = bit1; bit2 = signed load; inc = bit0 ? sext8(f) : f (a 9-bit two's complement:
+///     `b[r4+-163]` = 93-256)
+#[derive(Clone, Copy, Debug)]
+struct IncMem { d: usize, b: usize, w: u8, store: bool, signed: bool, inc: i32, pre: bool, post: bool }
+fn decode_inc_mem(route: u8, raw: u64) -> IncMem {
+    let w = match (raw >> 8) & 0xff { 0xec => 4u8, 0xed => 2, _ => 1 };
+    let d = ((raw >> 28) & 0xf) as usize;
+    let b = ((raw >> 20) & 0xf) as usize;
+    let f = (((raw >> 16) & 0xf) | (((raw >> 24) & 0xf) << 4)) as u32;
+    let (store, inc, signed) = if w == 1 {
+        let inc = if raw & 1 != 0 { f as i32 - 256 } else { f as i32 };
+        ((raw >> 1) & 1 != 0, inc, (raw >> 2) & 1 != 0)
+    } else if w == 4 && route == 18 {
+        let o = ((raw >> 18) & 3) | (((raw >> 24) & 0xf) << 2) | ((raw & 1) << 6) | (((raw >> 1) & 1) << 7) | (((raw >> 2) & 1) << 8);
+        let o = if o & 0x100 != 0 { o as i32 - 0x200 } else { o as i32 };
+        ((raw >> 16) & 1 != 0, 4 * o, false)
+    } else if w == 4 {
+        let v = (f & !1) | (((raw & 7) as u32) << 8);
+        let inc = if v & 0x400 != 0 { v as i32 - 0x800 } else { v as i32 };
+        ((raw >> 16) & 1 != 0, inc, false)
+    } else {
+        let v = (f & !1) | (((raw & 1) as u32) << 8) | ((((raw >> 1) & 1) as u32) << 9);
+        let inc = if v & 0x200 != 0 { v as i32 - 0x400 } else { v as i32 };
+        ((raw >> 16) & 1 != 0, inc, (raw >> 2) & 1 != 0)
+    };
+    let word_off = route == 18 && w == 4 && (raw >> 17) & 1 == 0;
+    IncMem { d, b, w, store, signed, inc, pre: route == 18 && !word_off, post: route == 19 }
+}
+
 /// `5x ed` halfword accesses: data = bits(28,31), base = bits(20,23), bit16 store, byte 0 bit 2
 /// signed (a load) / the high half (a store), bit 3 pre-increment; off = sext10(byte0 & 3 << 8 |
 /// bits(24,27) << 4 | bits(17,19) << 1), in bytes. All 30337 corpus samples fit.
@@ -5314,6 +5296,17 @@ mod size_report {
     }
 }
 
+/// `describe`'s form of an access with a base update: `Q ld|st r<data> pre|post r<base> <step> w<w>`,
+/// a load then `u|s`; the step a number or `r<i>`.
+fn describe_inc(store: bool, r: u8, pre: bool, b: u8, step: String, w: u8, signed: bool) -> String {
+    let mode = if pre { "pre" } else { "post" };
+    if store {
+        format!("Q st r{} {} r{} {} w{}", r, mode, b, step, w)
+    } else {
+        format!("Q ld r{} {} r{} {} w{} {}", r, mode, b, step, w, if signed { "s" } else { "u" })
+    }
+}
+
 /// What the emulator's decoder makes of an instruction window: its length in bytes and its
 /// class name, or None when nothing decodes it (`fm1-emu --check-decode`, tools/fuzz_decode.py).
 pub fn decode_info(win: u64, pc: u32) -> Option<(usize, &'static str)> {
@@ -5323,7 +5316,8 @@ pub fn decode_info(win: u64, pc: u32) -> Option<(usize, &'static str)> {
 /// The micro-op the emulator decodes an instruction window into, in a canonical text form, for
 /// auditing the decoders against the vendor disassembly (`fm1-emu --describe`):
 ///   `T <target>` a branch / call with a fixed target, `L r<d> <base> <off> w<w> u|s` a load,
-///   `S r<s> <base> <off> w<w>` a store, `I r<d> <value>` a constant; None: nothing to compare.
+///   `S r<s> <base> <off> w<w>` a store, `I r<d> <value>` a constant, `Q ..` an access with a base
+///   update (`describe_inc`); None: nothing to compare.
 /// The same decode path as `Cpu::fetch_at` (without the predicated-block form, which needs the
 /// following instructions).
 pub fn describe(win: u64, pc: u32) -> Option<String> {
@@ -5358,6 +5352,14 @@ pub fn describe(win: u64, pc: u32) -> Option<String> {
         };
         return Some(format!("C{} r{} {} {} {} {}", sign, b.reg, op, rhs, b.then_units, b.else_units));
     }
+    if route == 18 || route == 19 {
+        // single-register accesses with an increment (arms 18 / 19; a word at an offset: L / S)
+        let m = decode_inc_mem(route as u8, insn.raw);
+        if !m.pre && !m.post {
+            return Some(if m.store { format!("S r{} r{} {} w4", m.d, m.b, m.inc) } else { format!("L r{} r{} {} w4 u", m.d, m.b, m.inc) });
+        }
+        return Some(describe_inc(m.store, m.d as u8, m.pre, m.b as u8, m.inc.to_string(), m.w, m.signed));
+    }
     let fast = if route == ROUTE_SYNTAX { fast_of(&insn, syntax) } else { fast_raw(route, &insn, &alu4, &bittest) }?;
     let base = |b: Base| match b { Base::Reg(r) => format!("r{}", r), Base::Sp => "sp".to_string() };
     let opname = |o: Op| match o {
@@ -5366,6 +5368,7 @@ pub fn describe(win: u64, pc: u32) -> Option<String> {
     };
     let rhs = |rk: u8, rv: u32| match rk { 0 => format!("r{}", rv), 1 => format!("{}", rv), _ => format!("1<<r{}", rv) };
     let sgn = |s: bool| if s { "s" } else { "u" };
+    let step = |i: u8, inc: u32| if i == 16 { (inc as i32).to_string() } else { format!("r{}", i) };
     Some(match fast.specialise() {
         Fast::BrI { target, .. } | Fast::BrR { target, .. } | Fast::BrIEq { target, .. } | Fast::BrINe { target, .. }
         | Fast::BitBr { target, .. } | Fast::DecBr { target, .. } | Fast::Goto { target } | Fast::Call { target } => {
@@ -5390,6 +5393,12 @@ pub fn describe(win: u64, pc: u32) -> Option<String> {
         Fast::SarI { d, s, n } => format!("A r{} r{} >>> {}", d, s, n),
         Fast::LdIdx { d, b, i, sh, w, signed } => format!("X r{} r{} r{} {} w{} {}", d, b, i, sh, w, sgn(signed)),
         Fast::StIdx { s, b, i, sh, w } => format!("Y r{} r{} r{} {} w{}", s, b, i, sh, w),
+        Fast::LdPre { d, b, i, w, signed, inc } => describe_inc(false, d, true, b, step(i, inc), w, signed),
+        Fast::StPre { s, b, i, w, inc } => describe_inc(true, s, true, b, step(i, inc), w, false),
+        Fast::LdPost { d, b, w, signed, inc } => describe_inc(false, d, false, b, (inc as i32).to_string(), w, signed),
+        Fast::StPost { s, b, w, inc } => describe_inc(true, s, false, b, (inc as i32).to_string(), w, false),
+        Fast::LdPostR { d, b, i, w, signed } => describe_inc(false, d, false, b, format!("r{}", i), w, signed),
+        Fast::StPostR { s, b, i, w } => describe_inc(true, s, false, b, format!("r{}", i), w, false),
         Fast::Rmw { b, w, op, off, v } => {
             let o = match op { RmwOp::Mov => "=", RmwOp::Or => "|=", RmwOp::And => "&=", RmwOp::Xor => "^=", RmwOp::Add => "+=", RmwOp::Sub => "-=" };
             format!("M w{} r{} {} {} {}", w, b, off as i32, o, v)

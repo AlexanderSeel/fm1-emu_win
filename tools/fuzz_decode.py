@@ -20,7 +20,7 @@ The instructions come from
     set, the rest random.
 Each goes in a 32-byte slot padded with nops. Output in work/fuzz/.
 """
-import collections, os, random, re, subprocess, sys
+import collections, hashlib, os, random, re, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "work", "fuzz")
@@ -128,10 +128,19 @@ with open(os.path.join(OUT, "cands.S"), "w") as f:
 with open(os.path.join(OUT, "cands.txt"), "w") as f:
     for _, b in cands:
         f.write((b + bytes(SLOT - len(b))).hex() + "\n")
-if "--reuse" not in args:                    # (--reuse: the last run's listing, same instructions)
-  subprocess.run(["docker", "run", "--rm", "--platform", "linux/amd64", "-v", f"{ROOT}:/fm1", "-w", "/fm1", "debian:bookworm-slim",
-                "bash", "-c", f"'{TC}/pi32v2/bin/clang' -target pi32v2 -c work/fuzz/cands.S -o work/fuzz/cands.o && "
-                f"'{TC}/common/bin/objdump' -d work/fuzz/cands.o > work/fuzz/cands_objdump.txt"], check=True)
+# (--reuse: the last run's listing, when it was made from the same instructions: the listing is
+# matched to them slot by slot)
+digest = hashlib.sha256(open(os.path.join(OUT, "cands.S"), "rb").read()).hexdigest()
+stamp = os.path.join(OUT, "cands_objdump.sha256")
+if "--reuse" in args:
+    if not os.path.exists(stamp) or open(stamp).read().strip() != digest:
+        sys.exit("--reuse: the last listing was made from other instructions (another --seed, --per, "
+                 "--sleigh or corpus); run without --reuse")
+else:
+    subprocess.run(["docker", "run", "--rm", "--platform", "linux/amd64", "-v", f"{ROOT}:/fm1", "-w", "/fm1", "debian:bookworm-slim",
+                    "bash", "-c", f"'{TC}/pi32v2/bin/clang' -target pi32v2 -c work/fuzz/cands.S -o work/fuzz/cands.o && "
+                    f"'{TC}/common/bin/objdump' -d work/fuzz/cands.o > work/fuzz/cands_objdump.txt"], check=True)
+    open(stamp, "w").write(digest + "\n")
 line_re = re.compile(r"^\s*([0-9a-f]+):\s+((?:[0-9a-f]{2} )+)\s*\t?\s*(.*)$")
 vendor = {}
 for l in open(os.path.join(OUT, "cands_objdump.txt"), errors="replace"):

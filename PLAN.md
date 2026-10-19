@@ -732,7 +732,9 @@ no length disagreements. Fixed, each with the vendor's layout (`vendor_encodings
 Left: shift-immediate field 0 is `<< 32` to objdump, 0 to us (clang never emits it, the hardware
 unconfirmed; the JITs would need a special case); 6-byte call targets beyond +-128 MB; the
 flag-condition branches (`ifcs/ifle/... goto`) have no semantics (rare, in hand-written code).
-audit_decode.py does not compare post-increment forms (why route 19's word bug lasted).
+audit_decode.py now compares the pre- / post-increment accesses too (`describe`'s `Q`, from the
+same `decode_inc_mem` routes 18 / 19 run): +7610 compared in the stock app's listing, all agree;
+with route 19's old sext10 put back it reports 135 disagreements in the fuzz listing.
 
 ## 6. Phase 5 — Boot & integration
 
