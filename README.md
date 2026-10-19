@@ -140,6 +140,10 @@ notes go to USB / Bluetooth MIDI) and slower than real time in the browser so fa
 
 ## On your computer
 
+**Download** `fm1-live` for macOS (Apple silicon) or Linux (ARM64, x86-64) from
+[the releases](https://github.com/joakimeriksson/fm1-emu/releases/latest), and play a firmware
+package: `./fm1-live --fwsc felucca.fwsc`. Or build it from a checkout:
+
 ```sh
 cargo run --release -p fm1-live -- --fw list           # the firmwares
 node tools/fetch_firmwares.mjs                          # download them into reference/firmwares

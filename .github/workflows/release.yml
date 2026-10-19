@@ -1,0 +1,161 @@
+# The release: on a tag v<version> (the workspace's version in Cargo.toml, which
+# crates/fm1-plugin's must equal, with its notes in docs/releases/v<version>.md):
+#   - macOS (Apple silicon): the plugin (AU, VST3, CLAP; tested, validated, tools/package_plugin.sh)
+#     and fm1-live / fm1-emu (tools/package_apps.sh)
+#   - Linux arm64 and x86-64: fm1-live / fm1-emu
+# each built, smoke-tested on FM-1 SID's package, and published as one GitHub Release: the notes
+# file, then the merged pull requests GitHub lists. Run by hand (workflow_dispatch), or on a pull
+# request that changes the release's own files, it builds and keeps the files as the run's
+# artifacts, without a release.
+#
+# The plugin is signed and notarized when these repository secrets exist; unsigned otherwise:
+#   MACOS_CERTIFICATE           a "Developer ID Application" certificate (.p12), base64
+#   MACOS_CERTIFICATE_PASSWORD  its password
+#   APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD   for notarization (an app-specific password)
+
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    paths:
+      - .github/workflows/release.yml
+      - tools/package_apps.sh
+      - tools/package_plugin.sh
+      - docs/releases/**
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Tools
+        run: brew install ninja
+
+      - name: The tag names the version; its notes exist
+        run: |
+          v=$(sed -nE 's/^version = "(.*)"/\1/p' Cargo.toml | head -1)
+          p=$(sed -nE 's/^version = "(.*)"/\1/p' crates/fm1-plugin/Cargo.toml | head -1)
+          test "$v" = "$p" || { echo "workspace $v, plugin $p"; exit 1; }
+          test -f "docs/releases/v$v.md" || { echo "no docs/releases/v$v.md"; exit 1; }
+          if [ "$GITHUB_REF_TYPE" = tag ]; then
+            test "v$v" = "$GITHUB_REF_NAME" || { echo "tag $GITHUB_REF_NAME, version $v"; exit 1; }
+          fi
+
+      - name: Signing certificate
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+        run: |
+          if [ -z "$MACOS_CERTIFICATE" ]; then echo "no certificate: an unsigned build"; exit 0; fi
+          kc=$RUNNER_TEMP/build.keychain-db
+          pw=$(uuidgen)
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$pw" "$kc"
+          security set-keychain-settings -lut 21600 "$kc"
+          security unlock-keychain -p "$pw" "$kc"
+          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$MACOS_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$pw" "$kc"
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+          id=$(security find-identity -v -p codesigning "$kc" | sed -nE 's/.*"(Developer ID Application[^"]*)".*/\1/p' | head -1)
+          echo "SIGN_IDENTITY=$id" >> "$GITHUB_ENV"
+
+      # The machine's thread: a stamped note on time, a screen with no audio taken (Felucca,
+      # from its author's site).
+      - name: Plugin tests
+        run: |
+          node tools/fetch_firmwares.mjs felucca
+          cd crates/fm1-plugin && cargo test --release
+
+      - name: Build, install, Apple's AU validator
+        run: tools/build_plugin.sh
+
+      - name: Steinberg's VST3 validator
+        run: |
+          cd target/plugin
+          XCODE_VERSION=16.0 cmake -S build/cpm/vst3sdk -B vst3sdk-build -G Ninja -DXCODE_VERSION=16.0 \
+            -DCMAKE_BUILD_TYPE=Release -DSMTG_ENABLE_VST3_PLUGIN_EXAMPLES=OFF -DSMTG_ENABLE_VSTGUI_SUPPORT=OFF
+          cmake --build vst3sdk-build --target validator
+          vst3sdk-build/bin/Release/validator ~/Library/Audio/Plug-Ins/VST3/FM-1.vst3
+
+      - name: Package the plugin (notarized when the secrets exist)
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: tools/package_plugin.sh
+
+      - name: fm1-live and fm1-emu
+        run: |
+          cargo build --release --locked -p fm1-live -p fm1-emu
+          target/release/fm1-live --version
+          target/release/fm1-live --fwsc fm1-sid/web/sidplayer.fwsc --bench 3000 | tee bench.txt
+          grep -q "ms emulated" bench.txt
+          tools/package_apps.sh macos-arm64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-arm64
+          path: |
+            target/plugin/release/*.zip
+            target/release-apps/*.tar.gz
+
+  linux:
+    strategy:
+      matrix:
+        include:
+          - { runner: ubuntu-24.04-arm, platform: linux-arm64 }
+          - { runner: ubuntu-24.04, platform: linux-x86_64 }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust and the window / audio / MIDI headers
+        run: |
+          command -v cargo || { curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal; echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"; }
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libasound2-dev libx11-dev libxkbcommon-dev libxcursor-dev libxrandr-dev libxi-dev pkg-config
+
+      - name: fm1-live and fm1-emu
+        run: |
+          cargo build --release --locked -p fm1-live -p fm1-emu
+          target/release/fm1-live --version
+          target/release/fm1-live --fwsc fm1-sid/web/sidplayer.fwsc --bench 3000 | tee bench.txt
+          grep -q "ms emulated" bench.txt
+          tools/package_apps.sh ${{ matrix.platform }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: target/release-apps/*.tar.gz
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [macos, linux]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v=${GITHUB_REF_NAME#v}
+          ls -la dist
+          gh release create "$GITHUB_REF_NAME" dist/* --title "fm1-emu $v" \
+            --notes-file "docs/releases/v$v.md" --generate-notes

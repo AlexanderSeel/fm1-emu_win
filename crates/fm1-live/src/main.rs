@@ -115,8 +115,10 @@ fn parse() -> Option<Opts> {
                 o.name = format!("{name} {ver}");
             }
             "--fwsc" => {
-                o.fwsc = Some(a.get(i + 1)?.clone());
-                o.name = "M-VAVE stock firmware".into();
+                let path = a.get(i + 1)?;
+                o.fwsc = Some(path.clone());
+                // (the window's title: the package's name, `FM-1` for M-VAVE's own FM-1.fwsc)
+                o.name = std::path::Path::new(path).file_stem().map_or("".into(), |s| s.to_string_lossy().into_owned());
             }
             "--syx" => o.syx = Some(a.get(i + 1)?.clone()),
             "--midi" => o.midi = a.get(i + 1)?.clone(),
@@ -629,9 +631,23 @@ fn midi_inputs(o: &Opts, tx: &mpsc::Sender<Action>) -> Vec<midir::MidiInputConne
 /// Pixels of vertical mouse drag per encoder click.
 const DRAG_PER_CLICK: f32 = 12.0;
 
+const USAGE: &str = "usage: fm1-live --fwsc FIRMWARE.fwsc   (a firmware package: a community firmware, or M-VAVE's own)
+       fm1-live --fw ID | --fw list    (the page's list, in a checkout: node tools/fetch_firmwares.mjs)
+       fm1-live --bin XIP.bin [--entry 0x02000120]
+options: [--mhz 240] [--syx BANK.syx] [--midi all|none|NAME] [--midi-ch N] [--bench MS] [--shot MS]
+         [--flaky-core1 RATE [--seed N]] [--version]";
+
 fn main() {
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("fm1-live {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+    if std::env::args().any(|a| a == "--help" || a == "-h") {
+        println!("{USAGE}");
+        return;
+    }
     let Some(o) = parse() else {
-        eprintln!("usage: fm1-live [--fw ID | --fw list | --bin work/felucca_xip.bin] [--entry 0x02000120] [--mhz 240] [--bench MS] [--midi all|none|NAME] [--midi-ch N] [--flaky-core1 RATE [--seed N]]");
+        eprintln!("{USAGE}");
         std::process::exit(2);
     };
     if o.seed.is_some() && o.flaky_core1.is_none() {
@@ -652,6 +668,9 @@ fn main() {
         Ok(m) => m,
         Err(e) => {
             eprintln!("cannot read {}: {e}", o.bin);
+            if std::env::args().len() == 1 {
+                eprintln!("(no firmware given)\n{USAGE}");
+            }
             std::process::exit(1);
         }
     };

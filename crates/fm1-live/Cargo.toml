@@ -1,7 +1,7 @@
 [package]
 name = "fm1-live"
 description = "Play the emulated FM-1 live: LCD window, computer keyboard as the keys, audio out"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 

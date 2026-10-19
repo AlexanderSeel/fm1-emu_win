@@ -63,6 +63,10 @@ struct Args {
 }
 
 fn main() -> ExitCode {
+    if std::env::args().any(|a| a == "--version" || a == "-V") {
+        println!("fm1-emu {}", env!("CARGO_PKG_VERSION"));
+        return ExitCode::SUCCESS;
+    }
     if std::env::args().any(|a| a == "--coverage") {
         return coverage_report();
     }
