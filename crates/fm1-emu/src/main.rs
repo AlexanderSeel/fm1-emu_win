@@ -92,6 +92,44 @@ fn main() -> ExitCode {
         }
         return ExitCode::SUCCESS;
     }
+    // `--check-decode FILE`: for every line of hex bytes (an instruction, then what follows it),
+    // what the emulator makes of it: `line|len|class|status`, status `ok`, `unsupported` (decoded,
+    // no semantics), `undecoded` or the core's error, from one step on a scratch machine
+    // (tools/fuzz_decode.py feeds it instructions and compares with the vendor disassembler)
+    if let Some(i) = std::env::args().position(|a| a == "--check-decode") {
+        let path = std::env::args().nth(i + 1).unwrap_or_default();
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            eprintln!("cannot read {path}");
+            return ExitCode::FAILURE;
+        };
+        for (n, line) in text.lines().enumerate() {
+            let hex = line.trim();
+            let bytes: Vec<u8> = (0..hex.len() / 2).filter_map(|k| u8::from_str_radix(&hex[2 * k..2 * k + 2], 16).ok()).collect();
+            let mut win = 0u64;
+            for (k, b) in bytes.iter().take(8).enumerate() {
+                win |= (*b as u64) << (8 * k);
+            }
+            let Some((len, name)) = fm1_core::decode_info(win, XIP_BASE) else {
+                println!("{n}|0|-|undecoded");
+                continue;
+            };
+            let mut image = bytes.clone();
+            image.resize(64, 0);
+            let mut soc = Soc::new(64 * 1024, image);
+            let mut cpu = Cpu::new(XIP_BASE);
+            cpu.sp = RAM_BASE + 0x8000;
+            for r in cpu.regs.iter_mut() {
+                *r = RAM_BASE + 0x1000;
+            }
+            let status = match cpu.step(&mut soc) {
+                Ok(()) => "ok".to_string(),
+                Err(CoreError::Unsupported { .. }) | Err(CoreError::MissingSlot { .. }) => "unsupported".to_string(),
+                Err(e) => format!("{e:?}").replace('|', "/"),
+            };
+            println!("{n}|{len}|{name}|{status}");
+        }
+        return ExitCode::SUCCESS;
+    }
     // `--list IMAGE START END`: a linear listing with the emulator's own decoder (it knows the
     // FPU and the float compares objdump cannot print): address, bytes, syntax, slot values,
     // and the micro-op the core runs
