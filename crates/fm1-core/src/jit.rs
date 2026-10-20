@@ -62,13 +62,14 @@ const _: () = assert!(std::mem::offset_of!(Ctx, slot) == OFF_SLOT as usize);
 
 // ------------------------------------------------------------------ executable memory
 // macOS (Apple silicon): a MAP_JIT mapping, writable or executable per thread, toggled around a
-// write. Linux: a plain read-write-execute mapping (a hardened kernel that refuses one, SELinux's
-// execmem, leaves the interpreter running: `new` gives None). That gives up W^X there: a stray
-// write into the code cache would be executable (an mprotect toggle around each write would keep
-// it, at a system call per compiled block). Both flush the instruction cache for what was
-// written. (Code is only appended, so a missing flush would seldom show: the tests cannot prove
-// it. Tested on Apple silicon's cores only, which need the instruction side, CTR_EL0.DIC = 0, but
-// not the data side, IDC = 1; Cortex-A cores such as a Raspberry Pi's need both.)
+// write. Linux and Android (the same kernel interface): a plain read-write-execute mapping (a
+// hardened kernel that refuses one, SELinux's execmem, leaves the interpreter running: `new`
+// gives None). That gives up W^X there: a stray write into the code cache would be executable
+// (an mprotect toggle around each write would keep it, at a system call per compiled block).
+// Both flush the instruction cache for what was written. (Code is only appended, so a missing
+// flush would seldom show: the tests cannot prove it. Tested on Apple silicon's cores and a
+// Tensor G2's (Cortex-X1, A78, A55), which need the instruction side, CTR_EL0.DIC = 0, but not
+// the data side, IDC = 1; older Cortex-A cores such as a Raspberry Pi 4's need both.)
 extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut c_void;
 }
@@ -79,13 +80,13 @@ extern "C" {
 }
 #[cfg(target_os = "macos")]
 const MAP_FLAGS: c_int = 0x0002 | 0x1000 | 0x0800; // PRIVATE | ANON | JIT
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 const MAP_FLAGS: c_int = 0x02 | 0x20; // PRIVATE | ANONYMOUS
 
 /// Make freshly written code visible to instruction fetch (what `__clear_cache` does on
 /// AArch64): clean the data cache lines to the point of unification, invalidate the instruction
 /// cache lines, then synchronise. Line sizes from CTR_EL0.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 unsafe fn flush_icache(start: *const u8, len: usize) {
     let ctr: u64;
     core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack));
@@ -138,7 +139,7 @@ impl CodeCache {
                 pthread_jit_write_protect_np(1);
                 sys_icache_invalidate(dst as *mut c_void, bytes);
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "android"))]
             {
                 std::ptr::copy_nonoverlapping(words.as_ptr() as *const u8, dst, bytes);
                 flush_icache(dst, bytes);
