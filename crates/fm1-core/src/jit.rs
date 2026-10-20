@@ -1,5 +1,5 @@
-//! AArch64 JIT for the blocks of micro-ops `Cpu::run_fast` interprets (after esp32sim's
-//! xtensa-lx7 JIT). A compiled block is the block's plain prefix (up to the first op that needs
+//! Native JIT for the blocks of micro-ops `Cpu::run_fast` interprets (after esp32sim's
+//! xtensa-lx7 JIT): AArch64 code (here), x86-64 code (jit/x64.rs, the same plan op for op). A compiled block is the block's plain prefix (up to the first op that needs
 //! the careful path) as native code, with the interpreter as the oracle: the two must leave
 //! bit-identical machine state.
 //!
@@ -15,16 +15,24 @@
 //! limit, so the chain never runs past a due tick; the helpers sync the clock with the running
 //! instruction count, so timing stays exact across the chain.
 //!
-//! Register plan (AAPCS64 callee-saved, so helpers may be called freely):
+//! AArch64 register plan (AAPCS64 callee-saved, so helpers may be called freely):
 //!   x19 = &Cpu, x20 = &Ctx, x21 = RAM host base, x22 = XIP host base,
 //!   w23 / w24 = values kept across a helper call within one instruction, x25 = code flags,
 //!   w26 = instructions done in this call before the current block, w27 = the limit
 //!   (instructions this call may run). Guest registers, sp and rets stay in the Cpu struct;
 //!   pc is stored at exit.
 
+#[cfg(target_arch = "aarch64")]
 use crate::jit_a64::{Asm, Cond as AC, Label, Reg, SP};
-use crate::{Base, Bus, Cond, Cpu, Fast, Op, RmwOp};
+#[cfg(target_arch = "aarch64")]
+use crate::{Base, Cond, Op, RmwOp};
+use crate::{Bus, Cpu, Fast};
 use std::ffi::{c_int, c_void};
+
+#[cfg(target_arch = "x86_64")]
+mod x64;
+#[cfg(target_arch = "x86_64")]
+use x64::compile;
 
 /// Host view of the guest memory the inline paths read and write directly.
 #[derive(Clone, Copy, Debug)]
@@ -66,9 +74,10 @@ const _: () = assert!(std::mem::offset_of!(Ctx, slot) == OFF_SLOT as usize);
 // execmem, leaves the interpreter running: `new` gives None). That gives up W^X there: a stray
 // write into the code cache would be executable (an mprotect toggle around each write would keep
 // it, at a system call per compiled block). Both flush the instruction cache for what was
-// written. (Code is only appended, so a missing flush would seldom show: the tests cannot prove
-// it. Tested on Apple silicon's cores only, which need the instruction side, CTR_EL0.DIC = 0, but
-// not the data side, IDC = 1; Cortex-A cores such as a Raspberry Pi's need both.)
+// written on AArch64. (Code is only appended, so a missing flush would seldom show: the tests
+// cannot prove it. Tested on Apple silicon's cores only, which need the instruction side,
+// CTR_EL0.DIC = 0, but not the data side, IDC = 1; Cortex-A cores such as a Raspberry Pi's need
+// both.) x86-64 keeps instruction fetch coherent with stores itself: nothing to flush.
 extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut c_void;
 }
@@ -85,7 +94,7 @@ const MAP_FLAGS: c_int = 0x02 | 0x20; // PRIVATE | ANONYMOUS
 /// Make freshly written code visible to instruction fetch (what `__clear_cache` does on
 /// AArch64): clean the data cache lines to the point of unification, invalidate the instruction
 /// cache lines, then synchronise. Line sizes from CTR_EL0.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
 unsafe fn flush_icache(start: *const u8, len: usize) {
     let ctr: u64;
     core::arch::asm!("mrs {}, ctr_el0", out(reg) ctr, options(nomem, nostack));
@@ -122,8 +131,8 @@ impl CodeCache {
         Some(CodeCache { base: p as *mut u8, size, used: 0 })
     }
 
-    fn write(&mut self, words: &[u32]) -> Option<*const u8> {
-        let bytes = words.len() * 4;
+    fn write(&mut self, code: &[u8]) -> Option<*const u8> {
+        let bytes = code.len();
         if self.used + bytes > self.size {
             return None;
         }
@@ -134,13 +143,14 @@ impl CodeCache {
             #[cfg(target_os = "macos")]
             {
                 pthread_jit_write_protect_np(0);
-                std::ptr::copy_nonoverlapping(words.as_ptr() as *const u8, dst, bytes);
+                std::ptr::copy_nonoverlapping(code.as_ptr(), dst, bytes);
                 pthread_jit_write_protect_np(1);
                 sys_icache_invalidate(dst as *mut c_void, bytes);
             }
             #[cfg(target_os = "linux")]
             {
-                std::ptr::copy_nonoverlapping(words.as_ptr() as *const u8, dst, bytes);
+                std::ptr::copy_nonoverlapping(code.as_ptr(), dst, bytes);
+                #[cfg(target_arch = "aarch64")]
                 flush_icache(dst, bytes);
             }
             self.used += bytes;
@@ -204,9 +214,9 @@ impl Jit {
                     Entry::No
                 } else {
                     match compile::<B>(&ops[..plen], pc0, mem, &mut self.guards, self.profile) {
-                        Some((w, body)) => match self.cache.write(&w) {
-                            // SAFETY: body is a word index inside the code just written
-                            Some(p) => Entry::Code(p, unsafe { p.add(body * 4) }, plen as u32),
+                        Some((code, body)) => match self.cache.write(&code) {
+                            // SAFETY: body is a byte offset inside the code just written
+                            Some(p) => Entry::Code(p, unsafe { p.add(body) }, plen as u32),
                             None => Entry::No,
                         },
                         None => Entry::No,
@@ -340,19 +350,30 @@ extern "C" fn h_ram_ok<B: Bus>(ctx: *mut Ctx, guard: *mut RamGuard) -> u32 {
     valid as u32
 }
 
-// ------------------------------------------------------------------ code generation
+// ------------------------------------------------------------------ code generation (AArch64)
 
+#[cfg(target_arch = "aarch64")]
 const CPU: Reg = 19;
+#[cfg(target_arch = "aarch64")]
 const CTX: Reg = 20;
+#[cfg(target_arch = "aarch64")]
 const RAM: Reg = 21;
+#[cfg(target_arch = "aarch64")]
 const XIP: Reg = 22;
+#[cfg(target_arch = "aarch64")]
 const KEEP: Reg = 23;
+#[cfg(target_arch = "aarch64")]
 const KEEP2: Reg = 24;
+#[cfg(target_arch = "aarch64")]
 const FLAGS: Reg = 25;
+#[cfg(target_arch = "aarch64")]
 const DONE: Reg = 26;
+#[cfg(target_arch = "aarch64")]
 const LIMIT: Reg = 27;
+#[cfg(target_arch = "aarch64")]
 const FRAME: i32 = 96;
 
+#[cfg(target_arch = "aarch64")]
 struct Gen<'a> {
     a: Asm,
     mem: &'a JitMem,
@@ -378,6 +399,7 @@ fn off_pc() -> u32 {
     std::mem::offset_of!(Cpu, pc) as u32
 }
 
+#[cfg(target_arch = "aarch64")]
 fn acond(c: Cond) -> AC {
     match c {
         Cond::Eq => AC::Eq,
@@ -404,6 +426,7 @@ fn acond(c: Cond) -> AC {
     }
 }
 
+#[cfg(target_arch = "aarch64")]
 impl Gen<'_> {
     /// flags for a compare of w(x) with w(y): integer, or as two floats
     fn cmp(&mut self, float: bool, x: Reg, y: Reg) {
@@ -597,8 +620,9 @@ impl Gen<'_> {
     }
 }
 
-/// Native code for a block prefix of plain micro-ops (none careful).
-fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<Box<RamGuard>>, profile: bool) -> Option<(Vec<u32>, usize)> {
+/// Native code for a block prefix of plain micro-ops (none careful), and its body's offset.
+#[cfg(target_arch = "aarch64")]
+fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<Box<RamGuard>>, profile: bool) -> Option<(Vec<u8>, usize)> {
     for o in [off_reg(15), off_sp(), off_rets(), off_pc(), off_hold()] {
         if o >= 16384 {
             return None;
@@ -1090,20 +1114,21 @@ fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<
     g.a.ldp(CPU, CTX, SP, 16);
     g.a.ldp_post(29, 30, SP, FRAME);
     g.a.ret();
-    Some((g.a.finish(), body))
+    Some((g.a.finish().iter().flat_map(|w| w.to_le_bytes()).collect(), body * 4))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::BOp;
+    use crate::{Base, BOp};
     struct Memory { data: Vec<u8>, flags: Vec<u8>, version: u64 }
     impl Memory {
         fn new() -> Self { Self { data: vec![0; 256], flags: vec![1; 65], version: 0 } }
     }
     impl Bus for Memory {
         fn read8(&mut self, a: u32) -> u8 { self.data[a as usize] }
-        fn read16(&mut self, a: u32) -> u16 { u16::from_le_bytes(self.data[a as usize..a as usize+2].try_into().unwrap()) }
+        // (the halfword at a & !1, as the Soc reads one)
+        fn read16(&mut self, a: u32) -> u16 { let a = (a & !1) as usize; u16::from_le_bytes(self.data[a..a + 2].try_into().unwrap()) }
         fn read32(&mut self, a: u32) -> u32 { u32::from_le_bytes(self.data[a as usize..a as usize+4].try_into().unwrap()) }
         fn write8(&mut self, a: u32, v: u8) { self.data[a as usize] = v; self.version += 1; }
         fn write16(&mut self, a: u32, v: u16) { self.data[a as usize..a as usize+2].copy_from_slice(&v.to_le_bytes()); self.version += 1; }
@@ -1176,6 +1201,94 @@ mod tests {
             assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 1) }.0, 1, "{fast:?}");
             assert_eq!((cpu.regs, cpu.sp, cpu.rets, cpu.pc), (expected.regs, expected.sp, expected.rets, expected.pc), "{fast:?}");
             assert_eq!(bus.data, reference.data, "{fast:?}");
+        }
+    }
+
+    /// Every micro-op the compilers emit inline, each alone in a block, from random registers
+    /// (floats among them: NaN, both zeros, infinities, out of the integers' range): compiled
+    /// code and the interpreter must leave the same registers, sp, rets, pc and memory.
+    #[test]
+    fn compiled_ops_match_interpreter_from_random_state() {
+        use crate::{Cond, Op, RmwOp};
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed as u32 };
+        let floats = [0.0f32, -0.0, 1.0, -1.5, 0.5, f32::NAN, -f32::NAN, f32::INFINITY, f32::NEG_INFINITY,
+            2147483648.0, -2147483904.0, 4294967296.0, 3e9, -3e9, 1e-40, 65536.25, f32::MAX, f32::MIN];
+        let ops = [Op::Add, Op::Sub, Op::RSub, Op::Or, Op::Xor, Op::And, Op::AndNot, Op::Mul, Op::Shl, Op::Shr, Op::Sar];
+        let conds = [Cond::Eq, Cond::Ne, Cond::LtU, Cond::GtU, Cond::LeU, Cond::GeU, Cond::LtS, Cond::GtS, Cond::LeS, Cond::GeS,
+            Cond::FEq, Cond::FUne, Cond::FLt, Cond::FUge, Cond::FLe, Cond::FUgt, Cond::FGe, Cond::FUlt, Cond::FGt, Cond::FUle];
+        let rmws = [RmwOp::Mov, RmwOp::Or, RmwOp::And, RmwOp::Xor, RmwOp::Add, RmwOp::Sub];
+        // registers 8..15 hold addresses inside the test RAM (word, halfword, odd)
+        let mut cases = vec![];
+        for &op in &ops {
+            cases.push(Fast::Alu3 { d: 0, a: 1, b: 2, op });
+            cases.push(Fast::Alu3 { d: 1, a: 1, b: 1, op });
+            cases.push(Fast::Alu3I { d: 0, a: 1, v: 0xffff_fff3, op });
+            cases.push(Fast::Alu3I { d: 0, a: 1, v: 33, op });
+            cases.push(Fast::Alu2 { d: 3, b: 2, op });
+            cases.push(Fast::Alu2I { d: 3, v: 7, op });
+            for rk in 0..3 { cases.push(Fast::A4 { d: 4, s: 5, op, rk, rv: if rk == 1 { 0x8000_0001 } else { 6 } }); }
+            cases.push(Fast::MemA4 { b: 8, off: 4, op, rk: 0, rv: 2 });
+        }
+        for &cond in &conds {
+            cases.push(Fast::BrR { a: 1, b: 2, cond, target: 0x40 });
+            cases.push(Fast::BrR { a: 1, b: 1, cond, target: 0x40 });
+            // (compares with an immediate and decrement-branches are integer only, as decoded)
+            if !cond.is_float() {
+                cases.push(Fast::BrI { a: 1, v: 0x8000_0000, cond, target: 0x40 });
+                cases.push(Fast::DecBr { r: 3, cond, v: 5, target: 0x40 });
+            }
+        }
+        for fop in [0u8, 1, 2, 3, 5, 6, 7, 8, 0x1f, 0x5f, 0x8f, 0x9f] { // (the ops fm1-isa decodes)
+            cases.push(Fast::FOp { d: 0, a: 1, b: 2, op: fop });
+            cases.push(Fast::FOp { d: 0, a: 1, b: 1, op: fop });
+        }
+        for kind in 0..4 { cases.push(Fast::MinMax { d: 0, a: 1, b: 2, kind }); }
+        for part in 0..3 { for signed in [false, true] { cases.push(Fast::Ext { d: 0, s: 1, part, signed }); } }
+        for n in [0, 1, 31] { cases.push(Fast::ShlI { d: 0, s: 1, n }); cases.push(Fast::SarI { d: 0, s: 1, n }); }
+        for mk in 0..3 { for ne in [false, true] { cases.push(Fast::BitBr { r: 1, mk, ne, mv: if mk == 1 { 0x10 } else { 2 }, target: 0x40 }); } }
+        for (rk, rv) in [(0, 2), (1, 0x80), (2, 2)] { for fam in [0, 1, 2, 4, 5, 6] { for alt in [false, true] {
+            cases.push(Fast::IfBlk { a: 1, rk, fam, alt, has_else: false, rv, then_d: 6, else_d: 0 });
+        } } }
+        for w in [1u8, 2, 4] { for b in [8u8, 9, 10] { for signed in [false, true] {
+            cases.push(Fast::Ld { d: 0, b: Base::Reg(b), off: 2, w, signed });
+            cases.push(Fast::LdIdx { d: 0, b, i: 11, sh: 1, w, signed });
+            cases.push(Fast::LdPost { d: 0, b, w, signed, inc: 4 });
+            cases.push(Fast::LdPost { d: b, b, w, signed, inc: 4 });
+        }
+            cases.push(Fast::St { s: 1, b: Base::Reg(b), off: 2, w });
+            cases.push(Fast::St { s: 1, b: Base::Sp, off: 4, w });
+            cases.push(Fast::StIdx { s: 1, b, i: 11, sh: 2, w });
+            cases.push(Fast::StPost { s: 1, b, w, inc: 0xffff_fffe });
+            for &op in &rmws { cases.push(Fast::Rmw { b, w, op, off: 1, v: 0x1234_80ff }); }
+        } }
+        let mut jit = Jit::new(false).unwrap();
+        for (j, mut fast) in cases.into_iter().enumerate() {
+            for round in 0..24 {
+                let mut bus = Memory::new(); let mut reference = Memory::new();
+                // (bytes 0..32 stay 0: the block's own code, which its RAM guard checks)
+                for i in 32..256 { let v = rnd() as u8; bus.data[i] = v; reference.data[i] = v; }
+                bus.flags.iter_mut().for_each(|f| *f = 0); // no watched code words
+                let mem = bus.jit_mem().unwrap();
+                let mut cpu = Cpu::new(0);
+                for r in 0..8 {
+                    cpu.regs[r] = match rnd() % 4 { 0 => floats[rnd() as usize % floats.len()].to_bits(), 1 => rnd() % 40, _ => rnd() };
+                }
+                if round % 3 == 0 { cpu.regs[2] = cpu.regs[1]; }
+                cpu.regs[8] = 64 + (rnd() % 32) * 4; cpu.regs[9] = 65 + (rnd() % 32) * 2; cpu.regs[10] = 129 + rnd() % 64;
+                cpu.regs[11] = rnd() % 16;
+                cpu.sp = 192; cpu.rets = 0x0200_1234;
+                if let Fast::DecBr { ref mut v, .. } = fast { *v = cpu.regs[3].wrapping_sub(1); }
+                let mut expected = Cpu::new(0);
+                expected.regs = cpu.regs; expected.sp = cpu.sp; expected.rets = cpu.rets;
+                expected.pc = expected.exec_fast(&mut reference, fast, 2).unwrap_or(2);
+                let code = hot(&mut jit, j * 24 + round, 0, &[op(fast)], &mem);
+                assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 1) }.0, 1, "{fast:?}");
+                let regs = |c: &Cpu| c.regs.map(|r| format!("{r:08x}"));
+                assert_eq!((regs(&cpu), cpu.sp, cpu.rets, cpu.pc), (regs(&expected), expected.sp, expected.rets, expected.pc),
+                    "case {j} round {round}: {fast:?}");
+                assert_eq!(bus.data, reference.data, "case {j} round {round}: {fast:?}");
+            }
         }
     }
 

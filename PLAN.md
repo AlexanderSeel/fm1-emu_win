@@ -736,6 +736,24 @@ audit_decode.py now compares the pre- / post-increment accesses too (`describe`'
 same `decode_inc_mem` routes 18 / 19 run): +7610 compared in the stock app's listing, all agree;
 with route 19's old sext10 put back it reports 135 disagreements in the fuzz listing.
 
+## 5.24 The JIT on x86-64 Linux (2026-10-21)
+
+`jit/x64.rs` compiles the same block prefixes as the AArch64 compiler, op for op, sharing
+everything else in jit.rs (code cache, chaining, the helpers that keep timing exact, the RAM
+guards); `jit_x64.rs` is its encoder (86 encodings checked against LLVM's assembler). System V:
+rbx / rbp / r12..r15 hold Cpu, Ctx, RAM, XIP, the count and the code flags; the limit and the two
+values kept across a helper call live in the frame. Floats in SSE (what Rust's f32 gives on the
+host); conversions to integers saturate as Rust's `as` (cvttss2si alone does not); fmin / fmax
+through the interpreter. One cfg, `native_jit` (fm1-core's build.rs), says where a JIT is built.
+A new test compiles every inline micro-op alone and runs it from random registers (NaN, both
+zeros, infinities, out-of-range floats) against the interpreter: both backends agree. (It found
+two places where the AArch64 code differs from the interpreter, neither decodable: a float
+condition on `BrI`, FPU op 4.)
+Measured on an x86-64 Linux box (Core Ultra 7 155H, Docker capped at 1.5 CPUs): all 49
+firmwares and the stock firmware's audio the same with the JIT and interpreted, and the same as
+on Apple silicon; 2.41x the interpreter (geomean), every firmware faster than real time
+(slowest Doom 1.19x, zp12 1.26x). CI runs the Linux arm64 job's checks on an x86-64 runner too.
+
 ## 6. Phase 5 — Boot & integration
 
 - Boot stock firmware to a stable idle/main-loop state.
