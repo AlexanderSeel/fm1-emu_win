@@ -746,6 +746,8 @@ impl Soc {
                     } else if value & 8 != 0 {
                         self.paused[core] = false;
                         if core == 1 && !self.cpu1_released_once {
+                            // M-VAVE's FM1 Open SDK releases core 1 here (C1_CON |= 8), not at 0x10008
+                            // (once: the stock firmware's IPC resumes core 1 the same way)
                             self.cpu1_released_once = true;
                             self.cpu1_release = true;
                             self.periph.next_due = 0;
