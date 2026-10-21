@@ -175,8 +175,9 @@ cargo run --release -p fm1-live -- --fw felucca         # a window with the synt
 cargo run --release -p fm1-live -- --fwsc FM-1.fwsc     # M-VAVE's own, from its package
 ```
 
-`fm1-live` runs the real 240 MHz clock on Apple silicon Macs and 64-bit ARM Linux, with an
-AArch64 JIT; elsewhere it interprets (`--mhz` lowers the clock if that can't keep up). It plays every MIDI input of the computer (`--midi NAME`, `--midi none`,
+`fm1-live` compiles the firmware to native code on Apple silicon Macs and on Linux (ARM64 and
+x86-64), and runs the real 240 MHz clock with it; elsewhere (Windows, Intel Macs) it interprets
+(`--mhz` lowers the clock if that can't keep up). It plays every MIDI input of the computer (`--midi NAME`, `--midi none`,
 `--midi-ch N`) and loads a DX7 bank into M-VAVE's firmware with `--syx bank.syx`.
 `fm1-emu` is the batch runner for tests and debugging (WAV and screen output, breakpoints,
 memory dumps).

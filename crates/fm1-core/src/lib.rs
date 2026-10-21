@@ -19,16 +19,18 @@ use fm1_isa::{DecodeError, Instruction, SlotKind};
 ///
 /// Width-specific accessors keep MMIO side effects honest: a byte read must
 /// not silently widen into a word read of a peripheral register.
-#[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+#[cfg(native_jit)]
 mod jit;
-#[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(native_jit, target_arch = "aarch64"))]
 mod jit_a64;
-#[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(native_jit, target_arch = "x86_64"))]
+mod jit_x64;
+#[cfg(native_jit)]
 pub use jit::JitMem;
 #[cfg(target_arch = "wasm32")]
 pub mod jit_wasm;
 /// (no JIT on this host: the type exists so buses compile everywhere)
-#[cfg(not(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux"))))]
+#[cfg(not(native_jit))]
 #[derive(Clone, Copy, Debug)]
 pub struct JitMem {
     pub ram: *mut u8,
@@ -195,9 +197,9 @@ pub struct Cpu {
     /// path, the full decode beside them.
     pub icache: Vec<Line>,
     pub icache_x: Vec<Option<LineX>>,
-    /// Compile hot blocks to native code (AArch64 macOS hosts).
+    /// Compile hot blocks to native code (AArch64 macOS / Linux, x86-64 Linux; see jit.rs).
     pub jit_on: bool,
-    #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+    #[cfg(native_jit)]
     jit: Option<Box<jit::Jit>>,
     /// (the wasm32 build: hot blocks as WebAssembly modules, see jit_wasm.rs)
     #[cfg(target_arch = "wasm32")]
@@ -441,7 +443,7 @@ impl Cpu {
                 sync!();
                 return Ok((n, false));
             };
-            #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+            #[cfg(native_jit)]
             if self.jit_on && !careful {
                 if let Some(mem) = jit_mem {
                     if self.jit.is_none() {
@@ -519,7 +521,7 @@ impl Cpu {
                     }
                 }
             }
-            #[cfg(not(any(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")), target_arch = "wasm32")))]
+            #[cfg(not(any(native_jit, target_arch = "wasm32")))]
             let _ = (id, &jit_mem);
             for i in start..start + len {
                 // SAFETY: build_block pushed start..start+len into bops and
@@ -725,7 +727,7 @@ impl Cpu {
     }
 
     /// The compiled body of the block starting at pc, if there is one.
-    #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+    #[cfg(native_jit)]
     fn jit_body_at(&self, pc: u32, ram_tracked: bool) -> Option<*const u8> {
         // RAM bodies validate their own immutable code snapshot before execution.
         if self.bmap.is_empty() || (!ram_tracked && !(0x0200_0000..0x0400_0000).contains(&pc)) {
@@ -752,7 +754,7 @@ impl Cpu {
             #[cfg(target_arch = "wasm32")]
             self.bver.clear();
             self.bmap.iter_mut().for_each(|x| *x = 0);
-            #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+            #[cfg(native_jit)]
             if let Some(j) = self.jit.as_mut() {
                 j.reset();
             }
@@ -4868,8 +4870,8 @@ enum Cond {
 }
 
 impl Cond {
-    /// (only the AArch64 JIT asks)
-    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    /// (only the native JITs ask)
+    #[cfg_attr(not(native_jit), allow(dead_code))]
     fn is_float(self) -> bool {
         matches!(self, Cond::FEq | Cond::FUne | Cond::FLt | Cond::FUge | Cond::FLe | Cond::FUgt
             | Cond::FGe | Cond::FUlt | Cond::FGt | Cond::FUle)
