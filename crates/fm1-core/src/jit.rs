@@ -634,9 +634,9 @@ fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<
         a,
         mem,
         exit,
-        h_read: h_read::<B> as usize as u64,
-        h_write: h_write::<B> as usize as u64,
-        h_op: if profile { h_op::<B, true> as usize as u64 } else { h_op::<B, false> as usize as u64 },
+        h_read: h_read::<B> as *const () as u64,
+        h_write: h_write::<B> as *const () as u64,
+        h_op: if profile { h_op::<B, true> as *const () as u64 } else { h_op::<B, false> as *const () as u64 },
     };
     // prologue (entry from Rust); chained blocks enter at the body
     g.a.stp_pre(29, 30, SP, -FRAME);
@@ -1204,7 +1204,7 @@ mod tests {
         }
     }
 
-    /// Every micro-op the compilers emit inline, each alone in a block, from random registers
+    /// Every micro-op the compilers emit inline (and some through the executor), each alone in a block, from random registers
     /// (floats among them: NaN, both zeros, infinities, out of the integers' range): compiled
     /// code and the interpreter must leave the same registers, sp, rets, pc and memory.
     #[test]
@@ -1262,6 +1262,20 @@ mod tests {
             cases.push(Fast::StPost { s: 1, b, w, inc: 0xffff_fffe });
             for &op in &rmws { cases.push(Fast::Rmw { b, w, op, off: 1, v: 0x1234_80ff }); }
         } }
+        for (p, l) in [(0, 0), (0, 8), (1, 1), (7, 9), (16, 16), (31, 0), (31, 1), (3, 31)] {
+            for signed in [false, true] { cases.push(Fast::BitExt { d: 0, s: 1, p, l, signed }); }
+            cases.push(Fast::BitIns { d: 0, s: 1, p, l });
+        }
+        for n in [0, 3, 4, 7, 15] { cases.push(Fast::PushRets { n }); cases.push(Fast::PopPc { n }); }
+        for half in [false, true] { cases.push(Fast::Tb { r: 8, half }); }
+        for v in [5, 0x8000_0000] { cases.push(Fast::Mov2I { dh: 0, dl: 1, v }); cases.push(Fast::MovI { d: 2, v }); }
+        cases.extend([Fast::Nop, Fast::Mov { d: 0, s: 1 }, Fast::AddRI { d: 0, s: 1, v: 0xffff_fffc },
+            Fast::Mov2 { dh: 0, dl: 1, sh: 1, sl: 2 }, Fast::SpAdd { v: 0xffff_fff0 }, Fast::RFromSp { d: 0, v: 8 },
+            Fast::BrIEq { a: 1, v: 3, target: 0x40 }, Fast::BrINe { a: 1, v: 3, target: 0x40 },
+            Fast::Goto { target: 0x40 }, Fast::Call { target: 0x40 }, Fast::Rts,
+            Fast::LdW { d: 0, b: 8, off: 4 }, Fast::LdWSp { d: 0, off: 8 }, Fast::LdBu { d: 0, b: 10, off: 3 },
+            Fast::StW { s: 1, b: 8, off: 4 }, Fast::StWSp { s: 1, off: 8 },
+            Fast::PopRets, Fast::PushRet, Fast::PopRet]);
         let mut jit = Jit::new(false).unwrap();
         for (j, mut fast) in cases.into_iter().enumerate() {
             for round in 0..24 {
