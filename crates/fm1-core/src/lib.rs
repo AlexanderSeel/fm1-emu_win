@@ -197,7 +197,7 @@ pub struct Cpu {
     /// path, the full decode beside them.
     pub icache: Vec<Line>,
     pub icache_x: Vec<Option<LineX>>,
-    /// Compile hot blocks to native code (AArch64 macOS / Linux, x86-64 Linux; see jit.rs).
+    /// Compile hot blocks to native code (AArch64 macOS / Linux / Android, x86-64 Linux; see jit.rs).
     pub jit_on: bool,
     #[cfg(native_jit)]
     jit: Option<Box<jit::Jit>>,
