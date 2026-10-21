@@ -183,6 +183,9 @@ x86-64), and runs the real 240 MHz clock with it; elsewhere (Windows, Intel Macs
 memory dumps).
 Both take `--flaky-core1 RATE [--seed N]`: the second core misreads RAM now and then, as on
 some units, to test a firmware's fallback to one core ([docs/stock-firmware.md](docs/stock-firmware.md#a-flaky-core-1---flaky-core1-fm1_socflaky)).
+`fm1-live --flash FILE` keeps the flash chip (saved presets, samples) in FILE between runs: read
+at the start if it is there, written back at the end. `FM1_FLASH_CUT=N` cuts the power half way
+through the Nth erase or page program, to see what a firmware makes of a half-written save.
 
 The page builds with `web/build.sh` (Rust to WebAssembly; needs the `wasm32-unknown-unknown`
 target), the whole site with `tools/build_site.sh`.

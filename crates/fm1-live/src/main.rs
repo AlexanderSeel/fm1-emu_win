@@ -194,7 +194,7 @@ impl Machine {
             if f.len() != fm1_soc::FLASH_SIZE {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{path}: not a {} byte flash image", fm1_soc::FLASH_SIZE)));
             }
-            soc.flash.load(&f);
+            soc.restore_flash(&f);
         }
         let skip_log = std::env::var("FM1_SKIP_LOG").ok().map(|_| Default::default());
         let blocks = std::env::var("FM1_NO_BLOCKS").is_err();
@@ -445,7 +445,9 @@ fn save_flash(m: &Machine, path: Option<&String>) {
         println!("flash: {} erases / programs{cut}", f.ops);
     }
     if let Some(path) = path {
-        if let Err(e) = std::fs::write(path, &f.mem) {
+        // (a new file renamed over the old: a run killed mid-save leaves the last save whole)
+        let tmp = format!("{path}.tmp");
+        if let Err(e) = std::fs::write(&tmp, &f.mem).and_then(|_| std::fs::rename(&tmp, path)) {
             eprintln!("{path}: {e}");
         }
     }
@@ -664,7 +666,7 @@ const USAGE: &str = "usage: fm1-live --fwsc FIRMWARE.fwsc   (a firmware package:
        fm1-live --bin XIP.bin [--entry 0x02000120]
 options: [--mhz 240] [--syx BANK.syx] [--midi all|none|NAME] [--midi-ch N] [--bench MS] [--shot MS]
          [--flaky-core1 RATE [--seed N]] [--flash FILE] [--version]
-env: FM1_FLASH_CUT=N cuts the power half way through the Nth flash erase / program (with --flash)";
+env: FM1_FLASH_CUT=N cuts the power half way through the Nth flash erase / program (--flash keeps what is left)";
 
 fn main() {
     if std::env::args().any(|a| a == "--version" || a == "-V") {
