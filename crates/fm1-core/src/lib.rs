@@ -427,7 +427,7 @@ impl Cpu {
             }};
         }
         loop {
-            // the budget is checked per block (a block is at most 32 ops)
+            // (and per op below: the budget holds to the instruction)
             if n >= budget {
                 sync!();
                 return Ok((n, false));
@@ -458,7 +458,7 @@ impl Cpu {
                         let extra = if n == 0 { 0 } else { 1 };
                         sync!();
                         // SAFETY: code was compiled for this bus type and memory map
-                        let (k, slot) = unsafe { jit::run(code, self, bus, &mem, extra, budget.saturating_sub(n).max(len)) };
+                        let (k, slot) = unsafe { jit::run(code, self, bus, &mem, extra, budget - n) };
                         if self.profile { self.jit_entries += 1; self.jit_insns += k as u64; }
                         if k > 0 {
                             n += k;
@@ -503,10 +503,9 @@ impl Cpu {
                     if let Some((code, at)) = code {
                         let extra = if n == 0 { 0 } else { 1 };
                         sync!();
-                        // (the budget as the interpreter keeps it: this block whole, the region's
-                        // next ones while they fit. cpu1's idle probe runs a block at a time to
-                        // find its polling loop's start again; compiled RAM code ran past it)
-                        let cap = budget.saturating_sub(n).max(len);
+                        // (the budget as the interpreter keeps it, to the instruction: each block
+                        // of the region runs only while it fits, else the interpreter goes on)
+                        let cap = budget - n;
                         // SAFETY: code was compiled for this bus type and memory map
                         let k = unsafe { jit_wasm::run(code, at, self, bus, extra, cap) };
                         if self.profile { self.jit_entries += 1; self.jit_insns += k as u64; }
@@ -527,6 +526,16 @@ impl Cpu {
                 // SAFETY: build_block pushed start..start+len into bops and
                 // bops is only cleared together with the block table
                 let op = unsafe { *self.bops.get_unchecked(i as usize) };
+                // the budget, to the instruction: where a call stops does not depend on where
+                // blocks begin, so compiled code (which runs a block only while it fits) and
+                // the interpreter stop at the same one, and cores interleave the same
+                if n >= budget {
+                    if i > start && !careful && unsafe { self.bops.get_unchecked(i as usize - 1) }.glue {
+                        self.hold_irq = 1;
+                    }
+                    sync!();
+                    return Ok((n, false));
+                }
                 if n > 0 && bus.tick() {
                     // this instruction's tick is spent; the caller services
                     // the SoC and then runs it without ticking again
@@ -559,6 +568,22 @@ impl Cpu {
                 }
             }
         }
+    }
+
+    /// How many instructions the block at pc holds up to `stop` (an instruction of it after the
+    /// first, if one starts there) or its end (0: its first one needs `step`): a budget for
+    /// `run_fast` that runs that much, compiled or not, and stops there. (cpu1's idle probe: it
+    /// looks for the way back to where it began, which may lie inside a block.)
+    pub fn block_len_to<B: Bus>(&mut self, bus: &mut B, stop: u32) -> u32 {
+        let Ok(Some((_, start, len))) = self.block_at(bus, self.pc) else { return 0 };
+        let mut at = self.pc;
+        for k in 0..len {
+            if k > 0 && at == stop {
+                return k;
+            }
+            at = at.wrapping_add(self.bops[(start + k) as usize].len as u32);
+        }
+        len
     }
 
     /// The block of micro-ops starting at pc (XIP code only): built on first

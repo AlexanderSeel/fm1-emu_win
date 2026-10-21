@@ -793,6 +793,24 @@ code generator instead). CI runs the core tests (the random-state test of every 
 included) and SID with the JIT against the interpreter on a Windows runner. For issue #21
 (1x real time interpreted on a Core Ultra 7 155H under Windows).
 
+## 5.28 Run budgets to the instruction: the JIT gives the interpreter's output (2026-10-22)
+
+`run_fast` checked its budget per block, so a call ran up to a block past it, and the JITs were
+handed `max(budget left, block length)`: where a call stopped depended on where blocks began, and
+compiled code (which leaves at the end of its prefix, before a careful op) stopped elsewhere than
+the interpreter. Cores interleave and interrupts are taken where calls stop, so on master 10 of 84
+firmwares (Felucca, FMel, Frodhes, Ketch, Melodee, OPN1, X0X, X0XRMX, the stock firmware, FM1 Open)
+played differently with the JIT than interpreted. Now the budget holds to the instruction (checked
+per op; the JITs get exactly what is left, and compiled code runs a block only while it fits), so
+both stop at the same one: all 84 the same, JIT and interpreted. cpu1's idle probe, which ran a
+block per call (budget 1), now runs the block at pc up to where the probe began if that lies inside
+it (`Cpu::block_len_to`): with calls ending mid-block, the place to come back to need not start a
+block, and the probe missed it (NMSFM's core 1 ran 100 M instructions a second instead of 2.4 M).
+Against master: 20 firmwares play with interrupts a few instructions earlier or later (where a
+budget now ends), the same levels (peaks within 2 counts); speed geomean -1.3% JIT, -0.8%
+interpreted (noise). This also unblocks changes that move block boundaries (5.27's review: the
+polling-loop skip without its 4096 cap, untimed peripheral writes).
+
 ## 6. Phase 5 — Boot & integration
 
 - Boot stock firmware to a stable idle/main-loop state.
