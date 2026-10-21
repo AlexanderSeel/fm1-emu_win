@@ -157,9 +157,14 @@ pub struct Soc {
     /// the updater gives every firmware: April OS keeps its samples at flash 0x74000, read
     /// through XIP 0x02070000, and waits at boot until it finds them or a blank chip's 0xff).
     pub xip_flash: bool,
-    /// cpu0 set 0x10008 bit 3 (core 1's release); latched until the runner starts cpu1, as
-    /// firmwares hold the bit only while they wait for core 1 to report in.
+    /// cpu0 released core 1: 0x10008 bit 3 (the stock firmware), or the first `|= 8` (run) on
+    /// core 1's CON register 0x1EEE004 (M-VAVE's FM1 Open, after the newer AC79 SDK); latched
+    /// until the runner starts cpu1, as firmwares hold the bit only while they wait for core 1
+    /// to report in.
     pub cpu1_release: bool,
+    /// core 1 was released once: a later run on 0x1EEE004 is the stock IPC's resume after a
+    /// pause, not a release.
+    cpu1_released_once: bool,
     /// FM1_AUDIO_TRACE: log each audio half-buffer (debugging the DMA's pace).
     audio_trace: bool,
     /// The CRC-16 unit's register (0x13504).
@@ -222,6 +227,7 @@ impl Soc {
             crc: 0,
             rand: 0x9e37_79b9_7f4a_7c15,
             cpu1_release: false,
+            cpu1_released_once: false,
             audio_trace: std::env::var_os("FM1_AUDIO_TRACE").is_some(),
             xip_flash: true,
             gpio_writes: std::env::var("FM1_GPIO_TRACE").ok().map(|_| Default::default()),
@@ -739,6 +745,13 @@ impl Soc {
                         self.paused[core] = true;
                     } else if value & 8 != 0 {
                         self.paused[core] = false;
+                        if core == 1 && !self.cpu1_released_once {
+                            // M-VAVE's FM1 Open SDK releases core 1 here (C1_CON |= 8), not at 0x10008
+                            // (once: the stock firmware's IPC resumes core 1 the same way)
+                            self.cpu1_released_once = true;
+                            self.cpu1_release = true;
+                            self.periph.next_due = 0;
+                        }
                     }
                     self.sfr_set(addr, value & !0x14);
                 } else {
@@ -776,6 +789,7 @@ impl Soc {
             }
             Region::Clk => {
                 if addr == 0x10008 && value & 8 != 0 && self.sfr_get(addr) & 8 == 0 {
+                    self.cpu1_released_once = true;
                     self.cpu1_release = true;
                     self.periph.next_due = 0; // the runner looks at it before the next instruction
                 }
