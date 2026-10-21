@@ -736,6 +736,36 @@ audit_decode.py now compares the pre- / post-increment accesses too (`describe`'
 same `decode_inc_mem` routes 18 / 19 run): +7610 compared in the stock app's listing, all agree;
 with route 19's old sext10 put back it reports 135 disagreements in the fuzz listing.
 
+## 5.23 The Hub's old packages go away (2026-10-20)
+
+A user reported firmwares failing with 404: the Hub removes a firmware's old package when a
+new version comes, so 18 of web/firmwares.json's 47 Hub packages (written 2026-10-16) were gone.
+`fetchPackage` (web/fwsc.js) now asks the Hub's catalog.json (once) for an entry with `hub`
+whose package has gone, and fetches the one listed now. The list is rebuilt from the Hub: 73
+entries, 71 community, 24 new. Each was booted 8 s in fm1-live (a note on the panel and over
+MIDI, then PLAY): all but five play or draw their screen. Left out (SKIP in hub_catalog.mjs):
+Melodee 1.4.5 (black screen, interrupts off; 1.3.6 ran), OberVave 1.5.3, 386DX, MC-1 and Shine
+On (each halts on a decode not known yet: `64 e8 5f bc`, `64 f0 00 ae`, `64 f0 00 0e`,
+`64 e8 5f b9` ...).
+
+## 5.24 The JIT on x86-64 Linux (2026-10-21)
+
+`jit/x64.rs` compiles the same block prefixes as the AArch64 compiler, op for op, sharing
+everything else in jit.rs (code cache, chaining, the helpers that keep timing exact, the RAM
+guards); `jit_x64.rs` is its encoder (86 encodings checked against LLVM's assembler). System V:
+rbx / rbp / r12..r15 hold Cpu, Ctx, RAM, XIP, the count and the code flags; the limit and the two
+values kept across a helper call live in the frame. Floats in SSE (what Rust's f32 gives on the
+host); conversions to integers saturate as Rust's `as` (cvttss2si alone does not); fmin / fmax
+through the interpreter. One cfg, `native_jit` (fm1-core's build.rs), says where a JIT is built.
+A new test compiles every inline micro-op alone and runs it from random registers (NaN, both
+zeros, infinities, out-of-range floats) against the interpreter: both backends agree. (It found
+two places where the AArch64 code differs from the interpreter, neither decodable: a float
+condition on `BrI`, FPU op 4.)
+Measured on an x86-64 Linux box (Core Ultra 7 155H, Docker capped at 1.5 CPUs): all 49
+firmwares and the stock firmware's audio the same with the JIT and interpreted, and the same as
+on Apple silicon; 2.41x the interpreter (geomean), every firmware faster than real time
+(slowest Doom 1.19x, zp12 1.26x). CI runs the Linux arm64 job's checks on an x86-64 runner too.
+
 ## 6. Phase 5 — Boot & integration
 
 - Boot stock firmware to a stable idle/main-loop state.

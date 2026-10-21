@@ -1,6 +1,7 @@
 // The FM-1 page's catalog (web/firmwares.json) from the FM-1 Firmware Hub's (thefirmwarehub.com,
 // zvenson's): every firmware it lists that runs here, its package fetched from the Hub (whose
-// packages never change under their name, sent with Access-Control-Allow-Origin: *), then our
+// packages never change under their name, sent with Access-Control-Allow-Origin: *; an old one is
+// removed when a new version comes, and web/fwsc.js then asks the Hub's catalog), then our
 // own list, web/firmwares-own.json (hand-edited: FM-1 SID, M-VAVE's own, ... the firmwares the Hub
 // does not list). For a firmware the Hub lists, what is ours is kept (the page's description, the
 // licence, the installer link; from our own list, else from the last web/firmwares.json) and the
@@ -15,7 +16,14 @@ const OWN = new URL("../web/firmwares-own.json", import.meta.url);
 // our ids where the Hub's differ (the page takes either in ?fw=; see ourId for the rest)
 const OURS = { salt: "felucca-salt", floyd: "sloop-floyd", sloopbanks: "sloop-banks" };
 // listed on the Hub, not run here yet
-const SKIP = { bubba: "boots to a black screen, no sound" };
+const SKIP = {
+  bubba: "boots to a black screen, no sound",
+  melodee: "1.4.5 boots to a black screen, interrupts off (1.3.6 ran)",
+  obervave: "1.5.3 halts on an instruction not decoded yet, 64 e8 5f bc .. (1.3.1 ran)",
+  "386dx": "halts on an instruction not decoded yet, 64 f0 00 ae ..",
+  mc1: "halts on an instruction not decoded yet, 64 f0 00 0e ..",
+  shineon: "halts on an instruction not decoded yet, 64 e8 5f b9 ..",
+};
 // first in the list (the page's default first), then by id
 const FIRST = ["mvave", "felucca", "felucca-salt"];
 

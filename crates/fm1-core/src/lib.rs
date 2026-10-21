@@ -19,16 +19,18 @@ use fm1_isa::{DecodeError, Instruction, SlotKind};
 ///
 /// Width-specific accessors keep MMIO side effects honest: a byte read must
 /// not silently widen into a word read of a peripheral register.
-#[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+#[cfg(native_jit)]
 mod jit;
-#[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(native_jit, target_arch = "aarch64"))]
 mod jit_a64;
-#[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(native_jit, target_arch = "x86_64"))]
+mod jit_x64;
+#[cfg(native_jit)]
 pub use jit::JitMem;
 #[cfg(target_arch = "wasm32")]
 pub mod jit_wasm;
 /// (no JIT on this host: the type exists so buses compile everywhere)
-#[cfg(not(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux"))))]
+#[cfg(not(native_jit))]
 #[derive(Clone, Copy, Debug)]
 pub struct JitMem {
     pub ram: *mut u8,
@@ -195,9 +197,9 @@ pub struct Cpu {
     /// path, the full decode beside them.
     pub icache: Vec<Line>,
     pub icache_x: Vec<Option<LineX>>,
-    /// Compile hot blocks to native code (AArch64 macOS hosts).
+    /// Compile hot blocks to native code (AArch64 macOS / Linux, x86-64 Linux; see jit.rs).
     pub jit_on: bool,
-    #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+    #[cfg(native_jit)]
     jit: Option<Box<jit::Jit>>,
     /// (the wasm32 build: hot blocks as WebAssembly modules, see jit_wasm.rs)
     #[cfg(target_arch = "wasm32")]
@@ -441,7 +443,7 @@ impl Cpu {
                 sync!();
                 return Ok((n, false));
             };
-            #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+            #[cfg(native_jit)]
             if self.jit_on && !careful {
                 if let Some(mem) = jit_mem {
                     if self.jit.is_none() {
@@ -519,7 +521,7 @@ impl Cpu {
                     }
                 }
             }
-            #[cfg(not(any(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")), target_arch = "wasm32")))]
+            #[cfg(not(any(native_jit, target_arch = "wasm32")))]
             let _ = (id, &jit_mem);
             for i in start..start + len {
                 // SAFETY: build_block pushed start..start+len into bops and
@@ -725,7 +727,7 @@ impl Cpu {
     }
 
     /// The compiled body of the block starting at pc, if there is one.
-    #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+    #[cfg(native_jit)]
     fn jit_body_at(&self, pc: u32, ram_tracked: bool) -> Option<*const u8> {
         // RAM bodies validate their own immutable code snapshot before execution.
         if self.bmap.is_empty() || (!ram_tracked && !(0x0200_0000..0x0400_0000).contains(&pc)) {
@@ -752,7 +754,7 @@ impl Cpu {
             #[cfg(target_arch = "wasm32")]
             self.bver.clear();
             self.bmap.iter_mut().for_each(|x| *x = 0);
-            #[cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "linux")))]
+            #[cfg(native_jit)]
             if let Some(j) = self.jit.as_mut() {
                 j.reset();
             }
@@ -1887,7 +1889,8 @@ impl Cpu {
         // ---- everything else ------------------------------------------------
         let sh = |x: u32, n: u32, kind: &str| -> u32 {
             match kind {
-                "<<" | "<<<" => if n >= 32 { 0 } else { x << n },
+                "<<" => if n >= 32 { 0 } else { x << n },
+                "<<<" => qasl(x, n),
                 ">>" => if n >= 32 { 0 } else { x >> n },
                 _ => if n >= 32 { ((x as i32) >> 31) as u32 } else { ((x as i32) >> n) as u32 },
             }
@@ -1970,12 +1973,20 @@ impl Cpu {
             | "R = R << R" | "R = R >> R" | "R = R >>> R" => {
                 let d = r(self, 0)?;
                 let a = self.regs[r(self, 1)?];
-                let n = if s.ends_with('R') { self.regs[r(self, 2)?] & 31 } else { v(self, 2)? };
+                // an immediate count is 1..32, 32 encoded as 0 (the vendor assembler's range;
+                // `c0 e1 d0 40` is r4 = r13 << 32, work/probe/mm.S)
+                let n = if s.ends_with('R') { self.regs[r(self, 2)?] & 31 } else { match v(self, 2)? { 0 => 32, n => n } };
                 // the operator starts at index 6 of "R = R << #i"; index 8 was
                 // the space, which made every 4-byte `rX = rY << n` an
                 // arithmetic right shift (Felucca's Huffman LUT came out empty)
                 let kind = s[6..].split(' ').next().unwrap_or("<<");
                 self.regs[d] = sh(a, n, kind);
+            }
+            // `SD 1a` with bit 3: rD <<<= rS, d = bits(0,2), s = bits(4,7) (the `<<=` layout; the
+            // vendor assembler, work/probe/fam.S)
+            "R <<<= R" if insn.entry.len == 2 => {
+                let (d, src) = ((insn.raw & 7) as usize, ((insn.raw >> 4) & 0xf) as usize);
+                self.regs[d] = qasl(self.regs[d], self.regs[src] & 31);
             }
             "R = -R" => { let d = r(self, 0)?; self.regs[d] = self.regs[r(self, 1)?].wrapping_neg(); }
             "R = ~R" => { let d = r(self, 0)?; self.regs[d] = !self.regs[r(self, 1)?]; }
@@ -2337,7 +2348,7 @@ impl Cpu {
                 };
             }
             27 if insn.entry.len == 4 => self.exec_raw(bus, RAW_POP_RETS_MASK, insn.raw as u32),
-            16 | 18 | 19 | 21 | 22 | 27 | 32 => self.exec_raw(bus, pre.route as u8, insn.raw as u32),
+            16 | 18 | 19 | 21 | 22 | 27 | 32 | 39 | 40 | 41 => self.exec_raw(bus, pre.route as u8, insn.raw as u32),
             17 =>
             {
                 // 4-byte offset loads/stores `R = [rB+#i]` / `[rB+#i] = R` with
@@ -2678,10 +2689,47 @@ impl Cpu {
                 //            clang's `acc - (u64)a * b`, probes/mul64.c)
                 //   `f6 e1`: rP = rQ / rB (u|s) — q = bits(21,23), b = bits(24,27),
                 //            pair = bits(29,31), signed = bit28
+                //   `de e1`: rD = rQ >> n (s|u), the pair shifted and saturated into one
+                //            register — d = bits(28,31), q = bits(21,23), n = bits(16,19) |
+                //            bits(24,25)<<4, signed = bit27 (vendor assembler, work/probe/dsp.S;
+                //            FM1 Open's mixers: `r3 = r7_r6 >> 29 (s)`)
+                //   `df e1`: the same by a register — q = bits(21,23), r = bits(24,27),
+                //            signed = bit16 (`__builtin_pi32v2_shfms64(x, n)`)
+                //   `d4 e1`: rP <>= n, a 64-bit rotate right, n as `d0`'s; `dc e1`: by
+                //            r[bits(24,27)] (the compiler's `(x >> n) | (x << (64 - n))`)
                                 let p = ((raw >> 29) & 7) as usize;
                 let (hi, lo) = (2 * p + 1, 2 * p);
                 let signed = (raw >> 28) & 1 != 0;
                 match raw & 0xff {
+                    0xd4 | 0xdc => {
+                        let n = if raw & 0xff == 0xdc { self.regs[((raw >> 24) & 0xf) as usize] & 63 }
+                            else { (((raw >> 16) & 0xf) | (((raw >> 24) & 3) << 4)) as u32 };
+                        let y = ((self.regs[hi] as u64) << 32 | self.regs[lo] as u64).rotate_right(n);
+                        self.regs[lo] = y as u32;
+                        self.regs[hi] = (y >> 32) as u32;
+                    }
+                    0xdf => {
+                        let q = ((raw >> 21) & 7) as usize;
+                        let x = (self.regs[2 * q + 1] as u64) << 32 | self.regs[2 * q] as u64;
+                        let n = self.regs[((raw >> 24) & 0xf) as usize] & 63;
+                        self.regs[((raw >> 28) & 0xf) as usize] = if raw & 0x1_0000 != 0 {
+                            ((x as i64) >> n).clamp(i32::MIN as i64, i32::MAX as i64) as u32
+                        } else {
+                            (x >> n).min(u32::MAX as u64) as u32
+                        };
+                    }
+                    0xde => {
+                        // saturated: the vendor clang never picks it for a plain C truncation
+                        // (it shifts the pair, work/probe/pairx.c), only DSP assembly uses it
+                        let q = ((raw >> 21) & 7) as usize;
+                        let x = (self.regs[2 * q + 1] as u64) << 32 | self.regs[2 * q] as u64;
+                        let n = ((raw >> 16) & 0xf) | (((raw >> 24) & 3) << 4);
+                        self.regs[((raw >> 28) & 0xf) as usize] = if raw & 0x0800_0000 != 0 {
+                            ((x as i64) >> n).clamp(i32::MIN as i64, i32::MAX as i64) as u32
+                        } else {
+                            (x >> n).min(u32::MAX as u64) as u32
+                        };
+                    }
                     0xd0 | 0xd8 => {
                         let by_reg = raw & 0xff == 0xd8;
                         let n = if by_reg { self.regs[((raw >> 24) & 0xf) as usize] & 63 }
@@ -2720,9 +2768,12 @@ impl Cpu {
                 }
             }
             22 => {
-                // `R = rev8(R)` (70 e0): d = bits(28,31), src = bits(24,27)
-                                let d = ((raw >> 28) & 0xf) as usize;
-                self.regs[d] = self.regs[((raw >> 24) & 0xf) as usize].swap_bytes();
+                // `R = rev8(R)` (70 e0 00): d = bits(28,31), src = bits(24,27); `70 e0 80`:
+                // rD = revs(rS.l), the low half's bytes swapped and sign-extended (the vendor
+                // compiler's `(short)__builtin_bswap16(x)`, work/probe/sem.c)
+                let d = ((raw >> 28) & 0xf) as usize;
+                let x = self.regs[((raw >> 24) & 0xf) as usize];
+                self.regs[d] = if raw & 0x80_0000 != 0 { (x as u16).swap_bytes() as i16 as i32 as u32 } else { x.swap_bytes() };
             }
             27 => {
                 // `{rets, rN..rB} = [sp++]` (3n 04): like the pc pops but the
@@ -2734,6 +2785,37 @@ impl Cpu {
                 }
                 self.rets = bus.read32(self.sp);
                 self.sp = self.sp.wrapping_add(4);
+            }
+            41 => {
+                let (d, a, b) = (((raw >> 28) & 0xf) as usize, ((raw >> 20) & 0xf) as usize, ((raw >> 24) & 0xf) as usize);
+                self.regs[d] = match dsp_raw(raw as u64).unwrap() {
+                    Dsp::QaslImm => qasl(self.regs[a], match (((raw >> 16) & 0xf) | ((raw >> 24) & 1) << 4) as u32 { 0 => 32, n => n }),
+                    Dsp::QaslReg => qasl(self.regs[a], self.regs[b] & 31),
+                    Dsp::Cls => {
+                        let x = self.regs[b];
+                        (if (x as i32) < 0 { !x } else { x }).leading_zeros() - 1
+                    }
+                    Dsp::MinMax => {
+                        let (x, y) = (self.regs[a], self.regs[b]);
+                        match (raw & 1 != 0, (raw >> 16) & 1 != 0) {
+                            (false, true) => (x as i32).max(y as i32) as u32,
+                            (false, false) => x.max(y),
+                            (true, true) => (x as i32).min(y as i32) as u32,
+                            (true, false) => x.min(y),
+                        }
+                    }
+                    Dsp::BrevAdd => (self.regs[d].reverse_bits().wrapping_add(self.regs[b].reverse_bits())).reverse_bits(),
+                };
+            }
+            39 => {
+                // `39 e4|f4 AO DB`: rD = rA +|- rB (ssat), subtract with bit 19
+                let (a, b) = (self.regs[((raw >> 20) & 0xf) as usize] as i32, self.regs[((raw >> 24) & 0xf) as usize] as i32);
+                self.regs[((raw >> 28) & 0xf) as usize] = if raw & 0x8_0000 != 0 { a.saturating_sub(b) } else { a.saturating_add(b) } as u32;
+            }
+            40 => {
+                // `20 e0 II DN`: byte N (bits 26,27) of rD (bits 28,31) = II
+                let (d, k) = (((raw >> 28) & 0xf) as usize, 8 * ((raw >> 26) & 3) as u32);
+                self.regs[d] = self.regs[d] & !(0xff << k) | (((raw >> 16) & 0xff) as u32) << k;
             }
             RAW_POP_RETS_MASK => {
                 // `d1 e8 <mask>`: {rets, registers of mask} = [sp++], the registers from
@@ -2832,6 +2914,12 @@ fn decode_any(win: u64, pc: u32) -> Result<fm1_isa::Instruction, fm1_isa::Decode
         // `r_mov_b_sp_u`'s register slot, solved from r0, r1, r2 and r12 alone, swapped bits 30
         // and 31 (`r4 = b[sp]` loaded r8; tools/fuzz_decode.py against the vendor objdump)
         None if sp_mem_raw(win).is_some() => Ok(fm1_isa::Instruction { addr: pc, raw: win & 0xffff_ffff, entry: &SP_LOAD_CRAW }),
+        // `64 e0 00|80 XY`, the special-register moves, before the table too: its `sp = R` class,
+        // fitted on r0, r1, r6 and r7, swapped bits 1 and 2 of the register (`sp = r5` set sp from
+        // r3: M-VAVE's FM1 Open moved its stack up over its own frame) and knew no r8..r15
+        None if let Some(entry) = sreg_move_raw(win) => Ok(fm1_isa::Instruction { addr: pc, raw: win & 0xffff_ffff, entry }),
+        // the DSP forms (see pre_table_raw), before the table too
+        None if let Some(entry) = pre_table_raw(win & 0xffff_ffff) => Ok(fm1_isa::Instruction { addr: pc, raw: win & 0xffff_ffff, entry }),
         None => fm1_isa::decode_win_cached(win, pc),
     };
     let raw = |entry| Ok(fm1_isa::Instruction { addr: pc, raw: win & 0xffff_ffff, entry });
@@ -2915,9 +3003,119 @@ fn decode_any(win: u64, pc: u32) -> Result<fm1_isa::Instruction, fm1_isa::Decode
         Err(_) if (win >> 8) & 0xff == 0xff && (win & 0xff) >> 4 == 4 && (win >> 16) & 0xff == 0 => {
             Ok(fm1_isa::Instruction { addr: pc, raw: win & 0xffff_ffff_ffff, entry: &CMP_RR_BRANCH6_CRAW })
         }
+        // `c4 e1 SN DM` / `c4 f1` (a dual-issue pair's head), bit 27 clear: rD = rS <> n, the
+        // field layout `R = R <> #i` already executes from; the classes fit only the corpus
+        // registers (FM1 Open's sha256 `r6 = r7 <> 19`). Bit 27 set is `<c>`, through carry.
+        Err(_) if matches!(win & 0xffff, 0xe1c4 | 0xf1c4) && win & 0x0e00_0000 == 0 => {
+            raw(if win & 0xffff == 0xf1c4 { &ROT_PAIR_CRAW } else { &ROT_CRAW })
+        }
         Err(e) => Err(e),
     }
 }
+
+/// The DSP forms whose layouts the vendor assembler fixed for every register (work/probe/dsp.S,
+/// fam.S, mm.S), the ones FM1 Open's engine and the compiler's `__builtin_pi32v2_*` produce.
+/// Decoded before the table: its classes for them fit only the corpus registers, or decode
+/// them with no semantics (`r_add_r_brev`, `r_b2_mov_i`, `r_mov_r1_r0_lsr_i_u`, which caught
+/// the dual-issue `f0` / `f1` heads); tools/sem_check.py runs them against objdump's text.
+/// byte1 `f0` / `f1` / `f4`: a dual-issue pair's head (`#`).
+fn pre_table_raw(raw: u64) -> Option<&'static fm1_isa::IsaEntry> {
+    let head = matches!((raw >> 8) & 0xff, 0xf0 | 0xf1 | 0xf4);
+    let b1 = if head { (raw >> 8) & 0xff ^ 0x10 } else { (raw >> 8) & 0xff };
+    let pick = |plain, pair| Some(if head { pair } else { plain });
+    match (raw & 0xff, b1) {
+        // `39 e4 AO DB`: rD = rA + rB / rA - rB (ssat), the subtract with bit 19 (route 39;
+        // FM1 Open's mixers saturate r5 + r3)
+        (0x39, 0xe4) => pick(&SSAT_CRAW, &SSAT_PAIR_CRAW),
+        // the 64-bit pair forms (route 21): `de` rD = rQ >> n (s|u) and `df` by a register (bits
+        // 20 and 26 / 17..19 clear), `d4` rP <>= n (bits 26..28 clear), `dc` rP <>= rN (bits
+        // 16..23 clear)
+        (0xde, 0xe1) if raw & 0x0410_0000 == 0 => pick(&PAIR_OP_RAW, &PAIR_OP_PAIR_RAW),
+        (0xdf, 0xe1) if raw & 0x001e_0000 == 0 => pick(&PAIR_OP_RAW, &PAIR_OP_PAIR_RAW),
+        (0xd4, 0xe1) if raw & 0x1cf0_0000 == 0 => pick(&PAIR_OP_RAW, &PAIR_OP_PAIR_RAW),
+        (0xdc, 0xe1) if raw & 0x10ff_0000 == 0 => pick(&PAIR_OP_RAW, &PAIR_OP_PAIR_RAW),
+        // `20 e0 II DN`: rD.bN = #i, a byte of rD replaced (route 40; FM1 Open's `r14.b3 = 208`)
+        (0x20, 0xe0) if (raw >> 24) & 3 == 0 => pick(&BYTE_SET_CRAW, &BYTE_SET_PAIR_CRAW),
+        // `70 e0 80 DS`: rD = revs(rS.l) (route 22)
+        (0x70, 0xe0) if (raw >> 16) & 0xff == 0x80 => pick(&REV8_CRAW, &REV8_PAIR_CRAW),
+        // `78..7b e0 0S DS`: rD = sat16(rS) (route 34)
+        (0x78..=0x7b, 0xe0) if (raw >> 16) & 0xfe == 0 => pick(&SAT16_CRAW, &SAT16_PAIR_CRAW),
+        _ if dsp_raw(raw).is_some() => pick(&DSP_CRAW, &DSP_PAIR_CRAW),
+        _ => None,
+    }
+}
+
+/// The forms the vendor compiler's builtins produce that no corpus firmware showed (work/probe/bi,
+/// fitted with the assembler, work/probe/fam.S); route 41. d = bits(28,31) throughout.
+#[derive(Clone, Copy, Debug)]
+enum Dsp {
+    /// `c0 e1 SN DM`, op bits(25,27) = 2: rD = rS <<< n, n = bits(16,19) | bit24 << 4 (the
+    /// `<<` / `>>` / `>>>` classes' layout; `__builtin_pi32v2_qasl`)
+    QaslImm,
+    /// `c8 e1 A1 DB`: rD = rA <<< rB (sub-op 1 of the `<<` / `>>` / `>>>` by-register forms)
+    QaslReg,
+    /// `80 e1 01 DS`: rD = cls(rS), the leading bits equal to the sign, the sign not counted
+    /// (as `clrsb`; `__builtin_pi32v2_cls`; the `clz` row's op 1)
+    Cls,
+    /// `34 e4 AX DB` / `35 e4`: rD = max / min(rA, rB), X = 1 signed, 0 unsigned (smax, umax, smin,
+    /// umin; the classes fit only the corpus registers)
+    MinMax,
+    /// `b0 e0 00 DS`: rD += rS (brev), an add whose carry runs from bit 31 down to bit 0 (FFT
+    /// addressing; `__builtin_pi32v2_brevadd`)
+    BrevAdd,
+}
+fn dsp_raw(raw: u64) -> Option<Dsp> {
+    let pair = matches!((raw >> 8) & 0xff, 0xf0 | 0xf1 | 0xf4);
+    let b1 = if pair { (raw >> 8) & 0xff ^ 0x10 } else { (raw >> 8) & 0xff };
+    match (raw & 0xff, b1) {
+        (0xc0, 0xe1) if (raw >> 25) & 7 == 2 => Some(Dsp::QaslImm),
+        (0xc8, 0xe1) if (raw >> 16) & 0xf == 1 => Some(Dsp::QaslReg),
+        (0x80, 0xe1) if (raw >> 16) & 0xff == 1 => Some(Dsp::Cls),
+        (0xb0, 0xe0) if (raw >> 16) & 0xff == 0 => Some(Dsp::BrevAdd),
+        (0x34 | 0x35, 0xe4) if (raw >> 17) & 7 == 0 => Some(Dsp::MinMax),
+        _ => None,
+    }
+}
+static DSP_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "dsp_craw", syntax: "R = dsp(R, R) (raw)", len: 4, count: 0, mask: 0, match_: 0,
+    group: "alu", alt: &[], samples: &[], slots: &[],
+};
+static DSP_PAIR_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "dsp_craw", syntax: "R = dsp(R, R) (raw)  #", len: 4, count: 0, mask: 0, match_: 0,
+    group: "alu", alt: &[], samples: &[], slots: &[],
+};
+static SSAT_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "ssat_craw", syntax: "R = R +|- R (ssat)", len: 4, count: 0, mask: 0, match_: 0,
+    group: "alu", alt: &[], samples: &[], slots: &[],
+};
+static SSAT_PAIR_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "ssat_craw", syntax: "R = R +|- R (ssat)  #", len: 4, count: 0, mask: 0, match_: 0,
+    group: "alu", alt: &[], samples: &[], slots: &[],
+};
+static ROT_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "rot_craw", syntax: "R = R <> #i", len: 4, count: 0, mask: 0, match_: 0,
+    group: "alu", alt: &[], samples: &[], slots: &[],
+};
+static ROT_PAIR_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "rot_pair_craw", syntax: "R = R <> #i  #", len: 4, count: 0, mask: 0, match_: 0,
+    group: "alu", alt: &[], samples: &[], slots: &[],
+};
+static SAT16_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "sat16_craw", syntax: "R = sat16(R) (raw)", len: 4, count: 0, mask: 0, match_: 0,
+    group: "alu", alt: &[], samples: &[], slots: &[],
+};
+static SAT16_PAIR_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "sat16_craw", syntax: "R = sat16(R) (raw)  #", len: 4, count: 0, mask: 0, match_: 0,
+    group: "alu", alt: &[], samples: &[], slots: &[],
+};
+static BYTE_SET_PAIR_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "byte_set_craw", syntax: "R.b# = #i (raw)  #", len: 4, count: 0, mask: 0, match_: 0,
+    group: "alu", alt: &[], samples: &[], slots: &[],
+};
+static BYTE_SET_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
+    name: "byte_set_craw", syntax: "R.b# = #i (raw)", len: 4, count: 0, mask: 0, match_: 0,
+    group: "alu", alt: &[], samples: &[], slots: &[],
+};
 
 /// `dc` `[++rB=rI]` / `de` `[rB++=rI]` loads and stores (byte1 ec word, ed half, ee byte):
 /// data = bits(28,31), base = bits(20,23), index = bits(24,27); bits(16,19): bit16 store,
@@ -3285,6 +3483,8 @@ fn decode_alu4(raw: u64) -> Option<Alu4> {
                 (0x90, 0) | (0x94, 0) => Op::Or,
                 (0x90, 1) | (0x94, 1) => Op::Xor,
                 (0x90, 2) | (0x94, 2) => Op::And,
+                // `94 e1 A3 DB`: rD = rA & ~(1 << rB) (FM1 Open's groove capture)
+                (0x94, 3) => Op::AndNot,
                 (0xf0, 0) => Op::Mul,
                 (0xc8, 0) => Op::Shl,
                 (0xc8, 2) => Op::Shr,
@@ -3734,6 +3934,21 @@ mod tests {
         let mut cpu = Cpu::new(0);
         let slot = cpu.fetch_at(&mut FlatRam::new(mem), 0).unwrap();
         assert!(!cpu.icache[slot].careful, "flags replaced before the reader");
+    }
+
+    #[test]
+    fn and_not_takes_a_register_above_r7() {
+        // `64 e8 5f bc` [r11+92] &= ~r12 (OberVave 1.5.3, at every key release): the table's
+        // register field was three bits wide, so r12 didn't decode
+        let mut mem = vec![0u8; 0x200];
+        mem[..4].copy_from_slice(&[0x64, 0xe8, 0x5f, 0xbc]);
+        mem[0x15c..0x160].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+        let mut ram = FlatRam::new(mem);
+        let mut cpu = Cpu::new(0);
+        cpu.regs[11] = 0x100;
+        cpu.regs[12] = 0x0000_ff00;
+        cpu.step(&mut ram).unwrap();
+        assert_eq!(ram.read32(0x15c), 0xffff_00ff, "[r11+92] &= ~r12");
     }
 
     #[test]
@@ -4212,6 +4427,82 @@ mod tests {
         (cpu, ram)
     }
 
+    /// One instruction with chosen registers (the rest as `run1` sets them).
+    fn run_regs(bytes: &[u8], regs: &[(usize, u32)]) -> Cpu {
+        let mut mem = vec![0u8; 0x4000];
+        mem[..bytes.len()].copy_from_slice(bytes);
+        let mut ram = FlatRam::new(mem);
+        let mut cpu = Cpu::new(0);
+        for (n, r) in cpu.regs.iter_mut().enumerate() {
+            *r = 0x1000 + 0x100 * n as u32;
+        }
+        for &(r, v) in regs {
+            cpu.regs[r] = v;
+        }
+        cpu.sp = 0x2000;
+        cpu.step(&mut ram).unwrap();
+        cpu
+    }
+
+    #[test]
+    fn dsp_encodings() {
+        // FM1 Open's engine (libfm1_engine.a); the encodings from the vendor assembler
+        // (work/probe/dsp.S). `de e1 6d 39` r3 = r7_r6 >> 29 (s): shifted, then saturated
+        assert_eq!(run_regs(&[0xde, 0xe1, 0x6d, 0x39], &[(7, 1), (6, 0)]).regs[3], 8);
+        assert_eq!(run_regs(&[0xde, 0xe1, 0x6d, 0x39], &[(7, 0x4000_0000), (6, 0)]).regs[3], i32::MAX as u32);
+        assert_eq!(run_regs(&[0xde, 0xe1, 0x6d, 0x39], &[(7, 0xffff_ffff), (6, 0xe000_0000)]).regs[3], u32::MAX);
+        assert_eq!(run_regs(&[0xde, 0xe1, 0x6d, 0x39], &[(7, 0x8000_0000), (6, 0)]).regs[3], i32::MIN as u32);
+        // `de e1 01 02` r0 = r1_r0 >> 33 (u)
+        assert_eq!(run_regs(&[0xde, 0xe1, 0x01, 0x02], &[(1, 0xffff_fffe), (0, 5)]).regs[0], 0x7fff_ffff);
+        // `d4 f1 05 eb` r15_r14 <c>= #i (a carry rotate, bit 27) is not the plain pair rotate: it halts
+        let mut ram = FlatRam::new([0xd4, 0xf1, 0x05, 0xeb].iter().copied().chain([0; 0x3ffc]).collect());
+        assert!(Cpu::new(0).step(&mut ram).is_err());
+        // `39 e4 20 13` r1 = r2 + r3 (ssat), `39 e4 28 13` r1 = r2 - r3 (ssat)
+        assert_eq!(run_regs(&[0x39, 0xe4, 0x20, 0x13], &[(2, 0x7fff_fff0), (3, 0x100)]).regs[1], 0x7fff_ffff);
+        assert_eq!(run_regs(&[0x39, 0xe4, 0x20, 0x13], &[(2, 5), (3, -7i32 as u32)]).regs[1], -2i32 as u32);
+        assert_eq!(run_regs(&[0x39, 0xe4, 0x28, 0x13], &[(2, 0x8000_0010), (3, 0x100)]).regs[1], 0x8000_0000);
+        // `39 e4 e0 f9` r15 = r14 + r9 (ssat)
+        assert_eq!(run_regs(&[0x39, 0xe4, 0xe0, 0xf9], &[(14, 3), (9, 4)]).regs[15], 7);
+        // `c4 e1 73 61` r6 = r7 <> 19, `c4 e1 af 91` r9 = r10 <> 31
+        assert_eq!(run_regs(&[0xc4, 0xe1, 0x73, 0x61], &[(7, 0x0008_0001)]).regs[6], 0x0008_0001u32.rotate_right(19));
+        assert_eq!(run_regs(&[0xc4, 0xe1, 0xaf, 0x91], &[(10, 1)]).regs[9], 2);
+        // `78 e0 01 35` r3 = sat16(r5) (s), `78 e0 00 35` (u)
+        assert_eq!(run_regs(&[0x78, 0xe0, 0x01, 0x35], &[(5, 0x12345)]).regs[3], 32767);
+        assert_eq!(run_regs(&[0x78, 0xe0, 0x00, 0x35], &[(5, -5i32 as u32)]).regs[3], 0);
+        // `20 e0 d0 ec` r14.b3 = 208, `20 e0 ff 24` r2.b1 = 255
+        assert_eq!(run_regs(&[0x20, 0xe0, 0xd0, 0xec], &[(14, 0x1234_5678)]).regs[14], 0xd034_5678);
+        assert_eq!(run_regs(&[0x20, 0xe0, 0xff, 0x24], &[(2, 0x1234_5678)]).regs[2], 0x1234_ff78);
+        // `94 e1 13 16` r1 = r1 & ~(1 << r6)
+        assert_eq!(run_regs(&[0x94, 0xe1, 0x13, 0x16], &[(1, 0xff), (6, 3)]).regs[1], 0xf7);
+    }
+
+    #[test]
+    fn builtin_encodings() {
+        // what the vendor compiler's `__builtin_pi32v2_*` produce (work/probe/bi, fam.S)
+        // `<<<` saturates (qasl): `08 a1` r0 = r0 <<< 1, `18 1a` r0 <<<= r1, `c0 e1 a9 14` r1 =
+        // r10 <<< 9, `c8 e1 11 1a` r1 = r1 <<< r10
+        assert_eq!(run_regs(&[0x08, 0xa1], &[(0, 0x7fff_ffff)]).regs[0], 0x7fff_ffff);
+        assert_eq!(run_regs(&[0x08, 0xa1], &[(0, 0x3000_0000)]).regs[0], 0x6000_0000);
+        assert_eq!(run_regs(&[0x18, 0x1a], &[(0, -3i32 as u32), (1, 31)]).regs[0], 0x8000_0000);
+        assert_eq!(run_regs(&[0xc0, 0xe1, 0xa9, 0x14], &[(10, 0x0040_0000)]).regs[1], 0x7fff_ffff);
+        assert_eq!(run_regs(&[0xc0, 0xe1, 0xa9, 0x14], &[(10, 3)]).regs[1], 3 << 9);
+        assert_eq!(run_regs(&[0xc8, 0xe1, 0x11, 0x1a], &[(1, -1i32 as u32), (10, 4)]).regs[1], -16i32 as u32);
+        // `70 e0 80 14` r1 = revs(r4.l)
+        assert_eq!(run_regs(&[0x70, 0xe0, 0x80, 0x14], &[(4, 0x1234_0080)]).regs[1], 0xffff_8000);
+        // `d4 e1 01 41` r5_r4 <>= 17, `dc e1 00 43` r5_r4 <>= r3
+        let c = run_regs(&[0xd4, 0xe1, 0x01, 0x41], &[(5, 0), (4, 1)]);
+        assert_eq!((c.regs[5], c.regs[4]), (0x8000, 0));
+        let c = run_regs(&[0xdc, 0xe1, 0x00, 0x43], &[(5, 0), (4, 1), (3, 33)]);
+        assert_eq!((c.regs[5], c.regs[4]), (0, 0x8000_0000));
+        // `df e1 c1 95` r9 = r13_r12 >> r5 (s), `df e1 20 05` r0 = r3_r2 >> r5 (u)
+        assert_eq!(run_regs(&[0xdf, 0xe1, 0xc1, 0x95], &[(13, 0xffff_fff0), (12, 0), (5, 4)]).regs[9], 0x8000_0000);
+        assert_eq!(run_regs(&[0xdf, 0xe1, 0x20, 0x05], &[(3, 1), (2, 0x10), (5, 4)]).regs[0], 0x1000_0001);
+        // `80 e1 01 14` r1 = cls(r4), `b0 e0 00 14` r1 += r4 (brev)
+        assert_eq!(run_regs(&[0x80, 0xe1, 0x01, 0x14], &[(4, 0xffff_00ff)]).regs[1], 15);
+        assert_eq!(run_regs(&[0x80, 0xe1, 0x01, 0x14], &[(4, 1)]).regs[1], 30);
+        assert_eq!(run_regs(&[0xb0, 0xe0, 0x00, 0x14], &[(1, 0x8000_0000), (4, 0x8000_0000)]).regs[1], 0x4000_0000);
+    }
+
     #[test]
     fn vendor_encodings() {
         // `dc ec cc bc` r11 = [r12++=-820] (the corpus's: dc's bit 2 is the increment's sign)
@@ -4513,6 +4804,10 @@ fn route_of(insn: &Instruction, alu4: &Option<Alu4>, bittest: &Option<BitTest>) 
             _ if insn.entry.len == 4 && matches!((insn.raw >> 8) & 0xff, 0xe1 | 0xf1)
                 && matches!(insn.raw & 0xff, 0xd0 | 0xd8 | 0xf8 | 0xfc | 0xfe | 0xf6)
                 && insn.entry.syntax.starts_with('r') && has(insn.entry.syntax, "_r") => 21,
+            // the 64-bit pair forms `d4` / `dc` / `de` / `df` only as `pre_table_raw` vets them: the
+            // table's entries on those bytes include the carry rotates (`r15_r14 <c>= #i`, bit 27),
+            // which stay unsupported
+            "pair_op_raw" => 21,
             _ if insn.entry.len == 4 && (insn.raw & 0xffff) == 0xe070 || (insn.raw & 0xffff) == 0xf070 => 22,
             "testset_b_r" | "testset_r" => 23,
             "ifeq_goto_i" | "ifne_goto_i" => 24,
@@ -4528,6 +4823,9 @@ fn route_of(insn: &Instruction, alu4: &Option<Alu4>, bittest: &Option<BitTest>) 
             "clz_pair_craw" => 36,
             "sp_load_craw" => 37,
             "mov2_craw" => 38,
+            "ssat_craw" => 39,
+            "dsp_craw" => 41,
+            "byte_set_craw" => 40,
             "rep_i_r" | "rep_i_i" => 29,
             n if n.starts_with("fpu_") => ROUTE_FPU,
             _ => ROUTE_SYNTAX,
@@ -4572,8 +4870,8 @@ enum Cond {
 }
 
 impl Cond {
-    /// (only the AArch64 JIT asks)
-    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    /// (only the native JITs ask)
+    #[cfg_attr(not(native_jit), allow(dead_code))]
     fn is_float(self) -> bool {
         matches!(self, Cond::FEq | Cond::FUne | Cond::FLt | Cond::FUge | Cond::FLe | Cond::FUgt
             | Cond::FGe | Cond::FUlt | Cond::FGt | Cond::FUle)
@@ -4780,7 +5078,7 @@ fn fast_raw(route: u16, insn: &Instruction, alu4: &Option<Alu4>, bittest: &Optio
         2 => Some(Fast::Nop),
         // (the arms read bits below 32 only; route 21's table-less form carries the whole window)
         27 if insn.entry.len == 4 => Some(Fast::Raw { route: RAW_POP_RETS_MASK, raw: raw as u32 }),
-        16 | 18 | 19 | 21 | 22 | 27 | 32 => Some(Fast::Raw { route: route as u8, raw: raw as u32 }),
+        16 | 18 | 19 | 21 | 22 | 27 | 32 | 39 | 40 | 41 => Some(Fast::Raw { route: route as u8, raw: raw as u32 }),
         26 if insn.entry.len == 4 => Some(Fast::PushMask { mask: ((raw >> 16) & 0xffff) as u16 }),
         28 if insn.entry.len == 4 => Some(Fast::PopMask { mask: ((raw >> 16) & 0xffff) as u16 }),
         35 => {
@@ -5070,10 +5368,23 @@ fn half_mem(raw: u64) -> Option<HalfMem> {
     })
 }
 
+/// `<<<`, the vendor compiler's `__builtin_pi32v2_qasl`: a shift left that saturates to the
+/// signed 32-bit range (plain C `x << n` compiles to `<<`; work/probe/sem.c)
+fn qasl(x: u32, n: u32) -> u32 {
+    let x = x as i32 as i64;
+    if x == 0 {
+        0
+    } else if n >= 32 {
+        if x < 0 { i32::MIN as u32 } else { i32::MAX as u32 }
+    } else {
+        (x << n).clamp(i32::MIN as i64, i32::MAX as i64) as u32
+    }
+}
+
 /// `78..7b e0 0S DS`: rD = sat16(rS), S 1 signed (s), 0 unsigned (u); byte 0's low bits do not
 /// change it (all 22 corpus samples). (d, s, signed).
 fn sat16_raw(raw: u64) -> Option<(u8, u8, bool)> {
-    if (raw >> 8) & 0xff != 0xe0 || raw & 0xfc != 0x78 || (raw >> 16) & 0xfe != 0 {
+    if !matches!((raw >> 8) & 0xff, 0xe0 | 0xf0) || raw & 0xfc != 0x78 || (raw >> 16) & 0xfe != 0 {
         return None;
     }
     Some((((raw >> 28) & 0xf) as u8, ((raw >> 24) & 0xf) as u8, (raw >> 16) & 1 != 0))
@@ -5156,7 +5467,7 @@ fn fast_of(insn: &Instruction, s: &'static str) -> Option<Fast> {
         "R = icfg" => return Some(Fast::IcfgRd { d: r(0)? }),
         "icfg = R" => return Some(Fast::IcfgWr { s: r(0)? }),
         // arithmetic shift by an immediate below 32 (exec_syntax fills larger counts with the sign)
-        "R = R >>> #i" if insn.entry.len == 4 && v(2).map_or(false, |n| n < 32) => {
+        "R = R >>> #i" if insn.entry.len == 4 && v(2).map_or(false, |n| (1..32).contains(&n)) => {
             return Some(Fast::SarI { d: r(0)?, s: r(1)?, n: v(2)? as u8 });
         }
         _ if insn.entry.len == 4 && (insn.raw >> 8) & 0xff == 0xeb
@@ -5286,7 +5597,7 @@ fn fast_of(insn: &Instruction, s: &'static str) -> Option<Fast> {
         "R = R << R" | "R = R >> R" | "R = R >>> R" => {
             Some(Fast::A4 { d: r(0)?, s: r(1)?, op: shift_op(&s[6..])?, rk: 0, rv: r(2)? as u32 })
         }
-        "R = R << #i" | "R = R >> #i" if v(2)? < 32 => Some(Fast::A4 { d: r(0)?, s: r(1)?, op: shift_op(&s[6..])?, rk: 1, rv: v(2)? }),
+        "R = R << #i" | "R = R >> #i" if (1..32).contains(&v(2)?) => Some(Fast::A4 { d: r(0)?, s: r(1)?, op: shift_op(&s[6..])?, rk: 1, rv: v(2)? }),
         "R = ~R" => Some(Fast::Un { d: r(0)?, s: r(1)?, k: 0 }),
         "R = -R" => Some(Fast::Un { d: r(0)?, s: r(1)?, k: 1 }),
         "R = abs(R)" => Some(Fast::Un { d: r(0)?, s: r(1)?, k: 2 }),

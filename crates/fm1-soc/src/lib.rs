@@ -30,6 +30,7 @@ pub mod flaky;
 pub mod fwsc;
 mod lcd;
 pub mod machine;
+pub mod p33;
 pub mod periph;
 mod ram;
 pub mod smk;
@@ -73,6 +74,8 @@ enum Region {
     Uart1,
     Adc,
     Ana,
+    /// The power domain's register port (p33.rs).
+    P33,
     Bt,
     Spi2,
     Crc,
@@ -157,9 +160,14 @@ pub struct Soc {
     /// the updater gives every firmware: April OS keeps its samples at flash 0x74000, read
     /// through XIP 0x02070000, and waits at boot until it finds them or a blank chip's 0xff).
     pub xip_flash: bool,
-    /// cpu0 set 0x10008 bit 3 (core 1's release); latched until the runner starts cpu1, as
-    /// firmwares hold the bit only while they wait for core 1 to report in.
+    /// cpu0 released core 1: 0x10008 bit 3 (the stock firmware), or the first `|= 8` (run) on
+    /// core 1's CON register 0x1EEE004 (M-VAVE's FM1 Open, after the newer AC79 SDK); latched
+    /// until the runner starts cpu1, as firmwares hold the bit only while they wait for core 1
+    /// to report in.
     pub cpu1_release: bool,
+    /// core 1 was released once: a later run on 0x1EEE004 is the stock IPC's resume after a
+    /// pause, not a release.
+    cpu1_released_once: bool,
     /// FM1_AUDIO_TRACE: log each audio half-buffer (debugging the DMA's pace).
     audio_trace: bool,
     /// The CRC-16 unit's register (0x13504).
@@ -173,6 +181,8 @@ pub struct Soc {
     unknown_log: Vec<UnknownAccess>,
     /// `--flaky-core1`: core 1's RAM loads misread now and then (flaky.rs); None = a good unit.
     pub flaky_core1: Option<flaky::FlakyCore1>,
+    /// The power domain's analog registers.
+    pub p33: p33::P33,
 }
 
 fn dbg_line(addr: u32) -> &'static str {
@@ -222,11 +232,13 @@ impl Soc {
             crc: 0,
             rand: 0x9e37_79b9_7f4a_7c15,
             cpu1_release: false,
+            cpu1_released_once: false,
             audio_trace: std::env::var_os("FM1_AUDIO_TRACE").is_some(),
             xip_flash: true,
             gpio_writes: std::env::var("FM1_GPIO_TRACE").ok().map(|_| Default::default()),
             unknown_log: Vec::new(),
             flaky_core1: None,
+            p33: Default::default(),
         }
     }
 
@@ -351,6 +363,7 @@ impl Soc {
             0x13500..=0x1350f => Region::Crc,
             0x13b00..=0x13b07 => Region::Rand,
             0x11900..=0x119ff => Region::Ana,
+            0x13e08..=0x13e0f => Region::P33,
             0x20000..=0x2ffff => Region::Bt,
             0x1eee240..=0x1eee24f => Region::Dbg,
             _ => Region::Unknown,
@@ -697,6 +710,7 @@ impl Soc {
                 self.rand = x;
                 (if addr == 0x13b00 { x } else { x >> 32 }) as u32
             }
+            Region::P33 => self.p33.read(addr),
             Region::Unknown => {
                 self.log_unknown(addr, 4, false, 0);
                 0
@@ -739,6 +753,13 @@ impl Soc {
                         self.paused[core] = true;
                     } else if value & 8 != 0 {
                         self.paused[core] = false;
+                        if core == 1 && !self.cpu1_released_once {
+                            // M-VAVE's FM1 Open SDK releases core 1 here (C1_CON |= 8), not at 0x10008
+                            // (once: the stock firmware's IPC resumes core 1 the same way)
+                            self.cpu1_released_once = true;
+                            self.cpu1_release = true;
+                            self.periph.next_due = 0;
+                        }
                     }
                     self.sfr_set(addr, value & !0x14);
                 } else {
@@ -769,6 +790,7 @@ impl Soc {
             }
             Region::Iomap => self.sfr_set(addr, value),
             Region::Ana => self.sfr_set(addr, value),
+            Region::P33 => self.p33.write(addr, value),
             Region::Bt => {
                 if addr == 0x2fc44 {
                     self.bt_window = value;
@@ -776,6 +798,7 @@ impl Soc {
             }
             Region::Clk => {
                 if addr == 0x10008 && value & 8 != 0 && self.sfr_get(addr) & 8 == 0 {
+                    self.cpu1_released_once = true;
                     self.cpu1_release = true;
                     self.periph.next_due = 0; // the runner looks at it before the next instruction
                 }
