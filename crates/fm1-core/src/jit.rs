@@ -27,7 +27,9 @@ use crate::jit_a64::{Asm, Cond as AC, Label, Reg, SP};
 #[cfg(target_arch = "aarch64")]
 use crate::{Base, Cond, Op, RmwOp};
 use crate::{Bus, Cpu, Fast};
-use std::ffi::{c_int, c_void};
+#[cfg(not(windows))]
+use std::ffi::c_int;
+use std::ffi::c_void;
 
 #[cfg(target_arch = "x86_64")]
 mod x64;
@@ -78,10 +80,21 @@ const _: () = assert!(std::mem::offset_of!(Ctx, slot) == OFF_SLOT as usize);
 // missing flush would seldom show: the tests cannot prove it. Tested on Apple silicon's cores and
 // a Tensor G2's (Cortex-X1, A78, A55), which need the instruction side, CTR_EL0.DIC = 0, but not
 // the data side, IDC = 1; older Cortex-A cores such as a Raspberry Pi 4's need both.) x86-64
-// keeps instruction fetch coherent with stores itself: nothing to flush.
+// keeps instruction fetch coherent with stores itself: nothing to flush. Windows: VirtualAlloc's
+// read-write-execute pages (after luginf's fork, issue #3), W^X given up as on Linux.
+#[cfg(not(windows))]
 extern "C" {
     fn mmap(addr: *mut c_void, len: usize, prot: c_int, flags: c_int, fd: c_int, off: i64) -> *mut c_void;
 }
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn VirtualAlloc(addr: *mut c_void, len: usize, alloc_type: u32, protect: u32) -> *mut c_void;
+}
+#[cfg(windows)]
+const MEM_COMMIT_RESERVE: u32 = 0x1000 | 0x2000;
+#[cfg(windows)]
+const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 #[cfg(target_os = "macos")]
 extern "C" {
     fn pthread_jit_write_protect_np(enabled: c_int);
@@ -125,7 +138,11 @@ pub struct CodeCache {
 impl CodeCache {
     pub fn new(size: usize) -> Option<CodeCache> {
         // SAFETY: anonymous mapping chosen by the OS; failure is checked.
+        #[cfg(not(windows))]
         let p = unsafe { mmap(std::ptr::null_mut(), size, 7, MAP_FLAGS, -1, 0) };
+        // SAFETY: fresh pages chosen by the OS; failure (null) is checked.
+        #[cfg(windows)]
+        let p = unsafe { VirtualAlloc(std::ptr::null_mut(), size, MEM_COMMIT_RESERVE, PAGE_EXECUTE_READWRITE) };
         if p as isize == -1 || p.is_null() {
             return None;
         }
@@ -154,6 +171,8 @@ impl CodeCache {
                 #[cfg(target_arch = "aarch64")]
                 flush_icache(dst, bytes);
             }
+            #[cfg(windows)]
+            std::ptr::copy_nonoverlapping(code.as_ptr(), dst, bytes);
             self.used += bytes;
             Some(dst as *const u8)
         }
@@ -256,7 +275,7 @@ pub(crate) unsafe fn run<B: Bus>(code: *const u8, cpu: &mut Cpu, bus: &mut B, me
     // instructions this call may run: their ticks ((k - 1) + extra) must all fit tick_room
     let limit = (bus.tick_room() + 1).saturating_sub(extra as u64).min(1 << 30).min(cap as u64) as u32;
     let mut ctx = Ctx { cpu: cpu as *mut Cpu, bus: bus as *mut B as *mut (), extra, synced: 0, brk: 0, _pad: 0, slot: std::ptr::null_mut(), code_version: bus.code_writes() };
-    let f: extern "C" fn(*mut Cpu, *mut Ctx, *mut u8, *const u8, u32, *const u8) -> u32 = unsafe { std::mem::transmute(code) };
+    let f: CodeFn = unsafe { std::mem::transmute(code) };
     let k = f(cpu as *mut Cpu, &mut ctx, mem.ram, mem.xip, limit, mem.ram_code);
     if k > 0 {
         // the ticks of the instructions run, less those the helpers applied already
@@ -270,6 +289,22 @@ pub(crate) unsafe fn run<B: Bus>(code: *const u8, cpu: &mut Cpu, bus: &mut B, me
 
 // ------------------------------------------------------------------ helpers called from generated code
 
+// The generated code's calling convention, for its entry and the helpers it calls: the host's C
+// one, except on x86-64, where it is System V everywhere (on Windows too, so jit/x64.rs has one
+// register plan; Rust saves what Win64 would want kept around the call into it).
+#[cfg(target_arch = "x86_64")]
+type CodeFn = extern "sysv64" fn(*mut Cpu, *mut Ctx, *mut u8, *const u8, u32, *const u8) -> u32;
+#[cfg(not(target_arch = "x86_64"))]
+type CodeFn = extern "C" fn(*mut Cpu, *mut Ctx, *mut u8, *const u8, u32, *const u8) -> u32;
+macro_rules! code_abi {
+    ($(#[$m:meta])* fn $($rest:tt)*) => {
+        #[cfg(target_arch = "x86_64")]
+        $(#[$m])* extern "sysv64" fn $($rest)*
+        #[cfg(not(target_arch = "x86_64"))]
+        $(#[$m])* extern "C" fn $($rest)*
+    };
+}
+
 unsafe fn sync<B: Bus>(ctx: &mut Ctx, bus: &mut B, idx: u32) {
     let need = idx + ctx.extra;
     if need > ctx.synced {
@@ -278,7 +313,8 @@ unsafe fn sync<B: Bus>(ctx: &mut Ctx, bus: &mut B, idx: u32) {
     }
 }
 
-extern "C" fn h_read<B: Bus>(ctx: *mut Ctx, addr: u32, idx: u32, w: u32) -> u32 {
+code_abi! {
+fn h_read<B: Bus>(ctx: *mut Ctx, addr: u32, idx: u32, w: u32) -> u32 {
     // SAFETY: ctx is the live context `run` passed in; the bus pointer is the caller's &mut B.
     let ctx = unsafe { &mut *ctx };
     let bus = unsafe { &mut *(ctx.bus as *mut B) };
@@ -293,8 +329,10 @@ extern "C" fn h_read<B: Bus>(ctx: *mut Ctx, addr: u32, idx: u32, w: u32) -> u32 
     }
     v
 }
+}
 
-extern "C" fn h_write<B: Bus>(ctx: *mut Ctx, addr: u32, v: u32, idx: u32, w: u32) {
+code_abi! {
+fn h_write<B: Bus>(ctx: *mut Ctx, addr: u32, v: u32, idx: u32, w: u32) {
     // SAFETY: as h_read.
     let ctx = unsafe { &mut *ctx };
     let bus = unsafe { &mut *(ctx.bus as *mut B) };
@@ -308,11 +346,13 @@ extern "C" fn h_write<B: Bus>(ctx: *mut Ctx, addr: u32, v: u32, idx: u32, w: u32
         ctx.brk = 1;
     }
 }
+}
 
-/// Any op through the interpreter's own executor: bit 32 = jumped (target in the low word).
 // PROF: count the call (`Cpu::jit_helpers`); chosen when compiling, so code compiled without
 // profiling pays nothing for it
-extern "C" fn h_op<B: Bus, const PROF: bool>(ctx: *mut Ctx, op: *const Fast, idx: u32, next_pc: u32) -> u64 {
+code_abi! {
+/// Any op through the interpreter's own executor: bit 32 = jumped (target in the low word).
+fn h_op<B: Bus, const PROF: bool>(ctx: *mut Ctx, op: *const Fast, idx: u32, next_pc: u32) -> u64 {
     // SAFETY: as h_read; `op` points at a leaked, immutable Fast.
     let ctx = unsafe { &mut *ctx };
     let bus = unsafe { &mut *(ctx.bus as *mut B) };
@@ -330,6 +370,7 @@ extern "C" fn h_op<B: Bus, const PROF: bool>(ctx: *mut Ctx, op: *const Fast, idx
         None => 0,
     }
 }
+}
 
 // Each RAM body owns an immutable snapshot. Even an old incoming chain remains safe
 // after its block has been rebuilt: it must validate the code it actually executes.
@@ -339,7 +380,8 @@ struct RamGuard {
     version: Option<u64>,
 }
 
-extern "C" fn h_ram_ok<B: Bus>(ctx: *mut Ctx, guard: *mut RamGuard) -> u32 {
+code_abi! {
+fn h_ram_ok<B: Bus>(ctx: *mut Ctx, guard: *mut RamGuard) -> u32 {
     let ctx = unsafe { &mut *ctx };
     let bus = unsafe { &mut *(ctx.bus as *mut B) };
     let guard = unsafe { &mut *guard };
@@ -349,6 +391,7 @@ extern "C" fn h_ram_ok<B: Bus>(ctx: *mut Ctx, guard: *mut RamGuard) -> u32 {
         .is_some_and(|now| now.len() >= guard.bytes.len() && now[..guard.bytes.len()] == *guard.bytes);
     if valid { guard.version = version; }
     valid as u32
+}
 }
 
 // ------------------------------------------------------------------ code generation (AArch64)

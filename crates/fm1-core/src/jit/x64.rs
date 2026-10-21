@@ -1,5 +1,6 @@
 //! x86-64 code for a block prefix: the AArch64 compiler's plan (jit.rs) op for op, with the
-//! System V calling convention (Linux).
+//! System V calling convention (Linux, and Windows too: jit.rs declares the entry and the helpers
+//! `extern "sysv64"`).
 //!
 //! Register plan (callee-saved, so helpers may be called freely):
 //!   rbx = &Cpu, rbp = &Ctx, r12 = RAM host base, r13 = XIP host base, r14d = instructions done

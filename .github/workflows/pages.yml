@@ -131,6 +131,30 @@ jobs:
           # (the JIT ran: well over the interpreter's speed)
           awk '/ms emulated/ { for (i = 1; i <= NF; i++) if ($i ~ /x$/ && $(i+1) == "real") print $i + 0 }' jit.txt int.txt | paste -sd' ' - | awk 'NF == 2 { ok = $1 > 1.5 * $2 } END { exit !ok }'
 
+  # The x86-64 JIT on Windows (System V code, VirtualAlloc): the same checks.
+  windows-x86_64:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Core tests
+        run: cargo test --release -p fm1-isa -p fm1-core -p fm1-soc
+
+      - name: JIT against the interpreter
+        run: |
+          cargo build --release -p fm1-live
+          pkg=fm1-sid/web/sidplayer.fwsc
+          FM1_BENCH_WAV=jit.raw target/release/fm1-live --fwsc $pkg --bench 4000 | tee jit.txt
+          FM1_NO_JIT=1 FM1_BENCH_WAV=int.raw target/release/fm1-live --fwsc $pkg --bench 4000 | tee int.txt
+          n=$(stat -c %s jit.raw int.raw | sort -n | head -1)
+          test "$n" -gt 100000
+          cmp -n "$n" jit.raw int.raw
+          # (the JIT ran: well over the interpreter's speed)
+          awk '/ms emulated/ { for (i = 1; i <= NF; i++) if ($i ~ /x$/ && $(i+1) == "real") print $i + 0 }' jit.txt int.txt | paste -sd' ' - | awk 'NF == 2 { ok = $1 > 1.5 * $2 } END { exit !ok }'
+
   deploy:
     if: github.event_name != 'pull_request'
     needs: build
