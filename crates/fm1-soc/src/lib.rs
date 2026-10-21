@@ -212,6 +212,22 @@ impl Soc {
         }
     }
 
+    /// A saved flash chip in place of the booted one (fm1-live --flash): each 4 KiB sector that
+    /// differs goes to the chip and, as the firmware's own erases and programs do, through to
+    /// the XIP window (whose installed copy would otherwise still show the package's bytes).
+    pub fn restore_flash(&mut self, image: &[u8]) {
+        let n = image.len().min(spiflash::FLASH_SIZE);
+        for at in (0..n).step_by(4096) {
+            let end = (at + 4096).min(n);
+            if self.flash.mem[at..end] != image[at..end] {
+                self.flash.mem[at..end].copy_from_slice(&image[at..end]);
+                self.flash.changed = Some((at, end));
+                self.sync_xip();
+                self.flash.revision = self.flash.revision.wrapping_add(1);
+            }
+        }
+    }
+
     /// `ram_size` in bytes; `xip` = the app binary mapped at XIP_BASE.
     pub fn new(ram_size: usize, xip: Vec<u8>) -> Self {
         Self {
@@ -946,5 +962,41 @@ mod tests {
         assert_eq!(soc.read32(0x0207_1000), 0xaaaa_aaaa, "the next sector as installed");
         assert_eq!(soc.flash.revision, 2, "erase and program persist even after XIP consumes changed");
         assert!(!soc.flash.busy());
+    }
+
+    #[test]
+    fn a_restored_flash_shows_through_xip() {
+        // the installed window (xip) holds 0xaa; the saved chip has new bytes at 0x74000 (in the
+        // window) and 0xf0000 (past it): both reach the chip, the first also the window
+        let mut soc = Soc::new(1 << 16, vec![0xaa; 0x80000]);
+        soc.xip_flash = true;
+        let mut image = soc.flash.mem.clone();
+        image[0x74000..0x74004].copy_from_slice(&[0x46, 0x53, 0x4d, 0x36]);
+        image[0xf0000] = 0x12;
+        let rev = soc.flash.revision;
+        soc.restore_flash(&image);
+        assert_eq!(soc.flash.mem, image);
+        assert_eq!(soc.read32(XIP_BASE + (0x74000 - XIP_FLASH_OFFSET) as u32), 0x364d_5346);
+        assert_eq!(soc.read32(XIP_BASE + (0x75000 - XIP_FLASH_OFFSET) as u32), 0xaaaa_aaaa, "an unchanged sector keeps the installed bytes");
+        assert_eq!(soc.flash.revision, rev.wrapping_add(2));
+    }
+
+    #[test]
+    fn a_power_cut_stops_half_way_through_an_op() {
+        // cut at op 2 (the page program): erased, two of the four bytes programmed, then nothing
+        let mut soc = Soc::new(1 << 16, vec![0xaa; 0x80000]);
+        soc.flash.cut_at = Some(2);
+        for cmd in [&[0x06][..], &[0x20, 0x07, 0x40, 0x00], &[0x06], &[0x02, 0x07, 0x40, 0x00, 0x12, 0x34, 0x56, 0x78],
+                    &[0x06], &[0x20, 0x07, 0x50, 0x00]] {
+            soc.write32(0x500c0, 0);
+            for &b in cmd {
+                soc.write32(spiflash::SPI0_BASE + 8, b as u32);
+            }
+            soc.write32(0x500c0, 1);
+        }
+        assert_eq!(soc.read32(0x0207_0000), 0xffff_3412, "the first half of the page program");
+        assert_eq!(soc.read32(0x0207_1000), 0xaaaa_aaaa, "the erase after the cut never happened");
+        assert_eq!(soc.flash.ops, 3);
+        assert!(soc.flash.cut());
     }
 }

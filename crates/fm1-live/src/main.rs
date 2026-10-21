@@ -3,6 +3,7 @@
 //!   fm1-live [--bin work/felucca_xip.bin] [--entry 0x02000120] [--mhz 240]
 //!   fm1-live --bench 3000          # headless: how fast does it run?
 //!   fm1-live --fwsc FM-1.fwsc [--syx bank.syx]   # M-VAVE's stock firmware, from its package
+//!   fm1-live ... --flash unit.bin  # the flash chip from this file (if it is there), back to it at the end
 //!
 //! The emulator runs on its own thread, paced to the wall clock: its
 //! emulated time stays a little ahead of real time and the I2S output is
@@ -65,6 +66,9 @@ struct Opts {
     flaky_core1: Option<f64>,
     /// its generator's seed (default 1)
     seed: Option<u64>,
+    /// --flash FILE: the flash chip's contents from FILE at the start (if it exists; after the
+    /// package is installed), written back to it at the end (bench, shot, or the window closed)
+    flash: Option<String>,
 }
 
 /// The firmware catalog web/firmwares.json as (id, name, version, image path): each image is
@@ -91,7 +95,7 @@ fn parse() -> Option<Opts> {
     let a: Vec<String> = std::env::args().collect();
     let mut o = Opts { bin: "work/felucca_xip.bin".into(), entry: 0x0200_0120, mhz: 240, bench: None, shot: None,
                        name: "Felucca".into(), fwsc: None, syx: None, midi: "all".into(), midi_ch: 0,
-                       flaky_core1: None, seed: None };
+                       flaky_core1: None, seed: None, flash: None };
     let mut i = 1;
     while i < a.len() {
         match a[i].as_str() {
@@ -129,6 +133,7 @@ fn parse() -> Option<Opts> {
             "--shot" => o.shot = Some(a.get(i + 1)?.parse().ok()?),
             "--flaky-core1" => o.flaky_core1 = Some(a.get(i + 1)?.parse::<f64>().ok().filter(|r| (0.0..=1.0).contains(r))?),
             "--seed" => o.seed = Some(a.get(i + 1)?.parse().ok()?),
+            "--flash" => o.flash = Some(a.get(i + 1)?.clone()),
             _ => return None,
         }
         i += 2;
@@ -183,6 +188,13 @@ impl Machine {
         cpu.regs[0] = params;
         if let Some(st) = &stock {
             cpu.regs[0] = fm1_soc::stock_boot(&mut soc, &st.flash, params, st.board);
+        }
+        if let Some(path) = o.flash.as_ref().filter(|p| std::path::Path::new(p).exists()) {
+            let f = std::fs::read(path)?;
+            if f.len() != fm1_soc::FLASH_SIZE {
+                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{path}: not a {} byte flash image", fm1_soc::FLASH_SIZE)));
+            }
+            soc.restore_flash(&f);
         }
         let skip_log = std::env::var("FM1_SKIP_LOG").ok().map(|_| Default::default());
         let blocks = std::env::var("FM1_NO_BLOCKS").is_err();
@@ -328,6 +340,7 @@ fn bench(o: &Opts, ms: u64) {
         let _ = std::fs::write(&path, bytes);
         println!("audio: {} samples -> {path}", m.soc.periph.audio.len());
     }
+    save_flash(&m, o.flash.as_ref());
     if m.cpu.profile {
         println!("JIT cpu0: {}", m.cpu.jit_profile_json());
         if let Some(c1) = &m.cpu1 { println!("JIT cpu1: {}", c1.jit_profile_json()); }
@@ -424,6 +437,22 @@ fn start_audio(ring: Arc<AudioRing>) -> Result<cpal::Stream, String> {
 /// the panel drawn at `ms` into work/panel.ppm.
 /// FM1_BENCH_KEYS=ms:id[,ms:id^,ms:eN:clicks...]: queue key presses (`^`: release) and
 /// encoder turns, `ms:mHEX` MIDI bytes into the MIDI IN jack. False when the variable is unset.
+/// --flash: the flash chip back to its file; and how many erases / programs it saw
+fn save_flash(m: &Machine, path: Option<&String>) {
+    let f = &m.soc.flash;
+    if f.ops > 0 || path.is_some() {
+        let cut = if f.cut() { format!(", power cut at op {}", f.cut_at.unwrap_or(0)) } else { String::new() };
+        println!("flash: {} erases / programs{cut}", f.ops);
+    }
+    if let Some(path) = path {
+        // (a new file renamed over the old: a run killed mid-save leaves the last save whole)
+        let tmp = format!("{path}.tmp");
+        if let Err(e) = std::fs::write(&tmp, &f.mem).and_then(|_| std::fs::rename(&tmp, path)) {
+            eprintln!("{path}: {e}");
+        }
+    }
+}
+
 fn script_keys(m: &mut Machine) -> bool {
     let Ok(keys) = std::env::var("FM1_BENCH_KEYS") else { return false };
     fm1_soc::script::queue(&mut m.soc, &keys);
@@ -562,6 +591,7 @@ fn shot(o: &Opts, ms: u64) {
         }
         Err(e) => eprintln!("work/panel.ppm: {e}"),
     }
+    save_flash(&m, o.flash.as_ref());
 }
 
 // ---------------------------------------------------------------- input --
@@ -635,7 +665,8 @@ const USAGE: &str = "usage: fm1-live --fwsc FIRMWARE.fwsc   (a firmware package:
        fm1-live --fw ID | --fw list    (the page's list, in a checkout: node tools/fetch_firmwares.mjs)
        fm1-live --bin XIP.bin [--entry 0x02000120]
 options: [--mhz 240] [--syx BANK.syx] [--midi all|none|NAME] [--midi-ch N] [--bench MS] [--shot MS]
-         [--flaky-core1 RATE [--seed N]] [--version]";
+         [--flaky-core1 RATE [--seed N]] [--flash FILE] [--version]
+env: FM1_FLASH_CUT=N cuts the power half way through the Nth flash erase / program (--flash keeps what is left)";
 
 fn main() {
     if std::env::args().any(|a| a == "--version" || a == "-V") {
@@ -696,6 +727,7 @@ fn main() {
     let audio_ok = _stream.is_some();
     let emu = {
         let (ring, lcd, leds, pads, status, quit) = (ring.clone(), lcd.clone(), leds.clone(), pads.clone(), status.clone(), quit.clone());
+        let flash = o.flash.clone();
         std::thread::spawn(move || {
             high_priority();
             let start = Instant::now();
@@ -765,6 +797,7 @@ fn main() {
                     last_stat = Instant::now();
                 }
             }
+            save_flash(&m, flash.as_ref());
         })
     };
 
