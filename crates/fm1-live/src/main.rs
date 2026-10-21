@@ -8,7 +8,8 @@
 //! The emulator runs on its own thread, paced to the wall clock: its
 //! emulated time stays a little ahead of real time and the I2S output is
 //! streamed to the default audio device. The window is the FM-1's front
-//! panel (panel.rs): click or drag across the keys, click buttons, drag a
+//! panel (panel.rs): click or drag across the keys (lower on a key = harder: the velocity
+//! its pill lands at; dragging down on a held key = pressing it harder), click buttons, drag a
 //! knob up/down or scroll over it; MASTER is the volume pot. Button and key
 //! LEDs follow the firmware's LED lines.
 //!
@@ -879,9 +880,10 @@ fn main() {
     let mut shown_leds = [0f32; 41];
     let mut grab: Option<Ctl> = None;
     let mut was_pressed = false;
+    let mut mouse_vel = 0u8;                    // the key under the mouse: how hard (its height; lower = harder)
     let (mut last_y, mut drag_acc) = (0f32, 0f32);
     let mut last_title = Instant::now();
-    eprintln!("mouse: click/drag the keys, click buttons, drag or scroll the knobs (MASTER = volume)");
+    eprintln!("mouse: click/drag the keys (lower = harder; drag down on a held key = aftertouch), click buttons, drag or scroll the knobs (MASTER = volume)");
     eprintln!("keys: A W S E D F T G Y H U J K O L P ; ' = C4..F5, Z/X OCT, Space PLAY, R REC, 1..0 buttons, arrows and , . for SELECT/PRESETS/ALGORITHM; Esc quits");
 
     while win.is_open() && !win.is_key_down(Key::Escape) {
@@ -899,12 +901,23 @@ fn main() {
                 grab = panel::hit(mx, my);
                 last_y = my;
                 drag_acc = 0.0;
+                if let Some(Ctl::Key(k)) = grab {
+                    mouse_vel = panel::key_vel(k, my);
+                }
             } else if pressed {
                 match grab {
-                    // glissando: the held note follows the pointer across keys
-                    Some(Ctl::Key(_)) => {
+                    // glissando: the held note follows the pointer across keys; on the same key,
+                    // its height is the pressure (aftertouch)
+                    Some(Ctl::Key(k0)) => {
                         if let Some(Ctl::Key(k)) = panel::hit(mx, my) {
-                            grab = Some(Ctl::Key(k));
+                            let v = panel::key_vel(k, my);
+                            if k != k0 {
+                                grab = Some(Ctl::Key(k));
+                                mouse_vel = v;
+                            } else if v.abs_diff(mouse_vel) >= 4 {
+                                mouse_vel = v;
+                                let _ = tx.send(Action::Pressure { id: k, vel: v });
+                            }
                         }
                     }
                     Some(Ctl::Enc(i)) => {
@@ -970,6 +983,11 @@ fn main() {
         for id in 0..41 {
             if want[id] != down[id] {
                 down[id] = want[id];
+                if want[id] && id >= 14 {
+                    // the mouse's key at its height, the computer keyboard's at 100
+                    let mouse = matches!(grab, Some(Ctl::Key(k)) if k as usize == id);
+                    let _ = tx.send(Action::KeyVel { vel: if mouse { mouse_vel } else { 100 } });
+                }
                 let _ = tx.send(Action::Key { id: id as u8, down: want[id] });
             }
         }
