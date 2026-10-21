@@ -39754,7 +39754,7 @@ pub static ISA: &[IsaEntry] = &[
         syntax: "sp = R",
         len: 4,
         count: 8,
-        mask: 0x000000008fffffff_u64,
+        mask: 0x000000000fffffff_u64,
         match_: 0x000000000e80e064_u64,
         group: "misc",
         alt: &[
@@ -39765,7 +39765,7 @@ pub static ISA: &[IsaEntry] = &[
             0x00007e80e064_u64,
         ],
         slots: &[
-            SlotSpec { kind: SlotKind::Imm, pieces: &[(28, 28), (30, 30), (29, 29)], mult: 0, adj: 0, hi: 0, lo: 0 },
+            SlotSpec { kind: SlotKind::Imm, pieces: &[(28, 31)], mult: 0, adj: 0, hi: 0, lo: 0 },
         ],
     },
     IsaEntry {
@@ -64930,7 +64930,7 @@ pub static ISA: &[IsaEntry] = &[
         syntax: "[R+#i] &= ~R",
         len: 4,
         count: 64,
-        mask: 0x000000000883ffff_u64,
+        mask: 0x000000000083ffff_u64,
         match_: 0x000000000003e864_u64,
         group: "misc",
         alt: &[
@@ -64965,7 +64965,7 @@ pub static ISA: &[IsaEntry] = &[
         slots: &[
             SlotSpec { kind: SlotKind::Imm, pieces: &[(28, 31)], mult: 0, adj: 0, hi: 0, lo: 0 },
             SlotSpec { kind: SlotKind::Scaled, pieces: &[(18, 22)], mult: 4, adj: 0, hi: 0, lo: 0 },
-            SlotSpec { kind: SlotKind::Imm, pieces: &[(24, 26)], mult: 0, adj: 0, hi: 0, lo: 0 },
+            SlotSpec { kind: SlotKind::Imm, pieces: &[(24, 27)], mult: 0, adj: 0, hi: 0, lo: 0 },
         ],
     },
     IsaEntry {
