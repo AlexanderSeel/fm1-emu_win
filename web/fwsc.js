@@ -114,8 +114,25 @@ export function appFromPackage(file) {
   throw new Error("no app.bin in the app area");
 }
 
+// The package the FM-1 Firmware Hub lists now for its firmware `id` (its catalog.json, read once):
+// the Hub removes a firmware's old package when a new version comes, so web/firmwares.json's goes
+// stale between runs of tools/hub_catalog.mjs.
+const HUB = "https://thefirmwarehub.com/";
+let hubCatalog = null;
+async function hubPackage(id, fetchFn) {
+  try {
+    hubCatalog ??= fetchFn(HUB + "catalog.json").then((r) => (r.ok ? r.json() : null));
+    const pkg = (await hubCatalog)?.firmwares?.find((h) => h.id === id)?.pkg;
+    return pkg ? new URL(pkg, HUB).href : null;
+  } catch {
+    hubCatalog = null;
+    return null;
+  }
+}
+
 // Fetch a catalog entry's package (web/firmwares.json): its `package` URL, or when that has
-// gone (a newer version replaced it) the .fwsc its `installer` page links now, found in the
+// gone (a newer version replaced it) the package the Hub lists now (an entry with `hub`), or
+// the .fwsc its `installer` page links now, found in the
 // page or the scripts it loads, or named by its `manifest` (a JSON file whose `package` or
 // `file` is relative to it: ORBIT's manifest.json, FiMba-1's latest.json). An entry with
 // `embedded` names the variable its installer page keeps the package in, base64 (April OS's
@@ -134,6 +151,13 @@ export async function fetchPackage(entry, fetchFn = fetch) {
   }
   let r = await fetchFn(entry.package);
   if (r.ok) return { bytes: new Uint8Array(await r.arrayBuffer()), url: entry.package };
+  if (entry.hub) {
+    const url = await hubPackage(entry.hub, fetchFn);
+    if (url && url !== entry.package) {
+      r = await fetchFn(url);
+      if (r.ok) return { bytes: new Uint8Array(await r.arrayBuffer()), url };
+    }
+  }
   if (entry.manifest) {
     const m = await (await fetchFn(entry.manifest)).json();
     const url = new URL(m.package || m.file, entry.manifest).href;
