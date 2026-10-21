@@ -790,8 +790,21 @@ keeps the System V register plan on Windows as well, and Rust saves around the c
 wants kept (rdi, rsi, xmm6..15). The code cache comes from VirtualAlloc (read-write-execute, as
 the Linux mapping; after luginf's fork, issue #3, whose JIT took the Win64 convention into its
 code generator instead). CI runs the core tests (the random-state test of every compiled op
-included) and SID with the JIT against the interpreter on a Windows runner. For issue #21
-(1x real time interpreted on a Core Ultra 7 155H under Windows).
+included) and SID with the JIT against the interpreter on a Windows runner. (Issue #21 is the
+browser page on Windows, not fm1-live: this gives such users a fast native player, it does not
+change the page.)
+
+## 5.27 The peripheral window by table (2026-10-22)
+
+A profile review (four reviewers, one per area: interpreter, native JIT, SoC, browser) found
+`Soc::region` the top function of FM1-DOOM and ZP-12 (about a quarter of their time): a chain of
+some 30 compares, with P33 (0x13e08) near its end, which their SDK's main loop touches every
+round (a watchdog kick). Now 0x10000..0x14000 is a table of 8-byte cells, the rest below
+0x0100_0000 a short match (no memory region lies there), the memory regions as before; a test
+compares it with the old chain for every address below 0x60000 on both boards. All 82 catalog
+firmwares, the stock one and FM1 Open, JIT and interpreted: the same audio, byte for byte. JIT
+geomean +6% (FM1-DOOM 1.55x -> 2.23x, Etch +37%, ZP-12 +26%, Beetle +23%, OberVave +16%),
+interpreted +2.4%; in the browser +3-5% on those (its bigger costs are elsewhere).
 
 ## 6. Phase 5 — Boot & integration
 
