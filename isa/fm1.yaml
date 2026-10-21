@@ -23696,17 +23696,18 @@ instructions:
     count: 2
     samples: ["eeee8880", "eeeee880"]
     status: auto
+  # the pair-head twin of r_mov_r_i_lsl_r_l4, every register (the corpus fit took only its two
+  # samples' bits; DUELL 0.2.20 runs `94 f1 13 13` when HOME is pressed)
   - name: r_mov_r_i_lsl_r_8
     syntax: "R = R & ~(#i << R) #"
     len: 4
-    mask: "cf9fffff"
+    mask: "000fffff"
     match: "0003f194"
     group: alu_imm
     fields:
-      f0: [21, 22]
-      f1: [28, 29]
+      f0: [20, 31]
     count: 2
-    samples: ["94f12330", "94f14300"]
+    samples: ["94f12330", "94f14300", "94f11313"]
     status: auto
   - name: r1_r0_sub_h_r_add_i_r_u_l4
     syntax: "r1_r0 -= h[R ++= -#i]*R (u)"
