@@ -3737,6 +3737,21 @@ mod tests {
     }
 
     #[test]
+    fn pair_head_and_not_shifted_runs() {
+        // `94 f1 13 13` r1 = r1 & ~(1 << r3) #, then a nop (DUELL 0.2.20, when HOME is pressed):
+        // the pair-head (f1) twin of `94 e1 .3 ..`, missing from the table
+        let mut mem = vec![0u8; 0x100];
+        mem[..6].copy_from_slice(&[0x94, 0xf1, 0x13, 0x13, 0x00, 0x00]);
+        let mut ram = FlatRam::new(mem);
+        let mut cpu = Cpu::new(0);
+        cpu.regs[1] = 0xff;
+        cpu.regs[3] = 3;
+        cpu.step(&mut ram).unwrap();
+        cpu.step(&mut ram).unwrap();
+        assert_eq!(cpu.regs[1], 0xf7, "r1 &= ~(1 << r3)");
+    }
+
+    #[test]
     fn corpus_unseen_offsets_decode() {
         // forms whose table classes fitted only the corpus operands (found running m6502 and the
         // SID player firmware): `6c e8 18 01` [r0+24] <<= 1, `64 e8 fe 10` [r1+-4] &= r0,

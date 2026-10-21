@@ -65122,6 +65122,28 @@ pub static ISA: &[IsaEntry] = &[
             SlotSpec { kind: SlotKind::Imm, pieces: &[(24, 27)], mult: 0, adj: 0, hi: 0, lo: 0 },
         ],
     },
+    // the pair-head twin of r_mov_r_i_lsl_r_l4 (f1 for e1), as r_mov_r_i_lsl_r_5 is of the
+    // and form; not in the corpora: DUELL 0.2.20 runs it when HOME is pressed
+    IsaEntry {
+        name: "r_mov_r_i_lsl_r_9",
+        syntax: "R = R & ~(#i << R) #",
+        len: 4,
+        count: 0,
+        mask: 0x00000000000fffff_u64,
+        match_: 0x000000000003f194_u64,
+        group: "misc",
+        alt: &[
+        ],
+        samples: &[
+            0x00001313f194_u64,
+        ],
+        slots: &[
+            SlotSpec { kind: SlotKind::Imm, pieces: &[(28, 31)], mult: 0, adj: 0, hi: 0, lo: 0 },
+            SlotSpec { kind: SlotKind::Imm, pieces: &[(20, 23)], mult: 0, adj: 0, hi: 0, lo: 0 },
+            SlotSpec { kind: SlotKind::Const, pieces: &[], mult: 0, adj: 1, hi: 0, lo: 0 },
+            SlotSpec { kind: SlotKind::Imm, pieces: &[(24, 27)], mult: 0, adj: 0, hi: 0, lo: 0 },
+        ],
+    },
     IsaEntry {
         name: "r_mov_r_r_16",
         syntax: "R = R & ~R #",

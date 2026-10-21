@@ -7254,6 +7254,19 @@ instructions:
     count: 53
     samples: ["94f10202", "94f10206", "94f10208", "94f1020b", "94f1020e", "94f10241", "94f11200", "94f11212", "94f11216", "94f1121d", "94f1122a", "94f12200", "94f12228", "94f12229", "94f122bd", "94f13234", "94f14201", "94f15211", "94f15226", "94f15254", "94f16201", "94f17284", "94f19201", "94f19246", "94f1d200", "94f1e211"]
     status: auto
+  # the pair-head twin of r_mov_r_i_lsl_r_l4, by r_mov_r_i_lsl_r_5's pattern; not in the corpora
+  # (DUELL 0.2.20 runs it when HOME is pressed)
+  - name: r_mov_r_i_lsl_r_9
+    syntax: "R = R & ~(#i << R) #"
+    len: 4
+    mask: "000fffff"
+    match: "0003f194"
+    group: alu_imm
+    fields:
+      f0: [20, 31]
+    count: 0
+    samples: ["94f11313"]
+    status: auto
   - name: r_mov_r_l_i_usat
     syntax: "R = R.l * #i (usat) #"
     len: 4
