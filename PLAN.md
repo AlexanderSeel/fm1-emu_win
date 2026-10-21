@@ -782,6 +782,17 @@ The page now shows the version that runs when a package has gone and the Hub's n
 instead (fetchPackage returns its `version`); a failed Hub catalog is asked again rather than
 turning the fallback off.
 
+## 5.26 The JIT on Windows (2026-10-21)
+
+The x86-64 JIT (5.24) on Windows too, with its code unchanged: the generated code's entry and
+the helpers it calls are `extern "sysv64"` on x86-64 (`code_abi!`, `CodeFn` in jit.rs), so it
+keeps the System V register plan on Windows as well, and Rust saves around the call what Win64
+wants kept (rdi, rsi, xmm6..15). The code cache comes from VirtualAlloc (read-write-execute, as
+the Linux mapping; after luginf's fork, issue #3, whose JIT took the Win64 convention into its
+code generator instead). CI runs the core tests (the random-state test of every compiled op
+included) and SID with the JIT against the interpreter on a Windows runner. For issue #21
+(1x real time interpreted on a Core Ultra 7 155H under Windows).
+
 ## 6. Phase 5 — Boot & integration
 
 - Boot stock firmware to a stable idle/main-loop state.
