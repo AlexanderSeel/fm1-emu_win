@@ -736,6 +736,18 @@ audit_decode.py now compares the pre- / post-increment accesses too (`describe`'
 same `decode_inc_mem` routes 18 / 19 run): +7610 compared in the stock app's listing, all agree;
 with route 19's old sext10 put back it reports 135 disagreements in the fuzz listing.
 
+## 5.23 The Hub's old packages go away (2026-10-20)
+
+A user reported firmwares failing with 404: the Hub removes a firmware's old package when a
+new version comes, so 18 of web/firmwares.json's 47 Hub packages (written 2026-10-16) were gone.
+`fetchPackage` (web/fwsc.js) now asks the Hub's catalog.json (once) for an entry with `hub`
+whose package has gone, and fetches the one listed now. The list is rebuilt from the Hub: 73
+entries, 71 community, 24 new. Each was booted 8 s in fm1-live (a note on the panel and over
+MIDI, then PLAY): all but five play or draw their screen. Left out (SKIP in hub_catalog.mjs):
+Melodee 1.4.5 (black screen, interrupts off; 1.3.6 ran), OberVave 1.5.3, 386DX, MC-1 and Shine
+On (each halts on a decode not known yet: `64 e8 5f bc`, `64 f0 00 ae`, `64 f0 00 0e`,
+`64 e8 5f b9` ...).
+
 ## 5.24 The JIT on x86-64 Linux (2026-10-21)
 
 `jit/x64.rs` compiles the same block prefixes as the AArch64 compiler, op for op, sharing
