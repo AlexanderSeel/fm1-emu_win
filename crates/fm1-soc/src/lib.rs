@@ -924,4 +924,23 @@ mod tests {
         assert_eq!(soc.flash.revision, 2, "erase and program persist even after XIP consumes changed");
         assert!(!soc.flash.busy());
     }
+
+    #[test]
+    fn a_power_cut_stops_half_way_through_an_op() {
+        // cut at op 2 (the page program): erased, two of the four bytes programmed, then nothing
+        let mut soc = Soc::new(1 << 16, vec![0xaa; 0x80000]);
+        soc.flash.cut_at = Some(2);
+        for cmd in [&[0x06][..], &[0x20, 0x07, 0x40, 0x00], &[0x06], &[0x02, 0x07, 0x40, 0x00, 0x12, 0x34, 0x56, 0x78],
+                    &[0x06], &[0x20, 0x07, 0x50, 0x00]] {
+            soc.write32(0x500c0, 0);
+            for &b in cmd {
+                soc.write32(spiflash::SPI0_BASE + 8, b as u32);
+            }
+            soc.write32(0x500c0, 1);
+        }
+        assert_eq!(soc.read32(0x0207_0000), 0xffff_3412, "the first half of the page program");
+        assert_eq!(soc.read32(0x0207_1000), 0xaaaa_aaaa, "the erase after the cut never happened");
+        assert_eq!(soc.flash.ops, 3);
+        assert!(soc.flash.cut());
+    }
 }
