@@ -766,6 +766,22 @@ firmwares and the stock firmware's audio the same with the JIT and interpreted, 
 on Apple silicon; 2.41x the interpreter (geomean), every firmware faster than real time
 (slowest Doom 1.19x, zp12 1.26x). CI runs the Linux arm64 job's checks on an x86-64 runner too.
 
+## 5.25 The catalog a day later: 83 firmwares (2026-10-21)
+
+A day after 5.23 the Hub had five new firmwares (Bytemania, Chipbox, Flyfish, Kawa, Mutable) and
+19 new versions (SLOOP 2.8, FMini 1.8.0, Beetle 1.3.8, CTL 1.0, ...). With #33 / #34 merged,
+Melodee 1.4.5, OberVave 1.5.3 and Shine On come off the skip list. Two decodes the vendor objdump
+names: `64 f0 00|80 XY`, the special-register moves as a dual-issue head (`r2 = rets  #`: CTL 1.0,
+386DX and MC-1 halted on it; `sreg_move_raw` took `64 e0` only), and `60 ff` bit-test branches
+(`if ((r0 & 0x1) == 0) goto`: Kawa; the table's class had `61 ff` with a forward offset only;
+`decode_bittest` already knew both). Of 131584 words of the two families, the only ones whose
+decode changes either halted before or (two) run the same. Booted 8 s each (a note, then PLAY): all
+82 packages run, no halts; the 78 that ran before give the same audio. Kawa, a tracker, is silent
+under the script but draws its screen and plays. Only Bubba stays out (black screen).
+The page now shows the version that runs when a package has gone and the Hub's newer one came
+instead (fetchPackage returns its `version`); a failed Hub catalog is asked again rather than
+turning the fallback off.
+
 ## 6. Phase 5 — Boot & integration
 
 - Boot stock firmware to a stable idle/main-loop state.

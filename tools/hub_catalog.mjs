@@ -18,11 +18,6 @@ const OURS = { salt: "felucca-salt", floyd: "sloop-floyd", sloopbanks: "sloop-ba
 // listed on the Hub, not run here yet
 const SKIP = {
   bubba: "boots to a black screen, no sound",
-  melodee: "1.4.5 boots to a black screen, interrupts off (1.3.6 ran)",
-  obervave: "1.5.3 halts on an instruction not decoded yet, 64 e8 5f bc .. (1.3.1 ran)",
-  "386dx": "halts on an instruction not decoded yet, 64 f0 00 ae ..",
-  mc1: "halts on an instruction not decoded yet, 64 f0 00 0e ..",
-  shineon: "halts on an instruction not decoded yet, 64 e8 5f b9 ..",
 };
 // first in the list (the page's default first), then by id
 const FIRST = ["mvave", "felucca", "felucca-salt"];
