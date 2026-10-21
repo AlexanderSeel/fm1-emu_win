@@ -3949,6 +3949,15 @@ mod tests {
         cpu.step(&mut ram).unwrap();
         cpu.step(&mut ram).unwrap();
         assert_eq!(cpu.regs[1], 0xf7, "r1 &= ~(1 << r3)");
+        // `94 f1 63 10` r1 = r6 & ~(1 << r0): registers outside the table row's two corpus samples
+        let mut mem = vec![0u8; 0x100];
+        mem[..6].copy_from_slice(&[0x94, 0xf1, 0x63, 0x10, 0x00, 0x00]);
+        let mut ram = FlatRam::new(mem);
+        let mut cpu = Cpu::new(0);
+        (cpu.regs[0], cpu.regs[1], cpu.regs[2], cpu.regs[6]) = (2, 0, 0x55, 0xff);
+        cpu.step(&mut ram).unwrap();
+        cpu.step(&mut ram).unwrap();
+        assert_eq!((cpu.regs[1], cpu.regs[2]), (0xfb, 0x55), "r1 = r6 & ~(1 << r0), r2 untouched");
     }
 
     #[test]
