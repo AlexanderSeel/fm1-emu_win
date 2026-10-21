@@ -195,10 +195,21 @@ impl Instruction {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum DecodeError {
     /// No table entry matched the window.
     UnknownInstruction { raw: u64, addr: u32 },
+}
+
+// (in hex: the derived form printed the address in decimal, 33568008 for 0x02003508)
+impl std::fmt::Debug for DecodeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DecodeError::UnknownInstruction { raw, addr } => {
+                write!(f, "UnknownInstruction {{ raw: {raw:#014x}, addr: {addr:#010x} }}")
+            }
+        }
+    }
 }
 
 /// Decode from a zero-extended little-endian window of up to 6 bytes.
