@@ -3737,6 +3737,21 @@ mod tests {
     }
 
     #[test]
+    fn and_not_takes_a_register_above_r7() {
+        // `64 e8 5f bc` [r11+92] &= ~r12 (OberVave 1.5.3, at every key release): the table's
+        // register field was three bits wide, so r12 didn't decode
+        let mut mem = vec![0u8; 0x200];
+        mem[..4].copy_from_slice(&[0x64, 0xe8, 0x5f, 0xbc]);
+        mem[0x15c..0x160].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+        let mut ram = FlatRam::new(mem);
+        let mut cpu = Cpu::new(0);
+        cpu.regs[11] = 0x100;
+        cpu.regs[12] = 0x0000_ff00;
+        cpu.step(&mut ram).unwrap();
+        assert_eq!(ram.read32(0x15c), 0xffff_00ff, "[r11+92] &= ~r12");
+    }
+
+    #[test]
     fn corpus_unseen_offsets_decode() {
         // forms whose table classes fitted only the corpus operands (found running m6502 and the
         // SID player firmware): `6c e8 18 01` [r0+24] <<= 1, `64 e8 fe 10` [r1+-4] &= r0,
