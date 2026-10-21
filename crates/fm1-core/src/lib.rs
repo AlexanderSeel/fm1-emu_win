@@ -4437,6 +4437,9 @@ mod tests {
         assert_eq!(run_regs(&[0xde, 0xe1, 0x6d, 0x39], &[(7, 0x8000_0000), (6, 0)]).regs[3], i32::MIN as u32);
         // `de e1 01 02` r0 = r1_r0 >> 33 (u)
         assert_eq!(run_regs(&[0xde, 0xe1, 0x01, 0x02], &[(1, 0xffff_fffe), (0, 5)]).regs[0], 0x7fff_ffff);
+        // `d4 f1 05 eb` r15_r14 <c>= #i (a carry rotate, bit 27) is not the plain pair rotate: it halts
+        let mut ram = FlatRam::new([0xd4, 0xf1, 0x05, 0xeb].iter().copied().chain([0; 0x3ffc]).collect());
+        assert!(Cpu::new(0).step(&mut ram).is_err());
         // `39 e4 20 13` r1 = r2 + r3 (ssat), `39 e4 28 13` r1 = r2 - r3 (ssat)
         assert_eq!(run_regs(&[0x39, 0xe4, 0x20, 0x13], &[(2, 0x7fff_fff0), (3, 0x100)]).regs[1], 0x7fff_ffff);
         assert_eq!(run_regs(&[0x39, 0xe4, 0x20, 0x13], &[(2, 5), (3, -7i32 as u32)]).regs[1], -2i32 as u32);
@@ -4782,8 +4785,12 @@ fn route_of(insn: &Instruction, alu4: &Option<Alu4>, bittest: &Option<BitTest>) 
             _ if insn.entry.len == 4 && insn.raw & 0xff == 0xd8
                 && matches!((insn.raw >> 8) & 0xff, 0xec | 0xed | 0xee) => 20,
             _ if insn.entry.len == 4 && matches!((insn.raw >> 8) & 0xff, 0xe1 | 0xf1)
-                && matches!(insn.raw & 0xff, 0xd0 | 0xd4 | 0xd8 | 0xdc | 0xdf | 0xf8 | 0xfc | 0xfe | 0xf6 | 0xde)
+                && matches!(insn.raw & 0xff, 0xd0 | 0xd8 | 0xf8 | 0xfc | 0xfe | 0xf6)
                 && insn.entry.syntax.starts_with('r') && has(insn.entry.syntax, "_r") => 21,
+            // the 64-bit pair forms `d4` / `dc` / `de` / `df` only as `pre_table_raw` vets them: the
+            // table's entries on those bytes include the carry rotates (`r15_r14 <c>= #i`, bit 27),
+            // which stay unsupported
+            "pair_op_raw" => 21,
             _ if insn.entry.len == 4 && (insn.raw & 0xffff) == 0xe070 || (insn.raw & 0xffff) == 0xf070 => 22,
             "testset_b_r" | "testset_r" => 23,
             "ifeq_goto_i" | "ifne_goto_i" => 24,
