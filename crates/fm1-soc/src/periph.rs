@@ -49,6 +49,9 @@
 
 use std::collections::VecDeque;
 
+/// `Periph::adc_state`: CON, done, IRQ, the sample, the noise generator
+pub(crate) type AdcState = (u32, bool, bool, u16, u32);
+
 pub const CPU_HZ: u64 = 240_000_000;
 /// TIMER4 counts the 24 MHz crystal; TIMER5 runs from OSC/4.
 const T4_HZ: u64 = 24_000_000;
@@ -646,13 +649,16 @@ impl Periph {
         self.uart.dropped
     }
 
-    /// The SARADC's state as a polling loop can change it (`machine`'s loop skip).
-    pub(crate) fn adc_state(&self) -> (u32, bool, bool) {
-        (self.adc_con, self.adc_done, self.adc_irq)
+    /// The SARADC's state as a polling loop can change it (`machine`'s loop skip): CON, done,
+    /// the IRQ line, and what a conversion start sets: the sample (a row's key force, which
+    /// ramps) and the noise generator (it moves on every row conversion, so rounds that convert
+    /// a row never repeat, and a failed probe's undo puts it back).
+    pub(crate) fn adc_state(&self) -> AdcState {
+        (self.adc_con, self.adc_done, self.adc_irq, self.adc_sample, self.adc_noise)
     }
 
-    pub(crate) fn set_adc_state(&mut self, (con, done, irq): (u32, bool, bool)) {
-        (self.adc_con, self.adc_done, self.adc_irq) = (con, done, irq);
+    pub(crate) fn set_adc_state(&mut self, (con, done, irq, sample, noise): AdcState) {
+        (self.adc_con, self.adc_done, self.adc_irq, self.adc_sample, self.adc_noise) = (con, done, irq, sample, noise);
     }
 
     /// One cycle; true when something timed is due (call `advance(0)`).
