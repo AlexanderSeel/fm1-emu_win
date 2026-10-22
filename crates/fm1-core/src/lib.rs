@@ -217,9 +217,8 @@ pub struct Cpu {
     /// The stock firmware's synth renders on cpu1 from RAM: without blocks it ran a step at
     /// a time.
     bbytes: Vec<Option<Box<[u8]>>>,
-    /// Per block over RAM, in the wasm build: the bus's count of code-word writes when the block
-    /// was last found current (`ram_block_ok`: the same count, no compare).
-    #[cfg(target_arch = "wasm32")]
+    /// Per block over RAM: the bus's count of code-word writes when the block was last found
+    /// current (`ram_block_ok`: the same count, no compare).
     bver: Vec<u64>,
     /// FM1_NO_RAM_BLOCKS: RAM code a step at a time (the reference)
     no_ram_blocks: bool,
@@ -721,13 +720,14 @@ impl Cpu {
         (q == end).then_some(then)
     }
 
-    /// Is RAM block `id` still built from what memory holds now? In the wasm build, by the bus's
-    /// count of writes to code words when it keeps one: the same count as when the block was last
-    /// found current, nothing has changed; else the bytes are compared. Native block lookup
-    /// compares bytes; compiled RAM chain targets keep separate versioned snapshots.
+    /// Is RAM block `id` still built from what memory holds now? By the bus's count of writes to
+    /// code words when it keeps one: the same count as when the block was last found current,
+    /// nothing has changed; else the bytes are compared. (Sound because every write that can
+    /// reach a block's bytes is counted: the bus's own writes check the word's code flag, and
+    /// compiled code's inline stores, native and wasm, take the bus for a flagged word. Compiled
+    /// RAM chain targets keep separate versioned snapshots, `jit::RamGuard`.)
     #[inline]
     fn ram_block_ok<B: Bus>(&mut self, bus: &mut B, id: usize) -> bool {
-        #[cfg(target_arch = "wasm32")]
         if let Some(w) = bus.code_writes() {
             if self.bver[id] == w {
                 return true;
@@ -776,7 +776,6 @@ impl Cpu {
             self.bops.clear();
             self.blocks.clear();
             self.bbytes.clear();
-            #[cfg(target_arch = "wasm32")]
             self.bver.clear();
             self.bmap.iter_mut().for_each(|x| *x = 0);
             #[cfg(native_jit)]
@@ -833,7 +832,6 @@ impl Cpu {
         }
         self.bbytes.resize(self.blocks.len() - 1, None);
         self.bbytes.push(bytes);
-        #[cfg(target_arch = "wasm32")]
         {
             self.bver.resize(self.blocks.len() - 1, u64::MAX);
             self.bver.push(bus.code_writes().unwrap_or(u64::MAX));
