@@ -747,6 +747,429 @@ impl Gen<'_> {
     }
 }
 
+/// Native code for one plain micro-op, instruction `idx` of its block (the helpers' tick index),
+/// `next_pc` after it; true: it may have used the bus.
+#[cfg(target_arch = "aarch64")]
+fn emit_op<B: Bus>(g: &mut Gen, fast: Fast, idx: u32, next_pc: u32, profile: bool) -> bool {
+    let count = idx + 1;
+    let mut bus_used = false;
+    match fast {
+        Fast::Nop => {}
+        Fast::MovI { d, v } => {
+            g.a.mov32(0, v);
+            g.st_reg(0, d);
+        }
+        Fast::Mov { d, s } => {
+            g.ld_reg(0, s);
+            g.st_reg(0, d);
+        }
+        Fast::AddRI { d, s, v } => {
+            g.ld_reg(0, s);
+            g.add_imm(0, 0, v);
+            g.st_reg(0, d);
+        }
+        Fast::ShlI { d, s, n } => {
+            g.ld_reg(0, s);
+            g.a.lsl_imm(0, 0, n as u32 & 31);
+            g.st_reg(0, d);
+        }
+        Fast::SarI { d, s, n } => {
+            g.ld_reg(0, s);
+            g.a.asr_imm(0, 0, n as u32 & 31);
+            g.st_reg(0, d);
+        }
+        Fast::Alu3 { d, a, b, op } => {
+            g.ld_reg(0, a);
+            g.ld_reg(1, b);
+            g.alu(op);
+            g.st_reg(0, d);
+        }
+        Fast::Alu3I { d, a, v, op } => {
+            g.ld_reg(0, a);
+            g.a.mov32(1, v);
+            g.alu(op);
+            g.st_reg(0, d);
+        }
+        Fast::Alu2 { d, b, op } => {
+            g.ld_reg(0, d);
+            g.ld_reg(1, b);
+            g.alu(op);
+            g.st_reg(0, d);
+        }
+        Fast::Alu2I { d, v, op } => {
+            g.ld_reg(0, d);
+            g.a.mov32(1, v);
+            g.alu(op);
+            g.st_reg(0, d);
+        }
+        Fast::A4 { d, s, op, rk, rv } => {
+            g.rhs(rk, rv);
+            g.ld_reg(0, s);
+            g.alu(op);
+            g.st_reg(0, d);
+        }
+        Fast::Ext { d, s, part, signed } => {
+            g.ld_reg(0, s);
+            match (part, signed) {
+                (0, false) => g.a.ubfx(0, 0, 0, 8),
+                (0, true) => g.a.sbfx(0, 0, 0, 8),
+                (1, false) => g.a.ubfx(0, 0, 0, 16),
+                (1, true) => g.a.sbfx(0, 0, 0, 16),
+                (_, false) => g.a.ubfx(0, 0, 16, 16),
+                (_, true) => g.a.sbfx(0, 0, 16, 16),
+            }
+            g.st_reg(0, d);
+        }
+        Fast::MinMax { d, a, b, kind } => {
+            g.ld_reg(0, a);
+            g.ld_reg(1, b);
+            g.a.cmp(0, 1);
+            let c = match kind { 0 => AC::Lt, 1 => AC::Gt, 2 => AC::Lo, _ => AC::Hi };
+            g.a.csel(0, 0, 1, c);
+            g.st_reg(0, d);
+        }
+        // ---- branches (always a block's last op)
+        Fast::BrI { a, v, cond, target } => {
+            let t = g.a.label();
+            g.ld_reg(0, a);
+            g.a.mov32(1, v);
+            g.a.cmp(0, 1);
+            g.a.b_cond(acond(cond), t);
+            g.chain(next_pc, count);
+            g.a.bind(t);
+            g.chain(target, count);
+        }
+        Fast::BrIEq { a, v, target } | Fast::BrINe { a, v, target } => {
+            let t = g.a.label();
+            g.ld_reg(0, a);
+            g.a.mov32(1, v);
+            g.a.cmp(0, 1);
+            g.a.b_cond(if matches!(fast, Fast::BrIEq { .. }) { AC::Eq } else { AC::Ne }, t);
+            g.chain(next_pc, count);
+            g.a.bind(t);
+            g.chain(target, count);
+        }
+        Fast::BrR { a, b, cond, target } => {
+            let t = g.a.label();
+            g.ld_reg(0, a);
+            g.ld_reg(1, b);
+            g.cmp(cond.is_float(), 0, 1);
+            g.a.b_cond(acond(cond), t);
+            g.chain(next_pc, count);
+            g.a.bind(t);
+            g.chain(target, count);
+        }
+        Fast::BitBr { r, mk, ne, mv, target } => {
+            let t = g.a.label();
+            g.rhs(mk, mv);
+            g.ld_reg(0, r);
+            g.a.tst(0, 1);
+            g.a.b_cond(if ne { AC::Ne } else { AC::Eq }, t);
+            g.chain(next_pc, count);
+            g.a.bind(t);
+            g.chain(target, count);
+        }
+        Fast::DecBr { r, cond, v, target } => {
+            let t = g.a.label();
+            g.ld_reg(0, r);
+            g.a.sub_imm(0, 0, 1);
+            g.st_reg(0, r);
+            g.a.mov32(1, v);
+            g.a.cmp(0, 1);
+            g.a.b_cond(acond(cond), t);
+            g.chain(next_pc, count);
+            g.a.bind(t);
+            g.chain(target, count);
+        }
+        Fast::Goto { target } => g.chain(target, count),
+        Fast::Call { target } => {
+            g.a.mov32(0, next_pc);
+            g.a.str(0, CPU, off_rets());
+            g.chain(target, count);
+        }
+        Fast::IfBlk { a, rk, fam, alt, has_else: false, rv, then_d, .. } => {
+            // without an else part a predicated block is a conditional jump over its then part
+            let taken = g.a.label();
+            g.rhs(rk, rv);
+            g.ld_reg(0, a);
+            let c = if fam == 2 {
+                g.a.tst(0, 1);
+                if alt { AC::Ne } else { AC::Eq }
+            } else {
+                g.cmp(fam >= 8, 0, 1);
+                acond(crate::cond_of_fam(fam as u64, alt))
+            };
+            g.a.b_cond(c, taken);
+            g.chain(next_pc.wrapping_add(then_d as u32), count);
+            g.a.bind(taken);
+            g.chain(next_pc, count);
+        }
+        // (the multiply-accumulates 7 / 8 read d too: through the interpreter's executor)
+        Fast::FOp { d, a, b, op } if !matches!(op, 7 | 8) => {
+            g.ld_reg(0, a);
+            match op {
+                0x1f | 0x5f => {
+                    g.a.fmov_s_w(0, 0);
+                    if op == 0x1f { g.a.fcvtzs(0, 0) } else { g.a.fcvtzu(0, 0) }
+                }
+                0x8f | 0x9f => {
+                    if op == 0x8f { g.a.scvtf(0, 0) } else { g.a.ucvtf(0, 0) }
+                    g.a.fmov_w_s(0, 0);
+                }
+                _ => {
+                    g.ld_reg(1, b);
+                    g.a.fmov_s_w(0, 0);
+                    g.a.fmov_s_w(1, 1);
+                    let opc = match op { 0 => 0x1e20_2800, 1 => 0x1e20_3800, 2 => 0x1e20_0800, 3 => 0x1e20_1800, 5 => 0x1e20_7800, _ => 0x1e20_6800 };
+                    g.a.fop(opc, 0, 0, 1);
+                    g.a.fmov_w_s(0, 0);
+                }
+            }
+            g.st_reg(0, d);
+        }
+        Fast::Rts => {
+            g.a.ldr(9, CPU, off_rets());
+            g.ind(9, count);
+        }
+        Fast::CallR { r } => {
+            g.a.mov32(0, next_pc);
+            g.a.str(0, CPU, off_rets());
+            g.ld_reg(9, r);
+            g.ind(9, count);
+        }
+        Fast::GotoR { r } => {
+            g.ld_reg(9, r);
+            g.ind(9, count);
+        }
+        // ---- memory
+        Fast::Ld { d, b, off, w, signed } => {
+            match b {
+                Base::Reg(r) => g.ld_reg(0, r),
+                Base::Sp => g.a.ldr(0, CPU, off_sp()),
+            }
+            g.add_imm(0, 0, off);
+            g.load(w, signed, idx);
+            g.st_reg(0, d);
+            bus_used = true;
+        }
+        Fast::LdW { d, b, off } => {
+            g.ld_reg(0, b);
+            g.add_imm(0, 0, off);
+            g.load(4, false, idx);
+            g.st_reg(0, d);
+            bus_used = true;
+        }
+        Fast::LdWSp { d, off } => {
+            g.a.ldr(0, CPU, off_sp());
+            g.add_imm(0, 0, off);
+            g.load(4, false, idx);
+            g.st_reg(0, d);
+            bus_used = true;
+        }
+        Fast::LdBu { d, b, off } => {
+            g.ld_reg(0, b);
+            g.add_imm(0, 0, off);
+            g.load(1, false, idx);
+            g.st_reg(0, d);
+            bus_used = true;
+        }
+        Fast::St { s, b, off, w } => {
+            match b {
+                Base::Reg(r) => g.ld_reg(0, r),
+                Base::Sp => g.a.ldr(0, CPU, off_sp()),
+            }
+            g.add_imm(0, 0, off);
+            g.ld_reg(1, s);
+            g.store(w, idx);
+            bus_used = true;
+        }
+        Fast::StW { s, b, off } => {
+            g.ld_reg(0, b);
+            g.add_imm(0, 0, off);
+            g.ld_reg(1, s);
+            g.store(4, idx);
+            bus_used = true;
+        }
+        Fast::StWSp { s, off } => {
+            g.a.ldr(0, CPU, off_sp());
+            g.add_imm(0, 0, off);
+            g.ld_reg(1, s);
+            g.store(4, idx);
+            bus_used = true;
+        }
+        Fast::LdIdx { d, b, i, sh, w, signed } => {
+            g.ld_reg(0, b);
+            g.ld_reg(1, i);
+            g.a.add_lsl(0, 0, 1, sh as u32 & 31);
+            g.load(w, signed, idx);
+            g.st_reg(0, d);
+            bus_used = true;
+        }
+        Fast::StIdx { s, b, i, sh, w } => {
+            g.ld_reg(0, b);
+            g.ld_reg(1, i);
+            g.a.add_lsl(0, 0, 1, sh as u32 & 31);
+            g.ld_reg(1, s);
+            g.store(w, idx);
+            bus_used = true;
+        }
+        Fast::LdPost { d, b, w, signed, inc } => {
+            g.ld_reg(0, b);
+            g.load(w, signed, idx);
+            g.st_reg(0, d);
+            g.ld_reg(0, b); // (after the load wrote d, as the interpreter)
+            g.add_imm(0, 0, inc);
+            g.st_reg(0, b);
+            bus_used = true;
+        }
+        Fast::StPost { s, b, w, inc } => {
+            g.ld_reg(0, b);
+            g.ld_reg(1, s);
+            g.store(w, idx);
+            g.ld_reg(0, b);
+            g.add_imm(0, 0, inc);
+            g.st_reg(0, b);
+            bus_used = true;
+        }
+        Fast::Rmw { b, w, op: rop, off, v } => {
+            g.ld_reg(0, b);
+            g.add_imm(KEEP, 0, off);
+            if let RmwOp::Mov = rop {
+                g.a.mov32(1, v);
+            } else {
+                g.a.mov(0, KEEP);
+                g.load(w, false, idx);
+                g.a.mov32(2, v);
+                match rop {
+                    RmwOp::Or => g.a.orr(1, 0, 2),
+                    RmwOp::And => g.a.and(1, 0, 2),
+                    RmwOp::Xor => g.a.eor(1, 0, 2),
+                    RmwOp::Add => g.a.add(1, 0, 2),
+                    RmwOp::Sub => g.a.sub(1, 0, 2),
+                    RmwOp::Mov => unreachable!(),
+                }
+            }
+            g.a.mov(0, KEEP);
+            g.store(w, idx);
+            bus_used = true;
+        }
+        Fast::MemA4 { b, off, op: aop, rk, rv } => {
+            g.rhs(rk, rv);
+            g.a.mov(KEEP2, 1);
+            g.ld_reg(0, b);
+            g.add_imm(KEEP, 0, off as u32);
+            g.a.mov(0, KEEP);
+            g.load(4, false, idx);
+            g.a.mov(1, KEEP2);
+            g.alu(aop);
+            g.a.mov(1, 0);
+            g.a.mov(0, KEEP);
+            g.store(4, idx);
+            bus_used = true;
+        }
+        Fast::SpAdd { v } => {
+            g.a.ldr(0, CPU, off_sp()); g.add_imm(0, 0, v);
+            g.a.str(0, CPU, off_sp());
+        }
+        Fast::RFromSp { d, v } => {
+            g.a.ldr(0, CPU, off_sp()); g.add_imm(0, 0, v); g.st_reg(0, d);
+        }
+        Fast::Mov2 { dh, dl, sh, sl } => {
+            g.ld_reg(0, sh); g.ld_reg(1, sl);
+            g.st_reg(0, dh); g.st_reg(1, dl);
+        }
+        Fast::Mov2I { dh, dl, v } => {
+            g.a.mov32(0, v); g.st_reg(0, dl);
+            g.a.mov32(0, ((v as i32) >> 31) as u32); g.st_reg(0, dh);
+        }
+        Fast::BitExt { d, s, p, l, signed } => {
+            let (p, l) = (p as u32 & 31, l as u32 & 31);
+            g.ld_reg(0, s); g.a.lsr_imm(0, 0, p);
+            if l != 0 {
+                if signed { g.a.sbfx(0, 0, 0, l); } else { g.a.ubfx(0, 0, 0, l); }
+            }
+            g.st_reg(0, d);
+        }
+        Fast::BitIns { d, s, p, l } => {
+            let (p, l) = (p as u32 & 31, l as u32 & 31);
+            let mask = if l == 0 { u32::MAX } else { (1u32 << l) - 1 };
+            g.ld_reg(0, s); g.ld_reg(1, d);
+            g.a.mov32(2, mask); g.a.and(0, 0, 2); g.a.lsl_imm(0, 0, p);
+            g.a.mov32(2, !(mask << p)); g.a.and(1, 1, 2); g.a.orr(0, 0, 1);
+            g.st_reg(0, d);
+        }
+        Fast::PushRets { n } => {
+            let (top, bot) = ((n as i32).max(3), (n as i32).min(4));
+            for r in std::iter::once(-1).chain((bot..=top).rev()) {
+                g.a.ldr(0, CPU, off_sp()); g.a.sub_imm(0, 0, 4);
+                g.a.str(0, CPU, off_sp());
+                if r < 0 { g.a.ldr(1, CPU, off_rets()); } else { g.ld_reg(1, r as u8); }
+                g.store(4, idx);
+            }
+            bus_used = true;
+        }
+        Fast::PopPc { n } => {
+            let (top, bot) = ((n as i32).max(3), (n as i32).min(4));
+            for r in bot..=top {
+                g.a.ldr(0, CPU, off_sp()); g.load(4, false, idx); g.st_reg(0, r as u8);
+                g.a.ldr(0, CPU, off_sp()); g.a.add_imm(0, 0, 4); g.a.str(0, CPU, off_sp());
+            }
+            g.a.ldr(0, CPU, off_sp()); g.load(4, false, idx); g.a.mov(KEEP, 0);
+            g.a.ldr(0, CPU, off_sp()); g.a.add_imm(0, 0, 4); g.a.str(0, CPU, off_sp());
+            g.ind_brk(KEEP, count, true);
+        }
+        Fast::PopRets => {
+            g.a.ldr(0, CPU, off_sp()); g.load(4, false, idx); g.a.str(0, CPU, off_rets());
+            g.a.ldr(0, CPU, off_sp()); g.a.add_imm(0, 0, 4); g.a.str(0, CPU, off_sp());
+            bus_used = true;
+        }
+        Fast::Tb { r, half } => {
+            g.ld_reg(0, r); g.add_imm(0, 0, next_pc);
+            g.load(if half { 2 } else { 1 }, false, idx);
+            g.a.lsl_imm(0, 0, 1); g.add_imm(0, 0, next_pc);
+            g.ind_brk(0, count, true);
+        }
+        Fast::PushRet => {
+            g.a.ldr(0, CPU, off_sp());
+            g.a.sub_imm(0, 0, 4);
+            g.a.str(0, CPU, off_sp());
+            g.a.ldr(1, CPU, off_rets());
+            g.store(4, idx);
+            bus_used = true;
+        }
+        Fast::PopRet => {
+            g.a.ldr(0, CPU, off_sp());
+            g.load(4, false, idx);
+            g.a.mov(KEEP, 0);
+            g.a.ldr(0, CPU, off_sp());
+            g.a.add_imm(0, 0, 4);
+            g.a.str(0, CPU, off_sp());
+            g.ind_brk(KEEP, count, true);
+        }
+        // ---- everything else: the interpreter's executor for this one op
+        other => {
+            let p: &'static Fast = Box::leak(Box::new(other));
+            g.a.mov_x(0, CTX);
+            g.a.mov64(1, p as *const Fast as u64);
+            g.idx_w2(idx);
+            g.a.mov32(3, next_pc);
+            g.call(op_helper::<B>(&other, profile));
+            let fall = g.a.label();
+            g.a.tbz(0, 32, fall); // bit 32: jumped (x0)
+            g.ind_brk(0, count, true);
+            g.a.bind(fall);
+            bus_used = true;
+            if other.may_jump() {
+                // a jump through the interpreter (`pop` with pc in its mask) that fell
+                // through: leave first if the next tick is due, as after any bus access
+                g.check_brk(next_pc, count);
+                g.chain(next_pc, count);
+            }
+        }
+    }
+    bus_used
+}
+
 /// Native code for a block prefix of plain micro-ops (none careful), and its body's offset.
 #[cfg(target_arch = "aarch64")]
 fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<Box<RamGuard>>, profile: bool, itab: u64) -> Option<(Vec<u8>, usize)> {
@@ -809,430 +1232,14 @@ fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<
 
     let mut pc = pc0;
     for (i, op) in ops.iter().enumerate() {
-        let idx = i as u32;
         let next_pc = pc + op.len as u32;
-        let count = idx + 1;
-        let mut bus_used = false;
-        match op.fast {
-            Fast::Nop => {}
-            Fast::MovI { d, v } => {
-                g.a.mov32(0, v);
-                g.st_reg(0, d);
-            }
-            Fast::Mov { d, s } => {
-                g.ld_reg(0, s);
-                g.st_reg(0, d);
-            }
-            Fast::AddRI { d, s, v } => {
-                g.ld_reg(0, s);
-                g.add_imm(0, 0, v);
-                g.st_reg(0, d);
-            }
-            Fast::ShlI { d, s, n } => {
-                g.ld_reg(0, s);
-                g.a.lsl_imm(0, 0, n as u32 & 31);
-                g.st_reg(0, d);
-            }
-            Fast::SarI { d, s, n } => {
-                g.ld_reg(0, s);
-                g.a.asr_imm(0, 0, n as u32 & 31);
-                g.st_reg(0, d);
-            }
-            Fast::Alu3 { d, a, b, op } => {
-                g.ld_reg(0, a);
-                g.ld_reg(1, b);
-                g.alu(op);
-                g.st_reg(0, d);
-            }
-            Fast::Alu3I { d, a, v, op } => {
-                g.ld_reg(0, a);
-                g.a.mov32(1, v);
-                g.alu(op);
-                g.st_reg(0, d);
-            }
-            Fast::Alu2 { d, b, op } => {
-                g.ld_reg(0, d);
-                g.ld_reg(1, b);
-                g.alu(op);
-                g.st_reg(0, d);
-            }
-            Fast::Alu2I { d, v, op } => {
-                g.ld_reg(0, d);
-                g.a.mov32(1, v);
-                g.alu(op);
-                g.st_reg(0, d);
-            }
-            Fast::A4 { d, s, op, rk, rv } => {
-                g.rhs(rk, rv);
-                g.ld_reg(0, s);
-                g.alu(op);
-                g.st_reg(0, d);
-            }
-            Fast::Ext { d, s, part, signed } => {
-                g.ld_reg(0, s);
-                match (part, signed) {
-                    (0, false) => g.a.ubfx(0, 0, 0, 8),
-                    (0, true) => g.a.sbfx(0, 0, 0, 8),
-                    (1, false) => g.a.ubfx(0, 0, 0, 16),
-                    (1, true) => g.a.sbfx(0, 0, 0, 16),
-                    (_, false) => g.a.ubfx(0, 0, 16, 16),
-                    (_, true) => g.a.sbfx(0, 0, 16, 16),
-                }
-                g.st_reg(0, d);
-            }
-            Fast::MinMax { d, a, b, kind } => {
-                g.ld_reg(0, a);
-                g.ld_reg(1, b);
-                g.a.cmp(0, 1);
-                let c = match kind { 0 => AC::Lt, 1 => AC::Gt, 2 => AC::Lo, _ => AC::Hi };
-                g.a.csel(0, 0, 1, c);
-                g.st_reg(0, d);
-            }
-            // ---- branches (always a block's last op)
-            Fast::BrI { a, v, cond, target } => {
-                let t = g.a.label();
-                g.ld_reg(0, a);
-                g.a.mov32(1, v);
-                g.a.cmp(0, 1);
-                g.a.b_cond(acond(cond), t);
-                g.chain(next_pc, count);
-                g.a.bind(t);
-                g.chain(target, count);
-            }
-            Fast::BrIEq { a, v, target } | Fast::BrINe { a, v, target } => {
-                let t = g.a.label();
-                g.ld_reg(0, a);
-                g.a.mov32(1, v);
-                g.a.cmp(0, 1);
-                g.a.b_cond(if matches!(op.fast, Fast::BrIEq { .. }) { AC::Eq } else { AC::Ne }, t);
-                g.chain(next_pc, count);
-                g.a.bind(t);
-                g.chain(target, count);
-            }
-            Fast::BrR { a, b, cond, target } => {
-                let t = g.a.label();
-                g.ld_reg(0, a);
-                g.ld_reg(1, b);
-                g.cmp(cond.is_float(), 0, 1);
-                g.a.b_cond(acond(cond), t);
-                g.chain(next_pc, count);
-                g.a.bind(t);
-                g.chain(target, count);
-            }
-            Fast::BitBr { r, mk, ne, mv, target } => {
-                let t = g.a.label();
-                g.rhs(mk, mv);
-                g.ld_reg(0, r);
-                g.a.tst(0, 1);
-                g.a.b_cond(if ne { AC::Ne } else { AC::Eq }, t);
-                g.chain(next_pc, count);
-                g.a.bind(t);
-                g.chain(target, count);
-            }
-            Fast::DecBr { r, cond, v, target } => {
-                let t = g.a.label();
-                g.ld_reg(0, r);
-                g.a.sub_imm(0, 0, 1);
-                g.st_reg(0, r);
-                g.a.mov32(1, v);
-                g.a.cmp(0, 1);
-                g.a.b_cond(acond(cond), t);
-                g.chain(next_pc, count);
-                g.a.bind(t);
-                g.chain(target, count);
-            }
-            Fast::Goto { target } => g.chain(target, count),
-            Fast::Call { target } => {
-                g.a.mov32(0, next_pc);
-                g.a.str(0, CPU, off_rets());
-                g.chain(target, count);
-            }
-            Fast::IfBlk { a, rk, fam, alt, has_else: false, rv, then_d, .. } => {
-                // without an else part a predicated block is a conditional jump over its then part
-                let taken = g.a.label();
-                g.rhs(rk, rv);
-                g.ld_reg(0, a);
-                let c = if fam == 2 {
-                    g.a.tst(0, 1);
-                    if alt { AC::Ne } else { AC::Eq }
-                } else {
-                    g.cmp(fam >= 8, 0, 1);
-                    acond(crate::cond_of_fam(fam as u64, alt))
-                };
-                g.a.b_cond(c, taken);
-                g.chain(next_pc.wrapping_add(then_d as u32), count);
-                g.a.bind(taken);
-                g.chain(next_pc, count);
-            }
-            // (the multiply-accumulates 7 / 8 read d too: through the interpreter's executor)
-            Fast::FOp { d, a, b, op } if !matches!(op, 7 | 8) => {
-                g.ld_reg(0, a);
-                match op {
-                    0x1f | 0x5f => {
-                        g.a.fmov_s_w(0, 0);
-                        if op == 0x1f { g.a.fcvtzs(0, 0) } else { g.a.fcvtzu(0, 0) }
-                    }
-                    0x8f | 0x9f => {
-                        if op == 0x8f { g.a.scvtf(0, 0) } else { g.a.ucvtf(0, 0) }
-                        g.a.fmov_w_s(0, 0);
-                    }
-                    _ => {
-                        g.ld_reg(1, b);
-                        g.a.fmov_s_w(0, 0);
-                        g.a.fmov_s_w(1, 1);
-                        let opc = match op { 0 => 0x1e20_2800, 1 => 0x1e20_3800, 2 => 0x1e20_0800, 3 => 0x1e20_1800, 5 => 0x1e20_7800, _ => 0x1e20_6800 };
-                        g.a.fop(opc, 0, 0, 1);
-                        g.a.fmov_w_s(0, 0);
-                    }
-                }
-                g.st_reg(0, d);
-            }
-            Fast::Rts => {
-                g.a.ldr(9, CPU, off_rets());
-                g.ind(9, count);
-            }
-            Fast::CallR { r } => {
-                g.a.mov32(0, next_pc);
-                g.a.str(0, CPU, off_rets());
-                g.ld_reg(9, r);
-                g.ind(9, count);
-            }
-            Fast::GotoR { r } => {
-                g.ld_reg(9, r);
-                g.ind(9, count);
-            }
-            // ---- memory
-            Fast::Ld { d, b, off, w, signed } => {
-                match b {
-                    Base::Reg(r) => g.ld_reg(0, r),
-                    Base::Sp => g.a.ldr(0, CPU, off_sp()),
-                }
-                g.add_imm(0, 0, off);
-                g.load(w, signed, idx);
-                g.st_reg(0, d);
-                bus_used = true;
-            }
-            Fast::LdW { d, b, off } => {
-                g.ld_reg(0, b);
-                g.add_imm(0, 0, off);
-                g.load(4, false, idx);
-                g.st_reg(0, d);
-                bus_used = true;
-            }
-            Fast::LdWSp { d, off } => {
-                g.a.ldr(0, CPU, off_sp());
-                g.add_imm(0, 0, off);
-                g.load(4, false, idx);
-                g.st_reg(0, d);
-                bus_used = true;
-            }
-            Fast::LdBu { d, b, off } => {
-                g.ld_reg(0, b);
-                g.add_imm(0, 0, off);
-                g.load(1, false, idx);
-                g.st_reg(0, d);
-                bus_used = true;
-            }
-            Fast::St { s, b, off, w } => {
-                match b {
-                    Base::Reg(r) => g.ld_reg(0, r),
-                    Base::Sp => g.a.ldr(0, CPU, off_sp()),
-                }
-                g.add_imm(0, 0, off);
-                g.ld_reg(1, s);
-                g.store(w, idx);
-                bus_used = true;
-            }
-            Fast::StW { s, b, off } => {
-                g.ld_reg(0, b);
-                g.add_imm(0, 0, off);
-                g.ld_reg(1, s);
-                g.store(4, idx);
-                bus_used = true;
-            }
-            Fast::StWSp { s, off } => {
-                g.a.ldr(0, CPU, off_sp());
-                g.add_imm(0, 0, off);
-                g.ld_reg(1, s);
-                g.store(4, idx);
-                bus_used = true;
-            }
-            Fast::LdIdx { d, b, i, sh, w, signed } => {
-                g.ld_reg(0, b);
-                g.ld_reg(1, i);
-                g.a.add_lsl(0, 0, 1, sh as u32 & 31);
-                g.load(w, signed, idx);
-                g.st_reg(0, d);
-                bus_used = true;
-            }
-            Fast::StIdx { s, b, i, sh, w } => {
-                g.ld_reg(0, b);
-                g.ld_reg(1, i);
-                g.a.add_lsl(0, 0, 1, sh as u32 & 31);
-                g.ld_reg(1, s);
-                g.store(w, idx);
-                bus_used = true;
-            }
-            Fast::LdPost { d, b, w, signed, inc } => {
-                g.ld_reg(0, b);
-                g.load(w, signed, idx);
-                g.st_reg(0, d);
-                g.ld_reg(0, b); // (after the load wrote d, as the interpreter)
-                g.add_imm(0, 0, inc);
-                g.st_reg(0, b);
-                bus_used = true;
-            }
-            Fast::StPost { s, b, w, inc } => {
-                g.ld_reg(0, b);
-                g.ld_reg(1, s);
-                g.store(w, idx);
-                g.ld_reg(0, b);
-                g.add_imm(0, 0, inc);
-                g.st_reg(0, b);
-                bus_used = true;
-            }
-            Fast::Rmw { b, w, op: rop, off, v } => {
-                g.ld_reg(0, b);
-                g.add_imm(KEEP, 0, off);
-                if let RmwOp::Mov = rop {
-                    g.a.mov32(1, v);
-                } else {
-                    g.a.mov(0, KEEP);
-                    g.load(w, false, idx);
-                    g.a.mov32(2, v);
-                    match rop {
-                        RmwOp::Or => g.a.orr(1, 0, 2),
-                        RmwOp::And => g.a.and(1, 0, 2),
-                        RmwOp::Xor => g.a.eor(1, 0, 2),
-                        RmwOp::Add => g.a.add(1, 0, 2),
-                        RmwOp::Sub => g.a.sub(1, 0, 2),
-                        RmwOp::Mov => unreachable!(),
-                    }
-                }
-                g.a.mov(0, KEEP);
-                g.store(w, idx);
-                bus_used = true;
-            }
-            Fast::MemA4 { b, off, op: aop, rk, rv } => {
-                g.rhs(rk, rv);
-                g.a.mov(KEEP2, 1);
-                g.ld_reg(0, b);
-                g.add_imm(KEEP, 0, off as u32);
-                g.a.mov(0, KEEP);
-                g.load(4, false, idx);
-                g.a.mov(1, KEEP2);
-                g.alu(aop);
-                g.a.mov(1, 0);
-                g.a.mov(0, KEEP);
-                g.store(4, idx);
-                bus_used = true;
-            }
-            Fast::SpAdd { v } => {
-                g.a.ldr(0, CPU, off_sp()); g.add_imm(0, 0, v);
-                g.a.str(0, CPU, off_sp());
-            }
-            Fast::RFromSp { d, v } => {
-                g.a.ldr(0, CPU, off_sp()); g.add_imm(0, 0, v); g.st_reg(0, d);
-            }
-            Fast::Mov2 { dh, dl, sh, sl } => {
-                g.ld_reg(0, sh); g.ld_reg(1, sl);
-                g.st_reg(0, dh); g.st_reg(1, dl);
-            }
-            Fast::Mov2I { dh, dl, v } => {
-                g.a.mov32(0, v); g.st_reg(0, dl);
-                g.a.mov32(0, ((v as i32) >> 31) as u32); g.st_reg(0, dh);
-            }
-            Fast::BitExt { d, s, p, l, signed } => {
-                let (p, l) = (p as u32 & 31, l as u32 & 31);
-                g.ld_reg(0, s); g.a.lsr_imm(0, 0, p);
-                if l != 0 {
-                    if signed { g.a.sbfx(0, 0, 0, l); } else { g.a.ubfx(0, 0, 0, l); }
-                }
-                g.st_reg(0, d);
-            }
-            Fast::BitIns { d, s, p, l } => {
-                let (p, l) = (p as u32 & 31, l as u32 & 31);
-                let mask = if l == 0 { u32::MAX } else { (1u32 << l) - 1 };
-                g.ld_reg(0, s); g.ld_reg(1, d);
-                g.a.mov32(2, mask); g.a.and(0, 0, 2); g.a.lsl_imm(0, 0, p);
-                g.a.mov32(2, !(mask << p)); g.a.and(1, 1, 2); g.a.orr(0, 0, 1);
-                g.st_reg(0, d);
-            }
-            Fast::PushRets { n } => {
-                let (top, bot) = ((n as i32).max(3), (n as i32).min(4));
-                for r in std::iter::once(-1).chain((bot..=top).rev()) {
-                    g.a.ldr(0, CPU, off_sp()); g.a.sub_imm(0, 0, 4);
-                    g.a.str(0, CPU, off_sp());
-                    if r < 0 { g.a.ldr(1, CPU, off_rets()); } else { g.ld_reg(1, r as u8); }
-                    g.store(4, idx);
-                }
-                bus_used = true;
-            }
-            Fast::PopPc { n } => {
-                let (top, bot) = ((n as i32).max(3), (n as i32).min(4));
-                for r in bot..=top {
-                    g.a.ldr(0, CPU, off_sp()); g.load(4, false, idx); g.st_reg(0, r as u8);
-                    g.a.ldr(0, CPU, off_sp()); g.a.add_imm(0, 0, 4); g.a.str(0, CPU, off_sp());
-                }
-                g.a.ldr(0, CPU, off_sp()); g.load(4, false, idx); g.a.mov(KEEP, 0);
-                g.a.ldr(0, CPU, off_sp()); g.a.add_imm(0, 0, 4); g.a.str(0, CPU, off_sp());
-                g.ind_brk(KEEP, count, true);
-            }
-            Fast::PopRets => {
-                g.a.ldr(0, CPU, off_sp()); g.load(4, false, idx); g.a.str(0, CPU, off_rets());
-                g.a.ldr(0, CPU, off_sp()); g.a.add_imm(0, 0, 4); g.a.str(0, CPU, off_sp());
-                bus_used = true;
-            }
-            Fast::Tb { r, half } => {
-                g.ld_reg(0, r); g.add_imm(0, 0, next_pc);
-                g.load(if half { 2 } else { 1 }, false, idx);
-                g.a.lsl_imm(0, 0, 1); g.add_imm(0, 0, next_pc);
-                g.ind_brk(0, count, true);
-            }
-            Fast::PushRet => {
-                g.a.ldr(0, CPU, off_sp());
-                g.a.sub_imm(0, 0, 4);
-                g.a.str(0, CPU, off_sp());
-                g.a.ldr(1, CPU, off_rets());
-                g.store(4, idx);
-                bus_used = true;
-            }
-            Fast::PopRet => {
-                g.a.ldr(0, CPU, off_sp());
-                g.load(4, false, idx);
-                g.a.mov(KEEP, 0);
-                g.a.ldr(0, CPU, off_sp());
-                g.a.add_imm(0, 0, 4);
-                g.a.str(0, CPU, off_sp());
-                g.ind_brk(KEEP, count, true);
-            }
-            // ---- everything else: the interpreter's executor for this one op
-            other => {
-                let p: &'static Fast = Box::leak(Box::new(other));
-                g.a.mov_x(0, CTX);
-                g.a.mov64(1, p as *const Fast as u64);
-                g.idx_w2(idx);
-                g.a.mov32(3, next_pc);
-                g.call(op_helper::<B>(&other, profile));
-                let fall = g.a.label();
-                g.a.tbz(0, 32, fall); // bit 32: jumped (x0)
-                g.ind_brk(0, count, true);
-                g.a.bind(fall);
-                bus_used = true;
-                if other.may_jump() {
-                    // a jump through the interpreter (`pop` with pc in its mask) that fell
-                    // through: leave first if the next tick is due, as after any bus access
-                    g.check_brk(next_pc, count);
-                    g.chain(next_pc, count);
-                }
-            }
-        }
+        let bus_used = emit_op::<B>(&mut g, op.fast, i as u32, next_pc, profile);
         if bus_used && !op.fast.may_jump() {
             if op.glue {
                 // leaving between a glued pair's two instructions: interrupts wait for the second
-                g.check_brk_hold(next_pc, count);
+                g.check_brk_hold(next_pc, i as u32 + 1);
             } else {
-                g.check_brk(next_pc, count);
+                g.check_brk(next_pc, i as u32 + 1);
             }
         }
         pc = next_pc;
