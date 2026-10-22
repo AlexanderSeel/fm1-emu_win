@@ -575,11 +575,15 @@ impl Cpu {
                                 self.insn_count += (n - synced) as u64;
                                 return Ok((n, false));
                             }
-                            if !slot.is_null() {
-                                // a chainable exit came back: link it once its target is compiled
-                                if let Some(body) = self.jit_body_at(pc, bus.code_writes().is_some() && !mem.ram_code.is_null()) {
+                            if let Some(body) = self.jit_body_at(pc, bus.code_writes().is_some() && !mem.ram_code.is_null()) {
+                                if !slot.is_null() {
+                                    // a chainable exit came back: link it once its target is compiled
                                     // SAFETY: slots are leaked u64s owned by the compiled code
                                     unsafe { *slot = body as u64 };
+                                } else if let Some(j) = self.jit.as_mut() {
+                                    // a computed jump (or a stop) landed on a compiled body that
+                                    // is not in the table: the next one goes straight in
+                                    j.relist(pc, body);
                                 }
                             }
                             if inside && !self.pred_skips.is_empty() {

@@ -13,7 +13,8 @@
 //! compiled body once that block is compiled (Rust fills the slot the first time the exit
 //! returns there). An exit to a computed pc (a return, `call R` / `goto R`, a table jump, a pop
 //! into pc) looks the pc up in a direct-mapped table of compiled bodies (`Jit::itab`) and jumps
-//! there when it is found. Every body first checks that its instructions still fit the call's
+//! there when it is found (a body goes in when it compiles, and again when an exit to it came
+//! back to Rust after another took its entry). Every body first checks that its instructions still fit the call's
 //! tick limit, so the chain never runs past a due tick; the helpers sync the clock with the
 //! running instruction count, so timing stays exact across the chain.
 //!
@@ -360,6 +361,14 @@ impl Jit {
             end: pc0 + ops.iter().map(|o| o.len as u32).sum::<u32>(),
             inside_ok: !ops.iter().any(|o| (o.glue && !o.fast.reg_only()) || (o.careful && !matches!(o.fast, Fast::Swap { .. }))),
         })
+    }
+
+    /// List `body`, compiled at pc, in the computed jumps' table again: a later body on the same
+    /// entry took its place, and an exit from compiled code just landed on it (the table is
+    /// filled when a body compiles; without this a hot return target, once evicted by a cold
+    /// one, went back to Rust for good).
+    pub(crate) fn relist(&mut self, pc: u32, body: *const u8) {
+        self.itab[itab_slot(pc)] = ITab { pc, _pad: 0, body: body as u64 };
     }
 
     /// The chain target of block `id`, if it is compiled.
@@ -1597,6 +1606,30 @@ mod tests {
         // a reset forgets the table
         j.reset();
         assert!(j.itab.iter().enumerate().all(|(i, e)| e.pc == itab_empty(i).pc && itab_slot(e.pc) != i));
+    }
+
+    /// A body evicted from the table by a later one on the same entry goes back in with
+    /// `relist` (as run_fast does when an exit with no chain slot lands on it), and the
+    /// computed jumps enter it again.
+    #[test]
+    fn an_evicted_body_is_listed_again() {
+        let mut bus = Memory::new(); let mem = bus.jit_mem().unwrap();
+        let mut j = Jit::new(false).unwrap();
+        let rts = hot(&mut j, 0, 0, &[op(Fast::Rts)], &mem);
+        hot(&mut j, 1, 32, &[op(Fast::MovI { d: 0, v: 42 })], &mem);
+        let mut go = |to: u32| {
+            let mut cpu = Cpu::new(0); cpu.rets = to;
+            let k = unsafe { run(rts, &mut cpu, &mut bus, &mem, 0, 10, false) }.0;
+            (k, cpu.regs[0], cpu.pc)
+        };
+        assert_eq!(go(32), (2, 42, 34));
+        // a later body on the same entry, 32 KB on (past this bus's RAM: put there by hand)
+        let other = 32 + (2 << ITAB_BITS);
+        j.itab[itab_slot(32)] = ITab { pc: other, _pad: 0, body: 0 };
+        assert_eq!(go(32), (1, 0, 32));
+        j.relist(32, j.body(1).unwrap());
+        assert_eq!(go(32), (2, 42, 34));
+        assert_eq!(go(other), (1, 0, other));
     }
 
     /// A computed jump to 0xffff_ffff (an erased-flash function pointer, a trashed rets) whose
