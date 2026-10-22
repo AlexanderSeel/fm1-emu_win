@@ -540,6 +540,23 @@ impl Cpu {
     /// needs `step`.
     #[inline]
     pub fn run_fast<B: Bus>(&mut self, bus: &mut B, budget: u32) -> Result<(u32, bool), CoreError> {
+        if self.stop_pc != 0 {
+            return self.run_stretch(bus, budget);
+        }
+        self.run_fast_in::<B, false>(bus, budget)
+    }
+
+    /// `run_fast` as a runner's stretch (`stop_pc`): the same loop with the stretch's per-block
+    /// bookkeeping, out of line, so that the loop every other call runs has none of it (with it
+    /// there, interpreted Melodee ran 15% slower).
+    #[inline(never)]
+    fn run_stretch<B: Bus>(&mut self, bus: &mut B, budget: u32) -> Result<(u32, bool), CoreError> {
+        self.run_fast_in::<B, true>(bus, budget)
+    }
+
+    /// `run_fast`'s loop; `STRETCH`: `stop_pc` is set (`run_stretch`).
+    #[inline(always)]
+    fn run_fast_in<B: Bus, const STRETCH: bool>(&mut self, bus: &mut B, budget: u32) -> Result<(u32, bool), CoreError> {
         if trace_on() {
             return Ok((0, false));
         }
@@ -562,7 +579,7 @@ impl Cpu {
         }
         // a runner's stretch (see `stop_pc`): `bound` is where the runner's call in progress
         // ends (n), `interpreted` says code ran other than compiled since the stretch began
-        let stretch = self.stop_pc != 0;
+        let stretch = STRETCH;
         let mut bound = 0u32;
         let mut interpreted = false;
         loop {
@@ -726,6 +743,9 @@ impl Cpu {
             }
             #[cfg(not(any(native_jit, target_arch = "wasm32")))]
             let _ = (id, &jit_mem);
+            // (only the native JITs run on from a block compiled whole)
+            #[cfg(not(native_jit))]
+            let _ = whole;
             interpreted = true;
             for i in start..start + len {
                 // SAFETY: build_block pushed start..start+len into bops and
