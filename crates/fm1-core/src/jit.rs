@@ -1319,7 +1319,8 @@ mod tests {
             Fast::Goto { target: 0x40 }, Fast::Call { target: 0x40 }, Fast::Rts,
             Fast::LdW { d: 0, b: 8, off: 4 }, Fast::LdWSp { d: 0, off: 8 }, Fast::LdBu { d: 0, b: 10, off: 3 },
             Fast::StW { s: 1, b: 8, off: 4 }, Fast::StWSp { s: 1, off: 8 },
-            Fast::PopRets, Fast::PushRet, Fast::PopRet]);
+            Fast::PopRets, Fast::PushRet, Fast::PopRet,
+            Fast::CallR { r: 1 }, Fast::CallR { r: 8 }, Fast::GotoR { r: 2 }, Fast::GotoR { r: 9 }]);
         let mut jit = Jit::new(false).unwrap();
         for (j, mut fast) in cases.into_iter().enumerate() {
             for round in 0..24 {

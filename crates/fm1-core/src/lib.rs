@@ -1225,6 +1225,11 @@ impl Cpu {
     #[inline(never)]
     fn exec_rare<B: Bus>(&mut self, bus: &mut B, f: Fast, next_pc: u32) -> Option<u32> {
         match f {
+            Fast::CallR { r } => {
+                self.rets = next_pc;
+                return Some(self.regs[(r & 15) as usize]);
+            }
+            Fast::GotoR { r } => return Some(self.regs[(r & 15) as usize]),
             Fast::SetIe { on } => {
                 self.ie = on;
                 if on {
@@ -4810,7 +4815,7 @@ impl Fast {
             Fast::BrR { a, b, .. } => (m(a) | m(b), 0),
             Fast::BitBr { r, mk, mv, .. } => (m(r) | rhs(mk, mv), 0),
             Fast::DecBr { r, .. } => (m(r), m(r)),
-            Fast::Tb { r, .. } => (m(r), 0),
+            Fast::Tb { r, .. } | Fast::CallR { r } | Fast::GotoR { r } => (m(r), 0),
             Fast::Goto { .. } | Fast::Call { .. } | Fast::Rts | Fast::Nop | Fast::SpAdd { .. }
             | Fast::PushRet | Fast::PopRet | Fast::PopRets => (0, 0),
             Fast::PushRets { n } => (range(n), 0),
@@ -4830,7 +4835,7 @@ impl Fast {
         matches!(
             self,
             Fast::BrI { .. } | Fast::BrR { .. } | Fast::Goto { .. } | Fast::Call { .. } | Fast::Rts
-                | Fast::BitBr { .. } | Fast::DecBr { .. } | Fast::PopPc { .. } | Fast::PopRet | Fast::PopMask { .. }
+                | Fast::CallR { .. } | Fast::GotoR { .. } | Fast::BitBr { .. } | Fast::DecBr { .. } | Fast::PopPc { .. } | Fast::PopRet | Fast::PopMask { .. }
                 | Fast::IfBlk { .. } | Fast::BrIEq { .. } | Fast::BrINe { .. } | Fast::Tb { .. }
         )
     }
@@ -5009,6 +5014,9 @@ enum Fast {
     Goto { target: u32 },
     Call { target: u32 },
     Rts,
+    /// `call R` / `goto R`: a call or jump to a register's value
+    CallR { r: u8 },
+    GotoR { r: u8 },
     /// `R = R op x` from the 4-byte ALU decoder: rk 0 = register, 1 =
     /// immediate, 2 = `1 << R`.
     A4 { d: u8, s: u8, op: Op, rk: u8, rv: u32 },
@@ -5702,6 +5710,8 @@ fn fast_of(insn: &Instruction, s: &'static str) -> Option<Fast> {
         }
         "call #i" => Some(Fast::Call { target: target(0)? }),
         "rts" => Some(Fast::Rts),
+        "call R" => Some(Fast::CallR { r: r(0)? }),
+        "goto R" => Some(Fast::GotoR { r: r(0)? }),
         "{rets} = [sp++]" => Some(Fast::PopRets),
         "tbb [R]" | "tbh [R]" => Some(Fast::Tb { r: r(0)?, half: s.starts_with("tbh") }),
         "R = R & ~R" => Some(Fast::Alu3 { d: r(0)?, a: r(1)?, b: r(2)?, op: Op::AndNot }),
