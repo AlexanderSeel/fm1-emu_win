@@ -14,7 +14,34 @@ use std::process::ExitCode;
 use fm1_core::{Bus, CoreError, Cpu};
 use fm1_soc::{Soc, XIP_BASE, RAM_BASE};
 
+mod buildinfo;
+
 const DEFAULT_RAM: usize = 1 * 1024 * 1024;
+/// RAM runs from RAM_BASE up to the XIP window: more would cover the code with RAM
+const MAX_RAM: usize = (XIP_BASE - RAM_BASE) as usize;
+
+const USAGE: &str = "usage: fm1-emu --bin APP.bin | --fwsc FIRMWARE.fwsc [options]
+run:   [--flash DECRYPTED.bin] [--raw-flash CHIP.bin] [--syx BANK.syx] [--entry 0x02000000]
+       [--steps N (5000000)] [--ms MS] [--ram BYTES (1048576, at most 4194304)] [--quiet]
+       [--flaky-core1 RATE [--seed N]]
+input: [--keys 'T[-T2]:PLAY,T:n7,T:k12,T:enc0:+3,T:pot:512,T:midi:903c64'] (times in ms)
+out:   [--wav OUT.wav] [--snap MS,MS (work/lcd_MS.bmp)] [--dump ADDR N (N words at the end)]
+debug: [--trace K (the first K instructions)]
+       [--break-pc ADDR (registers at each hit)] [--watch ADDR (each change of a word)]
+tools: --list IMAGE START END | --describe OBJDUMP | --check-decode FILE | --sem-run FILE
+       | --exec-check OBJDUMP IMAGE | --coverage | --version | --help
+(addresses in hex)
+env:   FM1_BREAK_MAX=N (8)        stop reporting --break-pc after N hits
+       FM1_BREAK_PCS=ADDR,ADDR    more breakpoints
+       FM1_TRACE_RANGE=FROM:TO    trace every instruction from step FROM to TO
+       FM1_HIST_TOP=N (12)        lines of the class histogram
+       FM1_LIST_END=ADDR:LEN,...  list memory as it is after the run
+       FM1_IRQ_TRACE, FM1_DUAL_TRACE, FM1_FLASH_TRACE, FM1_LCD_TRACE, FM1_AUDIO_TRACE,
+       FM1_GPIO_TRACE, FM1_TRACE  logs
+       FM1_FWSC_XIP=FILE          save a package's XIP window; FM1_FWSC_DIR lists its directory
+       FM1_SUPERVISOR_START       start in supervisor mode (the old single stack)
+       FM1_NO_RAM_BLOCKS          RAM code a step at a time (the reference)
+a bare-metal program ends its run by jumping outside every code region (else it runs to --steps)";
 const DEFAULT_STEPS: u64 = 5_000_000;
 
 /// Flash offset of `app.bin` inside the JLFS app area. The XIP window maps flash 0x4000 at
@@ -64,7 +91,14 @@ struct Args {
 
 fn main() -> ExitCode {
     if std::env::args().any(|a| a == "--version" || a == "-V") {
-        println!("fm1-emu {}", env!("CARGO_PKG_VERSION"));
+        println!("{}", buildinfo::version("fm1-emu"));
+        if let Some(w) = buildinfo::stale() {
+            println!("warning: {w}");
+        }
+        return ExitCode::SUCCESS;
+    }
+    if std::env::args().any(|a| a == "--help" || a == "-h") {
+        println!("{USAGE}");
         return ExitCode::SUCCESS;
     }
     if std::env::args().any(|a| a == "--coverage") {
@@ -264,15 +298,16 @@ fn main() -> ExitCode {
     let mut args = match parse_args() {
         Some(a) => a,
         None => {
-            eprintln!(
-                "usage: fm1-emu --bin <app.bin> [--flash decrypted.bin] [--entry 0x02000000] \
-                 [--steps N] [--trace K] [--ram bytes] [--quiet] [--flaky-core1 RATE [--seed N]]"
-            );
+            eprintln!("{USAGE}");
             return ExitCode::from(2);
         }
     };
     if args.seed.is_some() && args.flaky_core1.is_none() {
         eprintln!("error: --seed needs --flaky-core1 (it seeds its misreads)");
+        return ExitCode::from(2);
+    }
+    if args.ram > MAX_RAM {
+        eprintln!("error: --ram {} is more than the {MAX_RAM} bytes between {RAM_BASE:#010x} and the code at {XIP_BASE:#010x}", args.ram);
         return ExitCode::from(2);
     }
 
@@ -423,6 +458,7 @@ fn main() -> ExitCode {
     let mut nop_run = 0u32;
     let mut watch_val = args.watch.map(|a| soc.read32(a));
     let mut break_hits = 0u32;
+    let break_max: u32 = std::env::var("FM1_BREAK_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(8);
     // FM1_TRACE_RANGE=start:end: every instruction in that range of total steps
     let trace_range: Option<(u64, u64)> = std::env::var("FM1_TRACE_RANGE").ok().and_then(|v| {
         let (a, b) = v.split_once(':')?;
@@ -479,9 +515,12 @@ fn main() -> ExitCode {
                 }
                 continue;
             }
-            if (Some(cpu.pc) == args.break_pc || extra_breaks.contains(&cpu.pc)) && break_hits < std::env::var("FM1_BREAK_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(8u32) {
+            if (Some(cpu.pc) == args.break_pc || extra_breaks.contains(&cpu.pc)) && break_hits < break_max {
                 break_hits += 1;
                 println!("break c{} pc={:#010x} [{}] sp={:#010x} rets={:#010x} irq_levels={:?} r0-11={:x?}", cpu.core_id, cpu.pc, total_steps, cpu.sp, cpu.rets, cpu.irq_levels, &cpu.regs[..12]);
+                if break_hits == break_max {
+                    println!("    (the last hit shown: FM1_BREAK_MAX={break_max})");
+                }
                 for (ri, &v) in cpu.regs[..3].iter().enumerate() {
                     if (RAM_BASE..RAM_BASE + 0x0010_0000).contains(&v) || (XIP_BASE..XIP_BASE + 0x0010_0000).contains(&v) {
                         let bytes: Vec<u8> = (0..40).map(|k| soc.read8(v + k)).collect();
@@ -734,6 +773,7 @@ fn main() -> ExitCode {
                 println!("  {pc:#010x} sp={sp:#010x} {name}");
             }
             println!("halt reason: {e:?}");
+            println!("{}", buildinfo::halt_note("fm1-emu"));
             println!("  pc={:#010x} sp={:#010x} rets={:#010x}", cpu.pc, cpu.sp, cpu.rets);
             for (i, r) in cpu.regs.iter().enumerate() {
                 print!("r{i}={r:#010x} ");

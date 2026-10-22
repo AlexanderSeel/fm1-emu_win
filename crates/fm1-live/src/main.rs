@@ -30,6 +30,8 @@ use fm1_soc::{machine, Action, Soc, VEC_BASE};
 use minifb::{Key, KeyRepeat, MouseButton, MouseMode, Window, WindowOptions};
 use panel::{Ctl, ENCS, H, W};
 
+#[path = "../../fm1-emu/src/buildinfo.rs"]
+mod buildinfo;
 mod panel;
 mod panel_smk;
 use std::collections::VecDeque;
@@ -282,14 +284,21 @@ fn bench(o: &Opts, ms: u64) {
     let mut insns = 0u64;
     let mut pcs: std::collections::HashMap<u32, u64> = std::collections::HashMap::new();
     let sample = std::env::var("FM1_BENCH_PCS").is_ok();
+    let panel = std::env::var_os("FM1_BENCH_PANEL").is_some();
+    let mut led_tail = false;
     while m.soc.periph.ms() < ms {
+        if panel && !led_tail && m.soc.periph.ms() + 40 >= ms {
+            // (the LEDs' on-fractions from here: the last 40 ms, as --shot shows them)
+            let _ = m.soc.periph.led_take();
+            led_tail = true;
+        }
         if steady.is_none() && m.soc.periph.ms() >= warmup {
             steady = Some((Instant::now(), m.soc.periph.ms()));
         }
         if sample && m.soc.periph.ms() > ms / 2 {
             for _ in 0..1000 {
                 if let Err(e) = m.run(97) {
-                    eprintln!("halt: {e}");
+                    halted(&e);
                     std::process::exit(1);
                 }
                 *pcs.entry(m.cpu.pc).or_insert(0) += 1;
@@ -298,7 +307,7 @@ fn bench(o: &Opts, ms: u64) {
             continue;
         }
         if let Err(e) = m.run(100_000) {
-            eprintln!("halt: {e}");
+            halted(&e);
             std::process::exit(1);
         }
         insns += 100_000;
@@ -339,6 +348,14 @@ fn bench(o: &Opts, ms: u64) {
         let bytes: Vec<u8> = m.soc.periph.audio.iter().flat_map(|s| s.to_le_bytes()).collect();
         let _ = std::fs::write(&path, bytes);
         println!("audio: {} samples -> {path}", m.soc.periph.audio.len());
+    }
+    dump_ram(&mut m);
+    if let Ok(path) = std::env::var("FM1_BENCH_PANEL") {
+        let leds = m.soc.periph.led_take();
+        match write_panel(&mut m, &[false; 41], &leds, &path) {
+            Ok(()) => println!("panel at {} ms -> {path}", m.soc.periph.ms()),
+            Err(e) => eprintln!("{path}: {e}"),
+        }
     }
     save_flash(&m, o.flash.as_ref());
     if m.cpu.profile {
@@ -453,6 +470,12 @@ fn save_flash(m: &Machine, path: Option<&String>) {
     }
 }
 
+/// A halt, with the binary that halted: a stale one is the first suspect.
+fn halted(e: &str) {
+    eprintln!("halt: {e}");
+    eprintln!("{}", buildinfo::halt_note("fm1-live"));
+}
+
 fn script_keys(m: &mut Machine) -> bool {
     let Ok(keys) = std::env::var("FM1_BENCH_KEYS") else { return false };
     fm1_soc::script::queue(&mut m.soc, &keys);
@@ -494,7 +517,7 @@ fn shot(o: &Opts, ms: u64) {
             m.soc.periph.skip_idle = true;
         }
         if let Err(e) = m.run(100_000) {
-            return eprintln!("halt: {e}");
+            return halted(&e);
         }
     }
     println!("irq levels at the end: {:?}, ie {}, skipped {} cycles", m.cpu.irq_levels, m.cpu.ie, m.soc.periph.skipped);
@@ -502,7 +525,7 @@ fn shot(o: &Opts, ms: u64) {
     let (mut in_isr, mut total) = (0u64, 0u64);
     while m.soc.periph.ms() < ms {
         if let Err(e) = m.run(1) {
-            return eprintln!("halt: {e}");
+            return halted(&e);
         }
         total += 1;
         if !m.cpu.irq_levels.is_empty() {
@@ -533,10 +556,7 @@ fn shot(o: &Opts, ms: u64) {
         let w: Vec<String> = (0..4).map(|i| format!("{:08x}", m.soc.read32(a + 4 * i))).collect();
         println!("dump {a:#x}: {}", w.join(" "));
     }
-    if let Ok(path) = std::env::var("FM1_DUMPRAM") {
-        let bytes: Vec<u8> = (0..RAM_SIZE as u32 / 4).flat_map(|i| m.soc.read32(RAM_BASE + 4 * i).to_le_bytes()).collect();
-        let _ = std::fs::write(&path, bytes);
-    }
+    dump_ram(&mut m);
     let fr: Vec<String> = (0..41).filter(|&i| leds[i] > 0.0).map(|i| format!("{i}:{:.3}", leds[i])).collect();
     println!("LED on-fractions: {}", fr.join(" "));
     if m.soc.board == fm1_soc::Board::Smk37 {
@@ -544,12 +564,35 @@ fn shot(o: &Opts, ms: u64) {
         let pads: Vec<String> = p.pads.iter().map(|c| format!("{c:06x}")).collect();
         println!("SMK-37 pads ({} frames): {}", p.pad_frames, pads.join(" "));
     }
+    let lit: Vec<usize> = (0..41).filter(|&i| leds[i] > 0.01).collect();
+    match write_panel(&mut m, &down, &leds, "work/panel.ppm") {
+        Ok(()) => {
+            let a = &m.soc.periph.audio;
+            let tail = &a[a.len().saturating_sub(44_100)..];
+            let peak = tail.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+            println!("work/panel.ppm at {} ms; LEDs lit: {lit:?}; audio peak over the last 0.5 s: {peak}", m.soc.periph.ms())
+        }
+        Err(e) => eprintln!("work/panel.ppm: {e}"),
+    }
+    save_flash(&m, o.flash.as_ref());
+}
+
+/// FM1_DUMPRAM=FILE: the RAM as the run left it.
+fn dump_ram(m: &mut Machine) {
+    if let Ok(path) = std::env::var("FM1_DUMPRAM") {
+        let bytes: Vec<u8> = (0..RAM_SIZE as u32 / 4).flat_map(|i| m.soc.read32(RAM_BASE + 4 * i).to_le_bytes()).collect();
+        let _ = std::fs::write(&path, bytes);
+    }
+}
+
+/// The panel as the machine shows it now, keys `down` held and `leds` lit, as a PPM file.
+fn write_panel(m: &mut Machine, down: &[bool; 41], leds: &[f32; 41], path: &str) -> std::io::Result<()> {
     let st = panel::State {
         lcd: &m.soc.lcd.fb,
         enc_clicks: &[0, 0, 0, 3, -2, 0, 5],
         pot: m.soc.periph.adc_value[4],
-        down: &down,
-        leds: &leds,
+        down,
+        leds,
         turning: &[0, 0, 0, 0, 0, 0, 0, 0],
     };
     let (pw, ph) = if m.soc.board == fm1_soc::Board::Smk37 { (panel_smk::W, panel_smk::H) } else { (W, H) };
@@ -581,17 +624,7 @@ fn shot(o: &Opts, ms: u64) {
     for p in &buf {
         ppm.extend_from_slice(&[(p >> 16) as u8, (p >> 8) as u8, *p as u8]);
     }
-    let lit: Vec<usize> = (0..41).filter(|&i| leds[i] > 0.01).collect();
-    match std::fs::write("work/panel.ppm", ppm) {
-        Ok(()) => {
-            let a = &m.soc.periph.audio;
-            let tail = &a[a.len().saturating_sub(44_100)..];
-            let peak = tail.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
-            println!("work/panel.ppm at {} ms; LEDs lit: {lit:?}; audio peak over the last 0.5 s: {peak}", m.soc.periph.ms())
-        }
-        Err(e) => eprintln!("work/panel.ppm: {e}"),
-    }
-    save_flash(&m, o.flash.as_ref());
+    std::fs::write(path, ppm)
 }
 
 // ---------------------------------------------------------------- input --
@@ -664,13 +697,28 @@ const DRAG_PER_CLICK: f32 = 12.0;
 const USAGE: &str = "usage: fm1-live --fwsc FIRMWARE.fwsc   (a firmware package: a community firmware, or M-VAVE's own)
        fm1-live --fw ID | --fw list    (the page's list, in a checkout: node tools/fetch_firmwares.mjs)
        fm1-live --bin XIP.bin [--entry 0x02000120]
-options: [--mhz 240] [--syx BANK.syx] [--midi all|none|NAME] [--midi-ch N] [--bench MS] [--shot MS]
-         [--flaky-core1 RATE [--seed N]] [--flash FILE] [--version]
-env: FM1_FLASH_CUT=N cuts the power half way through the Nth flash erase / program (--flash keeps what is left)";
+options: [--mhz 240] [--syx BANK.syx] [--midi all|none|NAME] [--midi-ch N] [--flash FILE]
+         [--flaky-core1 RATE [--seed N]] [--version] [--help]
+headless: --bench MS   run MS emulated ms as fast as it goes, report the speed
+          --shot MS    run MS ms, then write the panel to work/panel.ppm
+env: FM1_BENCH_KEYS='T[-T2]:PLAY,T:n7,T:enc0:+3,T:pot:512,T:ms:mHEX'  scripted input (--bench, --shot;
+                         times in ms, mHEX: MIDI bytes into the DIN jack)
+     FM1_BENCH_WAV=FILE    --bench: the audio (44.1 kHz stereo s16le, no header)
+     FM1_BENCH_PANEL=FILE  --bench: the panel at the end (PPM)
+     FM1_DUMPRAM=FILE      --bench, --shot: the 1 MiB of RAM at the end
+     FM1_BENCH_JSON=FILE   --bench: the speed as JSON
+     FM1_BENCH_NOKEYS, FM1_WARMUP_MS=N (1000), FM1_BENCH_THREAD, FM1_BENCH_TRACE, FM1_BENCH_PCS,
+     FM1_BENCH_ROUTES      --bench: no default keys, the steady-speed start, a thread, checkpoints, profiles
+     FM1_KEY_AT, FM1_KEY_UP, FM1_NO_PLAY, FM1_NO_SKIP, FM1_SKIP_FROM, FM1_DUMP=ADDR  --shot
+     FM1_NO_JIT            the interpreter (byte-identical, slower); FM1_NO_BLOCKS: a step at a time
+     FM1_FLASH_CUT=N       cut the power half way through the Nth flash erase / program (--flash keeps what is left)";
 
 fn main() {
     if std::env::args().any(|a| a == "--version" || a == "-V") {
-        println!("fm1-live {}", env!("CARGO_PKG_VERSION"));
+        println!("{}", buildinfo::version("fm1-live"));
+        if let Some(w) = buildinfo::stale() {
+            println!("warning: {w}");
+        }
         return;
     }
     if std::env::args().any(|a| a == "--help" || a == "-h") {
@@ -753,7 +801,7 @@ fn main() {
                 if behind {
                     if let Err(e) = m.run(20_000) {
                         *status.lock().unwrap() = format!("halted: {e}");
-                        eprintln!("halted: {e}");
+                        halted(&e);
                         break;
                     }
                 } else {
