@@ -8,8 +8,8 @@
 //! the pc it started from with the same registers: a polling loop with nothing to do (the
 //! stock firmware's job loop, X0X's), which would otherwise cost as much as cpu0.
 
-use crate::{Soc, RAM_BASE, VEC_BASE};
-use fm1_core::{Bus, Cpu};
+use crate::{p33, Soc, RAM_BASE, VEC_BASE};
+use fm1_core::{Bus, Cpu, PlainState};
 
 /// cpu0 runs in slices of this many instructions once cpu1 is running, cpu1 after each.
 pub const SLICE: u32 = 1024;
@@ -143,9 +143,323 @@ impl Bus for Core1Loads<'_> {
     }
 }
 
+/// Exact skipping of cpu0's polling loops. A loop that goes round with nothing to do (FM1-DOOM's
+/// and ZP-12's main loops: a watchdog kick through the P33 port and a look at flags the
+/// interrupts set, ~110 instructions) leaves the machine as it found it each time round, and
+/// until the next timed event nothing it reads can change: every round runs the same.
+///
+/// `probe_loop` runs cpu0 on in the interpreter through `ProbeBus`, which logs the RAM words
+/// stored to (with what they held) and lets through only loads that merely look
+/// (`Soc::pure_read`) and stores whose effect is compared afterwards (`Soc::loop_write_ok`: the
+/// P33 port, the FM-1's instant ADC). Back at the pc it began at with the same core state, the
+/// same port and ADC, and every word the round stored to holding what it held when the round
+/// began, the round is a fixed point: the rounds that fit before the next due tick and within
+/// the budget are skipped as k * L cycles at once, which leaves the machine as running them
+/// would, at the same cycle. A probe that finds no such round (an impure access, an event, too
+/// long) undoes everything it ran (core, RAM, port, ADC, clock), so the run goes on exactly as
+/// without it.
+///
+/// Probes run interpreted, a step at a time: where they find nothing, or rounds too long for
+/// what they skip (Ctl's and Polly's ~640-instruction rounds, between stretches of real work),
+/// they cost more than compiled code running the loop. So probing again after one that failed
+/// backs off, and probes spend a credit: one per instruction they step, earned back by what
+/// they skip (an instruction compiled code would have run is worth 1/16 of a step, an
+/// interpreted one 1/4) and slowly with time (1/2048 a cycle), so loops that show up later
+/// are still found.
+pub struct LoopSkip {
+    /// FM1_NO_LOOPSKIP: off (for A/B runs; the result is the same)
+    pub enabled: bool,
+    /// no probe before this cycle (after one that failed or skipped little)
+    next_try: u64,
+    backoff: u64,
+    /// probe steps that may still be spent, and the cycle the time's share was last added at
+    credit: i64,
+    credit_at: u64,
+    /// cycles (= instructions) skipped, probes made, probes that found a loop
+    pub skipped: u64,
+    pub probes: u64,
+    pub hits: u64,
+    // (buffers kept between probes)
+    log: Vec<(u32, u32)>,
+    seen: Vec<Visit>,
+    scratch: Vec<(u32, u32)>,
+}
+
+/// One visit of a probe to the pc it began at: the core, the P33 port, the ADC then, the
+/// instructions run before it and the length of the store log.
+#[derive(Clone, Copy)]
+struct Visit {
+    core: PlainState,
+    p33: p33::Snap,
+    adc: (u32, bool, bool),
+    at: u32,
+    log: usize,
+}
+
+impl LoopSkip {
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            next_try: 0,
+            backoff: 0,
+            credit: CREDIT_MAX,
+            credit_at: 0,
+            skipped: 0,
+            probes: 0,
+            hits: 0,
+            log: Vec::new(),
+            seen: Vec::new(),
+            scratch: Vec::new(),
+        }
+    }
+
+    /// May a probe start at cycle `now`? (the time's share of the credit added first)
+    fn may_probe(&mut self, now: u64) -> bool {
+        if now < self.next_try {
+            return false;
+        }
+        let earned = (now.saturating_sub(self.credit_at) / 2048).min(CREDIT_MAX as u64) as i64;
+        self.credit = (self.credit + earned).min(CREDIT_MAX);
+        self.credit_at = now;
+        self.credit > 0
+    }
+
+    /// No probe for a while (doubling up to ~17 ms at 240 MHz, from now).
+    fn back_off(&mut self, now: u64) {
+        self.backoff = (self.backoff * 2).clamp(1 << 11, 1 << 22);
+        self.next_try = now + self.backoff;
+    }
+}
+
+/// The longest a probe follows cpu0 looking for a round.
+const PROBE_MAX: u32 = 2048;
+/// A probe only where the run has at least this many instructions left, and as many cycles
+/// before the next event: a round must fit a few times to pay for the probe.
+const PROBE_MIN: u32 = 1024;
+/// The most probe steps the credit holds (`LoopSkip`): what skipping has earned beyond it is
+/// not kept for later.
+const CREDIT_MAX: i64 = 1 << 16;
+/// The visits to its starting pc a probe keeps to compare with (the last ones).
+const VISITS: usize = 8;
+
+/// cpu0 as a probe sees the SoC (see `LoopSkip`): an access that a skipped round could not
+/// repeat is not made (a load reads 0) and marks the probe `bad`; RAM stores are logged.
+struct ProbeBus<'a> {
+    soc: &'a mut Soc,
+    bad: bool,
+    /// RAM words (offsets) stored to, with what they held before
+    log: &'a mut Vec<(u32, u32)>,
+    /// the P33 port before the probe's first store to it
+    p33: &'a mut Option<p33::P33>,
+}
+
+impl ProbeBus<'_> {
+    /// May the load of the word at `a` go ahead?
+    #[inline]
+    fn load(&mut self, a: u32) -> bool {
+        if self.bad {
+            return false;
+        }
+        if (a.wrapping_sub(RAM_BASE) as usize) < self.soc.ram.len() || self.soc.pure_read(a) {
+            return true;
+        }
+        self.bad = true;
+        false
+    }
+
+    /// May a store of `width` bytes at `a` go ahead? (`word`: the address the SoC's slow path
+    /// writes outside RAM: `a` for a word store, the aligned word for narrower ones.)
+    #[inline]
+    fn store(&mut self, a: u32, width: u32, word: u32) -> bool {
+        if self.bad {
+            return false;
+        }
+        let o = a.wrapping_sub(RAM_BASE);
+        if (o as usize) < self.soc.ram.len() {
+            // not into code (its stores are counted) and not past RAM's end
+            if o as usize + width as usize > self.soc.ram.len() || self.soc.ram.is_code(o) {
+                self.bad = true;
+                return false;
+            }
+            let w = o & !3;
+            self.log.push((w, self.soc.ram.read32(w)));
+            // (an unaligned word store reaches into the next word)
+            if (o & 3) + width > 4 {
+                self.log.push((w + 4, self.soc.ram.read32(w + 4)));
+            }
+            return true;
+        }
+        if !self.soc.loop_write_ok(word) {
+            self.bad = true;
+            return false;
+        }
+        if self.p33.is_none() && word.wrapping_sub(p33::P33::CON) < 8 {
+            *self.p33 = Some(self.soc.p33.clone());
+        }
+        true
+    }
+}
+
+impl Bus for ProbeBus<'_> {
+    fn read8(&mut self, a: u32) -> u8 {
+        if self.load(a & !3) { self.soc.read8(a) } else { 0 }
+    }
+    fn read16(&mut self, a: u32) -> u16 {
+        if self.load(a & !3) { self.soc.read16(a) } else { 0 }
+    }
+    fn read32(&mut self, a: u32) -> u32 {
+        if self.load(a) { self.soc.read32(a) } else { 0 }
+    }
+    fn fetch32(&mut self, a: u32) -> u32 {
+        if self.load(a) { self.soc.read32(a) } else { 0 }
+    }
+    fn write8(&mut self, a: u32, v: u8) {
+        if self.store(a, 1, a & !3) {
+            self.soc.write8(a, v)
+        }
+    }
+    fn write16(&mut self, a: u32, v: u16) {
+        if self.store(a, 2, a & !3) {
+            self.soc.write16(a, v)
+        }
+    }
+    fn write32(&mut self, a: u32, v: u32) {
+        if self.store(a, 4, a) {
+            self.soc.write32(a, v)
+        }
+    }
+    fn irq_pending(&self) -> bool {
+        self.soc.periph.any_pending()
+    }
+    fn hw_lock(&mut self, _core: u32, _set: bool) -> bool {
+        self.bad = true;
+        true
+    }
+    fn idle(&mut self, _core: u32) {
+        self.bad = true;
+    }
+    fn irq_window(&mut self) {
+        // (nothing is pending while a probe runs; were it, the SoC would want a look now)
+        if self.soc.periph.any_pending() {
+            self.bad = true;
+        }
+    }
+}
+
+/// Look for a polling loop at cpu0's pc (see `LoopSkip`), with the tick of the instruction there
+/// paid. Returns the instructions run, skipped rounds included (at most `budget`; the next
+/// one's tick unpaid), or 0: no loop, and nothing changed.
+fn probe_loop(cpu: &mut Cpu, soc: &mut Soc, budget: u32) -> u32 {
+    let Some(start) = cpu.plain_state() else { return 0 };
+    let pc0 = start.pc();
+    let (cycles0, due0, adc0, insns0) = (soc.periph.cycles, soc.periph.next_due, soc.periph.adc_state(), cpu.insn_count);
+    let syntax0 = cpu.cur_syntax;
+    let mut ls = std::mem::replace(&mut soc.loop_skip, LoopSkip::new(true));
+    ls.probes += 1;
+    ls.log.clear();
+    ls.seen.clear();
+    let mut p33_was: Option<p33::P33> = None;
+    let mut i = 0u32;
+    let mut visits = 0usize;
+    let found = loop {
+        if cpu.pc == pc0 {
+            if let Some(core) = cpu.plain_state() {
+                let (p33, adc) = (soc.p33.snap(), soc.periph.adc_state());
+                let visit = Visit { core, p33, adc, at: i, log: ls.log.len() };
+                match ls.seen.iter().position(|v| v.core == core && v.p33 == p33 && v.adc == adc) {
+                    Some(j) => {
+                        // every word the round stored to holds what it held when it began
+                        // (the first old value logged for it in the round)
+                        let round = &ls.log[ls.seen[j].log..];
+                        ls.scratch.clear();
+                        ls.scratch.extend_from_slice(round);
+                        ls.scratch.sort_by_key(|e| e.0);
+                        ls.scratch.dedup_by_key(|e| e.0);
+                        if ls.scratch.iter().all(|&(w, old)| soc.ram.read32(w) == old) {
+                            break Ok(i - ls.seen[j].at);
+                        }
+                        // (a first round that set something up: compare with this one on)
+                        ls.seen[j] = visit;
+                    }
+                    // (the last few visits: a loop may settle after a few rounds)
+                    None if ls.seen.len() < VISITS => ls.seen.push(visit),
+                    None => ls.seen[visits % VISITS] = visit,
+                }
+                visits += 1;
+            }
+        }
+        if i >= budget || i >= PROBE_MAX {
+            break Err(false);
+        }
+        // (the first instruction's tick is paid; with something due the block loop goes on)
+        if i > 0 && soc.periph.tick() {
+            break Err(true);
+        }
+        let mut bus = ProbeBus { soc: &mut *soc, bad: false, log: &mut ls.log, p33: &mut p33_was };
+        let ok = cpu.step(&mut bus).is_ok();
+        if !ok || bus.bad || soc.periph.any_pending() {
+            break Err(false);
+        }
+        i += 1;
+    };
+    let ran = match found {
+        Ok(l) => {
+            // whole rounds whose ticks all fall before the next due one (cycles + k * l stays
+            // below it), and within the budget
+            let l = l as u64;
+            let c = soc.periph.cycles;
+            let due = soc.periph.next_due;
+            let by_event = due.saturating_sub(c + 1) / l;
+            let by_budget = (budget - i) as u64 / l;
+            let k = by_event.min(by_budget);
+            soc.periph.cycles += k * l;
+            cpu.insn_count += k * l;
+            let worth = if cpu.jit_on { 16 } else { 4 };
+            ls.credit = (ls.credit + (k * l / worth) as i64 - i as i64).min(CREDIT_MAX);
+            ls.hits += 1;
+            ls.skipped += k * l;
+            // a probe interprets a round or two: worth it again when it skipped well over that
+            if k * l >= 8 * i as u64 {
+                ls.backoff = 0;
+                ls.next_try = 0;
+            } else if by_event < by_budget {
+                ls.next_try = due; // an event is near: look again after it
+            } else {
+                ls.back_off(soc.periph.cycles);
+            }
+            i + (k * l) as u32
+        }
+        Err(event) => {
+            // undo it all: the block loop runs from where the probe began, as without it
+            for &(w, old) in ls.log.iter().rev() {
+                soc.ram.restore32(w, old);
+            }
+            if let Some(p) = p33_was {
+                soc.p33 = p;
+            }
+            soc.periph.set_adc_state(adc0);
+            soc.periph.next_due = due0;
+            soc.periph.cycles = cycles0;
+            cpu.set_plain_state(&start);
+            cpu.insn_count = insns0;
+            cpu.cur_syntax = syntax0;
+            ls.credit -= i as i64;
+            if event {
+                ls.next_try = due0; // look again after it
+            } else {
+                ls.back_off(cycles0);
+            }
+            0
+        }
+    };
+    soc.loop_skip = ls;
+    ran
+}
+
 /// cpu0's block loop: interrupts taken between blocks, the SoC serviced when a tick is due.
-/// `pending_tick` carries a tick already spent on the next instruction across calls.
-pub fn run_blocks(cpu: &mut Cpu, soc: &mut Soc, n: u32, pending_tick: &mut bool) -> Result<(), String> {
+/// `pending_tick` carries a tick already spent on the next instruction across calls. Returns
+/// the instructions run: n, or fewer when cpu0 released cpu1 (it stops right there).
+pub fn run_blocks(cpu: &mut Cpu, soc: &mut Soc, n: u32, pending_tick: &mut bool) -> Result<u32, String> {
     let mut done = 0u32;
     let mut ticked = std::mem::take(pending_tick);
     while done < n {
@@ -159,6 +473,18 @@ pub fn run_blocks(cpu: &mut Cpu, soc: &mut Soc, n: u32, pending_tick: &mut bool)
                 if cpu.irq_ready(prio) {
                     let handler = soc.read32(VEC_BASE + 4 * irq as u32);
                     cpu.interrupt(handler, prio);
+                }
+            }
+        }
+        let now = soc.periph.cycles;
+        if soc.loop_skip.enabled && n - done >= PROBE_MIN && !soc.periph.any_pending() && soc.loop_skip.may_probe(now) {
+            if soc.periph.next_due < soc.periph.cycles + PROBE_MIN as u64 {
+                soc.loop_skip.next_try = soc.periph.next_due; // too close to the next event
+            } else {
+                let k = probe_loop(cpu, soc, n - done);
+                if k > 0 {
+                    done += k;
+                    continue; // (the next instruction's tick unpaid)
                 }
             }
         }
@@ -181,7 +507,7 @@ pub fn run_blocks(cpu: &mut Cpu, soc: &mut Soc, n: u32, pending_tick: &mut bool)
     }
     // the next instruction's tick may already have happened: carry it
     *pending_tick = ticked;
-    Ok(())
+    Ok(done)
 }
 
 /// cpu1 once cpu0 released it (`0x10008 |= 8`): its entry is the word at 0x01C7FFF8 (the
@@ -247,20 +573,25 @@ pub fn run_cpu1(c1: &mut Cpu, soc: &mut Soc, cycles: u64) -> Result<(), String> 
     Ok(())
 }
 
-/// Run n instructions of cpu0 through `run0` (the block loop, or a caller's own), with cpu1
-/// alongside once it is released.
+/// cpu0 alone ran in stretches of this many instructions until it released cpu1, and the rest
+/// of the stretch it released it in was not run. The block loop stops at the release itself
+/// now (`run_blocks`), so cpu0 runs alone in one stretch; the instructions it gives up stay the
+/// same (to the next multiple of this), so cpu1 starts where it did.
+const SOLO_CHUNK: u32 = 4096;
+
+/// Run n instructions of cpu0 through `run0` (the block loop, or a caller's own: it returns the
+/// instructions run, fewer than asked only when cpu0 released cpu1), with cpu1 alongside once
+/// it is released.
 pub fn run_dual(
     cpu1: &mut Option<Cpu>,
     soc: &mut Soc,
     n: u32,
     ram_size: usize,
     jit_on: bool,
-    mut run0: impl FnMut(&mut Soc, u32) -> Result<(), String>,
+    mut run0: impl FnMut(&mut Soc, u32) -> Result<u32, String>,
 ) -> Result<(), String> {
     let mut done = 0;
     while cpu1.is_none() {
-        // cpu0 alone, in stretches short enough to see a release soon (X0X holds the release
-        // bit only while it waits for core 1 to report in, then gives up and clears it)
         *cpu1 = released_cpu1(soc, ram_size).map(|mut c| {
             c.jit_on = jit_on;
             c
@@ -268,10 +599,10 @@ pub fn run_dual(
         if cpu1.is_some() || done >= n {
             break;
         }
-        let k = (n - done).min(4096);
+        let k = n - done;
         soc.periph.room_cap = k as u64;
-        run0(soc, k)?;
-        done += k;
+        let ran = run0(soc, k)?;
+        done = if ran < k { (done + ran).div_ceil(SOLO_CHUNK).saturating_mul(SOLO_CHUNK).min(n) } else { n };
     }
     let Some(c1) = cpu1.as_mut() else { return Ok(()) };
     soc.periph.room_cap = SLICE as u64;
@@ -294,6 +625,151 @@ pub fn run_dual(
 mod tests {
     use super::*;
     use crate::flaky::{FlakyCore1, MISREAD_BIT};
+    use crate::periph::Action;
+    use crate::XIP_BASE;
+
+    // Polling loops in XIP code; r1 points 544 bytes past the word the loop polls.
+    /// `d5 ec 10 2e` r2 = [r1+-544]
+    const LOAD: [u8; 4] = [0xd5, 0xec, 0x10, 0x2e];
+    /// `d7 ec 51 38` [r5+-128] = r3
+    const STORE: [u8; 4] = [0xd7, 0xec, 0x51, 0x38];
+    /// `61 ff 20 20 oo oo` if ((r2 & 0x20) != 0) goto back to 0 (from `len` bytes in)
+    fn while_set(len: u32) -> [u8; 6] {
+        let o = (-((len + 6) as i32) / 2) as u16;
+        [0x61, 0xff, 0x20, 0x20, o as u8, (o >> 8) as u8]
+    }
+    /// PA5: key 5 (row 1, column 0) pulls it low while down
+    const KEY: u8 = 5;
+    const PA_IN: u32 = 0x50004;
+
+    fn machine(code: &[u8], regs: &[(usize, u32)], skip: bool) -> (Cpu, Soc) {
+        let mut xip = code.to_vec();
+        xip.resize(code.len() + 256, 0);
+        let mut soc = Soc::new(1 << 20, xip);
+        soc.loop_skip.enabled = skip;
+        // every column of the key matrix selected: 16 zeros into the shift registers (SRCLK, PA3),
+        // latched (RCLK, PA1)
+        for _ in 0..16 {
+            soc.write32(0x50000, 0);
+            soc.write32(0x50000, 8);
+        }
+        soc.write32(0x50000, 0);
+        soc.write32(0x50000, 2);
+        let mut cpu = Cpu::new(XIP_BASE);
+        for &(r, v) in regs {
+            cpu.regs[r] = v;
+        }
+        (cpu, soc)
+    }
+
+    /// The same machine with the loop skip and without, run in odd chunks with keys going down and
+    /// up at the given cycles: equal after every chunk (core, clock, the polled-at RAM word).
+    fn run_both(code: &[u8], regs: &[(usize, u32)], keys: &[(u64, bool)], total: u32) -> (Cpu, Soc) {
+        let (mut a, mut sa) = machine(code, regs, true);
+        let (mut b, mut sb) = machine(code, regs, false);
+        for &(at, down) in keys {
+            sa.periph.script.push_back((at, Action::Key { id: KEY, down }));
+            sb.periph.script.push_back((at, Action::Key { id: KEY, down }));
+        }
+        let (mut ta, mut tb) = (false, false);
+        let mut done = 0;
+        let mut seen = std::collections::BTreeSet::new();
+        while done < total {
+            let n = 7919.min(total - done);
+            assert_eq!(run_blocks(&mut a, &mut sa, n, &mut ta), Ok(n));
+            assert_eq!(run_blocks(&mut b, &mut sb, n, &mut tb), Ok(n));
+            done += n;
+            assert_eq!((a.pc, a.regs, a.insn_count, ta), (b.pc, b.regs, b.insn_count, tb), "after {done}");
+            assert_eq!(sa.periph.cycles, sb.periph.cycles, "after {done}");
+            assert_eq!(sa.ram.read32(0x1000), sb.ram.read32(0x1000), "after {done}");
+            assert_eq!(sa.p33.snap(), sb.p33.snap(), "after {done}");
+            seen.insert(a.pc);
+        }
+        assert_eq!(sb.loop_skip.probes, 0);
+        if !keys.is_empty() {
+            assert!(seen.len() >= 4, "both loops seen at chunk ends: {seen:x?}");
+        }
+        (a, sa)
+    }
+
+    #[test]
+    fn polling_loop_skipped_to_the_cycle() {
+        // wait for the key (2 instructions a round), then for its release (3), and round again:
+        // a round too many or too few in one shows as another place in the other
+        let mut code = [LOAD.as_slice(), &while_set(4)].concat();
+        code.extend_from_slice(&LOAD);
+        code.extend_from_slice(&LOAD);
+        code.extend_from_slice(&[0x60, 0xff, 0x20, 0x20, 0xf9, 0xff]); // while clear (back to 10)
+        code.extend_from_slice(&[0x60, 0xff, 0x00, 0x20, 0xf1, 0xff]); // back to 0
+        let keys: Vec<(u64, bool)> = (0..40).map(|i| (20_011 + i * 13_337 + i * i * 7, i % 2 == 0)).collect();
+        let (_, soc) = run_both(&code, &[(1, PA_IN + 544)], &keys, 560_000);
+        assert!(soc.loop_skip.skipped > 300_000, "{} skipped", soc.loop_skip.skipped);
+    }
+
+    #[test]
+    fn round_that_stores_what_is_there_skipped() {
+        // [0x1000] = r3 every round: the first changes it, the rest store what is there
+        let code = [STORE.as_slice(), &LOAD, &while_set(8)].concat();
+        let regs = [(1, PA_IN + 544), (5, RAM_BASE + 0x1000 + 128), (3, 0xdead_beef)];
+        let (_, soc) = run_both(&code, &regs, &[], 100_000);
+        assert_eq!(soc.ram.read32(0x1000), 0xdead_beef);
+        assert!(soc.loop_skip.skipped > 90_000, "{} skipped", soc.loop_skip.skipped);
+    }
+
+    #[test]
+    fn round_that_changes_ram_not_skipped() {
+        // r2 = [w]; [w] = 0x20 twice; while r2 bit 5 is clear: the first round leaves w changed
+        // (and the core as it was), the second leaves the loop (for a loop on the spot)
+        let code = [LOAD.as_slice(), &STORE, &STORE, &[0x60, 0xff, 0x20, 0x20, 0xf7, 0xff], &[0x60, 0xff, 0x00, 0x20, 0xfd, 0xff]].concat();
+        let regs = [(1, RAM_BASE + 0x1000 + 544), (5, RAM_BASE + 0x1000 + 128), (3, 0x20)];
+        let (cpu, _) = run_both(&code, &regs, &[], 20_000);
+        assert_eq!(cpu.pc, XIP_BASE + 18);
+    }
+
+    #[test]
+    fn watchdog_kick_through_p33_skipped() {
+        // P33_CON = 0x11 every round (a transfer: the port's state settles after 255)
+        let code = [STORE.as_slice(), &LOAD, &while_set(8)].concat();
+        let regs = [(1, PA_IN + 544), (5, crate::p33::P33::CON + 128), (3, 0x11)];
+        let (_, soc) = run_both(&code, &regs, &[], 100_000);
+        assert!(soc.loop_skip.skipped > 90_000, "{} skipped", soc.loop_skip.skipped);
+    }
+
+    #[test]
+    fn probe_without_a_loop_changes_nothing() {
+        // a store (the P33 port, RAM), then the counting timer word: the probe undoes the store
+        let code = [STORE.as_slice(), &LOAD, &[0x60, 0xff, 0x00, 0x20, 0xf9, 0xff]].concat();
+        for to in [crate::p33::P33::CON, RAM_BASE + 0x1000] {
+            let (mut cpu, mut soc) = machine(&code, &[(1, 0x1080c + 544), (5, to + 128), (3, 0x11)], true);
+            let before = (cpu.plain_state(), cpu.insn_count, soc.periph.cycles, soc.p33.snap(), soc.ram.read32(0x1000));
+            assert_eq!(probe_loop(&mut cpu, &mut soc, 5000), 0);
+            assert_eq!(before, (cpu.plain_state(), cpu.insn_count, soc.periph.cycles, soc.p33.snap(), soc.ram.read32(0x1000)));
+            assert_eq!((soc.loop_skip.probes, soc.loop_skip.hits, soc.ticks), (1, 0, 0));
+        }
+    }
+
+    #[test]
+    fn loop_with_side_effects_not_skipped() {
+        // a timer word that counts its reads (`Soc::ticks`), a port pin written, a counter in RAM
+        let load = |at: u32| [(1, at + 544)];
+        let (a, soc) = run_both(&[LOAD.as_slice(), &[0x60, 0xff, 0x00, 0x20, 0xfb, 0xff]].concat(), &load(0x1080c), &[], 50_000);
+        assert!(soc.loop_skip.probes > 0);
+        assert_eq!((soc.loop_skip.hits, soc.ticks), (0, 25_000));
+        assert_eq!(a.pc, XIP_BASE);
+        let code = [STORE.as_slice(), &LOAD, &while_set(8)].concat();
+        let (_, soc) = run_both(&code, &[(1, PA_IN + 544), (5, 0x50000 + 128), (3, 0)], &[], 50_000);
+        assert!(soc.loop_skip.probes > 0);
+        assert_eq!(soc.loop_skip.hits, 0);
+        // a P33 transfer, then the counting timer word: the probe's transfer is undone
+        let code = [STORE.as_slice(), &LOAD, &[0x60, 0xff, 0x00, 0x20, 0xf9, 0xff]].concat();
+        let (_, soc) = run_both(&code, &[(1, 0x1080c + 544), (5, crate::p33::P33::CON + 128), (3, 0x11)], &[], 50_000);
+        assert!(soc.loop_skip.probes > 0);
+        assert_eq!(soc.loop_skip.hits, 0);
+        // r3 = [r1 += 4]-style changes show in the core: `13 05` r3 = [r1++=4] polls on and on
+        let code = [[0x13, 0x05].as_slice(), &[0x60, 0xff, 0x00, 0x20, 0xf9, 0xff]].concat();
+        let (_, soc) = run_both(&code, &[(1, RAM_BASE)], &[], 50_000);
+        assert_eq!(soc.loop_skip.hits, 0);
+    }
 
     /// RAM code: `13 05` r3 = [r1++=4], eight times, then `80 00` rts; the words it loads are 0.
     fn soc_with_loads() -> Soc {
@@ -310,6 +786,25 @@ mod tests {
         c.core_id = id;
         c.regs[1] = RAM_BASE + 0x100;
         c
+    }
+
+    #[test]
+    fn release_forfeits_the_rest_of_its_4096() {
+        // cpu0 releases cpu1 (0x10008 |= 8) with its `at`th instruction, then spins; cpu1 spins
+        for at in [1251u32, 4096, 4097] {
+            let mut code: Vec<u8> = std::iter::repeat_n(LOAD, at as usize - 1).flatten().collect();
+            code.extend_from_slice(&STORE);
+            let spin = code.len() as u32;
+            code.extend_from_slice(&[0x60, 0xff, 0x00, 0x20, 0xfd, 0xff]);
+            let (mut cpu, mut soc) = machine(&code, &[(1, RAM_BASE + 544), (5, 0x10008 + 128), (3, 8)], true);
+            soc.write32(0x01c7_fff8, XIP_BASE + spin);
+            let mut cpu1 = None;
+            let mut pt = false;
+            run_dual(&mut cpu1, &mut soc, 20_000, 1 << 20, false, |soc, k| run_blocks(&mut cpu, soc, k, &mut pt)).unwrap();
+            assert!(cpu1.as_ref().is_some_and(|c| c.pc == XIP_BASE + spin));
+            // cpu0 alone ran up to the release, then nothing up to the next multiple of 4096
+            assert_eq!(cpu.insn_count, (at + 20_000 - at.div_ceil(4096) * 4096) as u64, "release at {at}");
+        }
     }
 
     #[test]
