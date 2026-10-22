@@ -634,8 +634,11 @@ impl Cpu {
     }
 
     /// How many instructions the block at pc holds up to `stop` (an instruction of it after the
-    /// first, if one starts there) or its end (0: its first one needs `step`): a budget for
-    /// `run_fast` that runs that much, compiled or not, and stops there. (cpu1's idle probe: it
+    /// first, if one starts there) or its end (0: the block is empty, its first instruction needs
+    /// `step`): a budget for `run_fast` that runs that much, compiled or not, and stops there.
+    /// Instructions, not ops: a `Swap` counts two, so a block may hold more than 32. A `stop` at a
+    /// Swap's second instruction counts through the head only, and `run_fast` then runs the head
+    /// alone, as the careful path does, leaving the pair pending at `stop`. (cpu1's idle probe: it
     /// looks for the way back to where it began, which may lie inside a block.)
     pub fn block_len_to<B: Bus>(&mut self, bus: &mut B, stop: u32) -> u32 {
         let Ok(Some((_, start, len))) = self.block_at(bus, self.pc) else { return 0 };
@@ -5115,8 +5118,8 @@ impl Fast {
 
     /// Can this pair head (not glued: `tail` reads what it writes) run after `tail`, with the
     /// pair's result? The head works on registers only (no bus, sp, rets, special register or
-    /// jump), reads and writes nothing the tail writes, and not both set the flags (no micro-op
-    /// reads them). The pair rule holds the head's registers back until the tail has run; the
+    /// jump), reads and writes nothing the tail writes, and neither reads the flags nor both set
+    /// them. The pair rule holds the head's registers back until the tail has run; the
     /// tail first, then the head, is that. (`regs_rw` must be exact for the tail's writes.)
     fn swappable_with(&self, tail: Fast) -> bool {
         let reg_only = matches!(self, Fast::Mov { .. } | Fast::MovI { .. } | Fast::Alu3 { .. } | Fast::Alu3I { .. }
@@ -5125,21 +5128,56 @@ impl Fast {
             | Fast::Mov2I { .. } | Fast::Un { .. } | Fast::MinMax { .. });
         match (reg_only, self.regs_rw(), tail.regs_rw()) {
             (true, Some((hr, hw)), Some((_, tw))) => {
-                (hr | hw) & tw == 0 && !(self.sets_flags() && tail.sets_flags()) && !matches!(tail, Fast::IfBlk { .. } | Fast::Swap { .. })
+                (hr | hw) & tw == 0 && !(self.sets_flags() && tail.sets_flags()) && !self.reads_flags() && !tail.reads_flags()
+                    && !matches!(tail, Fast::IfBlk { .. } | Fast::Swap { .. })
             }
             _ => false,
         }
     }
 
     /// Does this op set the arithmetic flags? (`alu_f`'s add / subtract, `AddRI`; no other
-    /// micro-op touches them)
+    /// micro-op touches them, but `Raw` and `Swap` may; neither is ever swapped). Every op is
+    /// listed, so a new one has to say: `swappable_with` is only sound if this is right.
     fn sets_flags(&self) -> bool {
         match *self {
             Fast::Alu3 { op, .. } | Fast::Alu3I { op, .. } | Fast::Alu2 { op, .. } | Fast::Alu2I { op, .. } | Fast::A4 { op, .. } => {
                 matches!(op, Op::Add | Op::Sub | Op::RSub)
             }
-            Fast::AddRI { .. } => true,
-            _ => false,
+            Fast::AddRI { .. } | Fast::Raw { .. } | Fast::Swap { .. } => true,
+            Fast::Mov { .. } | Fast::MovI { .. } | Fast::Ld { .. } | Fast::St { .. } | Fast::BrI { .. } | Fast::BrR { .. }
+            | Fast::FOp { .. } | Fast::Goto { .. } | Fast::Call { .. } | Fast::Rts | Fast::CallR { .. } | Fast::GotoR { .. }
+            | Fast::BitBr { .. } | Fast::LdIdx { .. } | Fast::StIdx { .. } | Fast::Rmw { .. } | Fast::LdPost { .. }
+            | Fast::StPost { .. } | Fast::DecBr { .. } | Fast::Ext { .. } | Fast::MemA4 { .. } | Fast::Nop
+            | Fast::PushRets { .. } | Fast::PopPc { .. } | Fast::PushMask { .. } | Fast::PopMask { .. } | Fast::PushRet
+            | Fast::PopRet | Fast::MinMax { .. } | Fast::IfBlk { .. } | Fast::BrIEq { .. } | Fast::BrINe { .. }
+            | Fast::LdW { .. } | Fast::LdWSp { .. } | Fast::LdBu { .. } | Fast::StW { .. } | Fast::StWSp { .. }
+            | Fast::ShlI { .. } | Fast::SarI { .. } | Fast::SpAdd { .. } | Fast::SpFromR { .. } | Fast::RFromSp { .. }
+            | Fast::BitExt { .. } | Fast::BitIns { .. } | Fast::SetIe { .. } | Fast::IcfgRd { .. } | Fast::IcfgWr { .. }
+            | Fast::BlockMove { .. } | Fast::PopRets | Fast::Tb { .. } | Fast::Mov2 { .. } | Fast::Mov2I { .. }
+            | Fast::Un { .. } | Fast::Div { .. } | Fast::LdPre { .. } | Fast::StPre { .. } | Fast::LdPostR { .. }
+            | Fast::StPostR { .. } => false,
+        }
+    }
+
+    /// Does this op read the arithmetic flags? No micro-op does (`addc` / `subc` and `psr` reads
+    /// are `step`'s), but `Raw` and `Swap` may (neither is ever swapped). Every op is listed, as
+    /// for `sets_flags`, so a new one has to say.
+    fn reads_flags(&self) -> bool {
+        match *self {
+            Fast::Raw { .. } | Fast::Swap { .. } => true,
+            Fast::Mov { .. } | Fast::MovI { .. } | Fast::Alu3 { .. } | Fast::Alu3I { .. } | Fast::Alu2 { .. }
+            | Fast::Alu2I { .. } | Fast::Ld { .. } | Fast::St { .. } | Fast::BrI { .. } | Fast::BrR { .. } | Fast::FOp { .. }
+            | Fast::Goto { .. } | Fast::Call { .. } | Fast::Rts | Fast::CallR { .. } | Fast::GotoR { .. } | Fast::A4 { .. }
+            | Fast::BitBr { .. } | Fast::LdIdx { .. } | Fast::StIdx { .. } | Fast::Rmw { .. } | Fast::LdPost { .. }
+            | Fast::StPost { .. } | Fast::DecBr { .. } | Fast::Ext { .. } | Fast::MemA4 { .. } | Fast::Nop
+            | Fast::PushRets { .. } | Fast::PopPc { .. } | Fast::PushMask { .. } | Fast::PopMask { .. } | Fast::PushRet
+            | Fast::PopRet | Fast::MinMax { .. } | Fast::IfBlk { .. } | Fast::BrIEq { .. } | Fast::BrINe { .. }
+            | Fast::LdW { .. } | Fast::LdWSp { .. } | Fast::LdBu { .. } | Fast::StW { .. } | Fast::StWSp { .. }
+            | Fast::AddRI { .. } | Fast::ShlI { .. } | Fast::SarI { .. } | Fast::SpAdd { .. } | Fast::SpFromR { .. }
+            | Fast::RFromSp { .. } | Fast::BitExt { .. } | Fast::BitIns { .. } | Fast::SetIe { .. } | Fast::IcfgRd { .. }
+            | Fast::IcfgWr { .. } | Fast::BlockMove { .. } | Fast::PopRets | Fast::Tb { .. } | Fast::Mov2 { .. }
+            | Fast::Mov2I { .. } | Fast::Un { .. } | Fast::Div { .. } | Fast::LdPre { .. } | Fast::StPre { .. }
+            | Fast::LdPostR { .. } | Fast::StPostR { .. } => false,
         }
     }
 
@@ -5769,9 +5807,12 @@ fn sp_mem_raw(raw: u64) -> Option<SpMem> {
 #[derive(Clone, Copy, Debug)]
 struct IncMem { d: usize, b: usize, w: u8, store: bool, signed: bool, inc: i32, pre: bool, post: bool }
 /// Routes 18 / 19 as micro-ops the compilers have (exec_raw's arm, its rules kept): a
-/// post-increment is `LdPost` / `StPost`, a word at an offset `Ld` / `St`. A load into the base
-/// register itself leaves the incremented base (exec_raw updates the base after the load,
-/// `LdPost` adds to what was loaded), and a pre-increment, stay raw.
+/// post-increment is `LdPost` / `StPost`, a word at an offset `Ld` / `St`. A post-increment load
+/// into its own base must stay raw: exec_raw updates the base after the load, so it leaves the
+/// incremented base, while `LdPost` adds to what was loaded (it reads b after the load). A
+/// pre-increment would be exact as `LdPre` / `StPre` (`i: 16`, base == data included), but stays
+/// raw: compiled code would gain nothing, since the compilers reach `LdPre` / `StPre` through the
+/// executor, the same call the raw route makes.
 fn inc_mem_fast(route: u8, raw: u32) -> Fast {
     let m = decode_inc_mem(route, raw as u64);
     let (d, b, inc) = (m.d as u8, m.b as u8, m.inc as u32);
