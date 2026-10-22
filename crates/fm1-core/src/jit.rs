@@ -223,9 +223,14 @@ struct ITab {
     body: u64,
 }
 const ITAB_BITS: u32 = 14;
-/// (no instruction starts at an odd pc that is all ones)
-const ITAB_EMPTY: ITab = ITab { pc: u32::MAX, _pad: 0, body: 0 };
 const _: () = assert!(std::mem::size_of::<ITab>() == 16);
+
+/// Empty entry i: its tag is a pc of another entry, so no computed target matches it (a tag no
+/// instruction starts at, such as all ones, still matches a guest that jumps there: through an
+/// erased-flash pointer or a trashed rets, into body 0).
+fn itab_empty(i: usize) -> ITab {
+    ITab { pc: ((i as u32) ^ 1) << 1, _pad: 0, body: 0 }
+}
 
 /// The `itab` entry of pc (generated code computes the same: `Gen::ind`).
 fn itab_slot(pc: u32) -> usize {
@@ -272,7 +277,7 @@ const HOT: u32 = 32;
 
 impl Jit {
     pub fn new(profile: bool) -> Option<Jit> {
-        let itab = vec![ITAB_EMPTY; 1 << ITAB_BITS].into_boxed_slice();
+        let itab = (0..1 << ITAB_BITS).map(itab_empty).collect();
         Some(Jit { cache: CodeCache::new(64 << 20)?, state: Vec::new(), guards: Vec::new(), profile, itab })
     }
 
@@ -370,7 +375,7 @@ impl Jit {
         self.state.clear();
         self.cache.used = 0;
         self.guards.clear();
-        self.itab.fill(ITAB_EMPTY);
+        self.itab.iter_mut().enumerate().for_each(|(i, e)| *e = itab_empty(i));
     }
 }
 
@@ -1591,7 +1596,19 @@ mod tests {
         assert_eq!((cpu.regs[0], cpu.pc), (0, 32));
         // a reset forgets the table
         j.reset();
-        assert!(j.itab.iter().all(|e| e.pc == u32::MAX));
+        assert!(j.itab.iter().enumerate().all(|(i, e)| e.pc == itab_empty(i).pc && itab_slot(e.pc) != i));
+    }
+
+    /// A computed jump to 0xffff_ffff (an erased-flash function pointer, a trashed rets) whose
+    /// entry is empty goes back to Rust there, as the interpreter would, not into body 0.
+    #[test]
+    fn computed_jump_to_all_ones_goes_back_to_rust() {
+        let mut bus = Memory::new(); let mem = bus.jit_mem().unwrap();
+        let mut j = Jit::new(false).unwrap();
+        let rts = hot(&mut j, 0, 0, &[op(Fast::Rts)], &mem);
+        let mut cpu = Cpu::new(0); cpu.rets = u32::MAX;
+        assert_eq!(unsafe { run(rts, &mut cpu, &mut bus, &mem, 0, 10, false) }.0, 1);
+        assert_eq!(cpu.pc, u32::MAX);
     }
 
     /// A swapped pair (`Fast::Swap`) compiled: its second instruction, then the head. Random
