@@ -63,8 +63,8 @@ struct Pace {
 }
 
 impl Pace {
-    /// A quantum of `frames` begins: its share of emulated time on top of what is left (a
-    /// quantum that could not run its share banks at most one more).
+    /// A quantum of `frames` begins: its share of emulated time, on top of the debt a quantum
+    /// left that ran more than its share (time it left unrun is not banked: at most one share).
     fn begin(&mut self, frames: usize, hz: u64) {
         let share = frames as i64 * hz as i64;
         self.credit = (self.credit + share).min(share);
@@ -89,6 +89,18 @@ impl Pace {
         if halves > 0 {
             self.burst = self.burst.max(arrived / halves as usize);
         }
+    }
+
+    /// The run budget (cpu0's instructions, at most one per cycle) a quantum of `frames` needs
+    /// at the least once audio plays, given that budget's cap of 1.5 quanta (web/worklet.js).
+    /// The pace keeps the queue at most `ahead` frames beyond the quantum's; when that is less
+    /// than a half buffer, emulated time lags the audio by the rest, and the quantum that empties
+    /// the queue must run that much on top of its own frames before the next half arrives.
+    fn least(&self, frames: usize, hz: u64, ahead: usize) -> u64 {
+        if ahead == 0 || self.burst <= frames {
+            return 0;
+        }
+        (self.burst - ahead.min(self.burst) + frames * 3 / 2) as u64 * hz / AUDIO_HZ as u64
     }
 
     /// The quantum is over. Time run because the queue was short is not owed back: that is
@@ -317,8 +329,8 @@ pub extern "C" fn fm1_bench_script(ptr: *mut u8, len: u32) -> u32 {
 }
 
 /// Render `frames` (<= 1024) stereo frames into the out buffers, running the machine until the
-/// I2S DMA has produced them (at most `max_insns`; with `fm1_ahead`, also the quantum's share of
-/// emulated time). Returns the frames that are real audio.
+/// I2S DMA has produced them (at most `max_insns`, raised to what the pace needs; with
+/// `fm1_ahead`, also the quantum's share of emulated time). Returns the frames that are real audio.
 #[no_mangle]
 pub extern "C" fn fm1_render(frames: u32, max_insns: u32) -> u32 {
     let Some(m) = machine() else { return 0 };
@@ -332,6 +344,8 @@ pub extern "C" fn fm1_render(frames: u32, max_insns: u32) -> u32 {
     let ahead = unsafe { AHEAD } as usize;
     let mut spent = 0u32;
     m.pace.begin(frames, m.soc.periph.hz);
+    // a cap below what the pace needs would drop out where running for the frames alone did not
+    let max_insns = max_insns.max(m.pace.least(frames, m.soc.periph.hz, ahead).min(u32::MAX as u64) as u32);
     while spent < max_insns && !m.halted && m.pace.more(m.audio.len() / 2, frames, ahead) {
         let (c0, h0) = (m.soc.periph.cycles, m.soc.periph.audio_halves);
         m.run(20_000);
@@ -767,23 +781,30 @@ mod persistence_tests {
 mod pace_tests {
     use super::*;
 
-    /// fm1_render's loop over a model DMA: `half` frames every `half` frames of emulated time,
-    /// chunks of about 20k cycles (some much longer: idle skipped). Per quantum after warm-up:
-    /// the most cycles one quantum ran, in quanta's shares, and the most frames queued ahead.
-    fn simulate(half: usize, ahead: usize, hz: u64) -> (f64, usize) {
+    /// fm1_render's loop over a model DMA: `half` frames every `half` frames of emulated time at
+    /// the I2S's rate (24 MHz / 544, a little faster than AUDIO_HZ), chunks of 20k instructions
+    /// and about 20k cycles (some much longer: idle skipped). `capped`: the run budget the
+    /// worklet hands out, 20 ms of emulated time until audio plays and 1.5 quanta after, raised
+    /// as fm1_render raises it; otherwise none. Returns, per quantum after warm-up, the most
+    /// cycles one quantum ran in quanta's shares and the most frames queued ahead; and the
+    /// quanta short of audio once it played.
+    fn simulate(half: usize, ahead: usize, hz: u64, capped: bool) -> (f64, usize, usize) {
         let frames = 128;
-        let period = half as u64 * hz / AUDIO_HZ as u64;
+        let period = half as u64 * 544 * hz / 24_000_000;
         let (mut t, mut next, mut queued) = (0u64, period, 0usize);
         let mut pace = Pace::default();
-        let (mut worst, mut deepest) = (0f64, 0);
+        let (mut worst, mut deepest, mut short, mut playing) = (0f64, 0, 0, false);
+        let mut budget = if capped { hz / 50 } else { u64::MAX };
         let mut seed = 1u32;
         for q in 0..4000 {
             pace.begin(frames, hz);
-            let t0 = t;
-            while pace.more(queued, frames, ahead) {
+            let max_insns = budget.max(pace.least(frames, hz, ahead));
+            let (t0, mut spent) = (t, 0);
+            while spent < max_insns && pace.more(queued, frames, ahead) {
                 seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
                 let c = if seed >> 28 == 0 { 300_000 } else { 15_000 + (seed >> 16) as u64 % 10_000 };
                 t += c;
+                spent += 20_000;
                 let (mut arrived, mut halves) = (0, 0);
                 while t >= next {
                     arrived += half;
@@ -794,22 +815,32 @@ mod pace_tests {
                 queued += arrived;
             }
             pace.end();
-            assert!(queued >= frames, "quantum {q} short");
-            queued -= frames;
+            if queued > 0 && !playing {
+                playing = true;
+                if capped && ahead > 0 {
+                    budget = frames as u64 * 3 / 2 * hz / AUDIO_HZ as u64;
+                }
+            }
+            if playing && queued < frames {
+                short += 1;
+            }
+            queued = queued.saturating_sub(frames);
             if q > 100 {
                 worst = worst.max((t - t0) as f64 / (frames as u64 * hz / AUDIO_HZ as u64) as f64);
                 deepest = deepest.max(queued);
             }
         }
-        (worst, deepest)
+        (worst, deepest, short)
     }
 
     #[test]
     fn half_buffers_of_any_size_make_the_same_even_work() {
         for hz in [60_000_000, 240_000_000] {
             for half in [128, 256, 512] {
-                let (bursty, _) = simulate(half, 0, hz);
-                let (even, deepest) = simulate(half, 1024, hz);
+                let (bursty, _, short) = simulate(half, 0, hz, false);
+                assert_eq!(short, 0);
+                let (even, deepest, short) = simulate(half, 1024, hz, false);
+                assert_eq!(short, 0);
                 // without: a quantum runs a whole half buffer's time (less one chunk's slack)
                 assert!(bursty > (half / 128) as f64 - 0.6, "{half} at {hz}: {bursty}");
                 // with: about one share (plus the chunks idle skipping stretches), and at most a
@@ -824,14 +855,28 @@ mod pace_tests {
     fn half_buffers_no_larger_than_a_quantum_run_as_without() {
         // they make even work as they are: running ahead would only add latency
         for half in [64, 128] {
-            assert_eq!(simulate(half, 1024, 240_000_000), simulate(half, 0, 240_000_000));
+            assert_eq!(simulate(half, 1024, 240_000_000, false), simulate(half, 0, 240_000_000, false));
         }
     }
 
     #[test]
     fn ahead_is_capped() {
         // the cap stops it: at most `ahead` frames beyond the quantum's
-        let (_, deepest) = simulate(512, 128, 240_000_000);
+        let (_, deepest, _) = simulate(512, 128, 240_000_000, false);
         assert!(deepest <= 128 + 512, "{deepest}");
+    }
+
+    #[test]
+    fn the_capped_budget_never_drops_out() {
+        // the worklet's 1.5 quanta, raised by what the pace lacks when it may not run a whole
+        // half buffer ahead (a small ?ahead=, or halves larger than AHEAD_FRAMES)
+        for hz in [60_000_000, 240_000_000] {
+            for half in [128, 256, 384, 512, 1024, 1152, 1536, 2048] {
+                for ahead in [1, 64, 128, 256, 384, 1024, 4096] {
+                    let (_, _, short) = simulate(half, ahead, hz, true);
+                    assert_eq!(short, 0, "half {half}, ahead {ahead} at {hz}");
+                }
+            }
+        }
     }
 }

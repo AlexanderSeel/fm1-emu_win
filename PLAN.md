@@ -844,7 +844,11 @@ uneven work per emulated millisecond (X0X's slow quanta cost twice its mean), no
 The worklet's budget was 20 ms of emulated time per quantum throughout. Now that holds while a
 firmware boots (Tonitor boots 3.8 s silent), and once audio plays it is 1.5 quanta (with the pace
 on), so a stalled firmware no longer holds the audio thread ~7 quanta' worth at a time.
-`?ahead=0` turns the pace off and keeps the 20 ms.
+`?ahead=0` turns the pace off and keeps the 20 ms. The 1.5 quanta suffice only when the pace may
+run a whole half buffer ahead: with less (`?ahead=256` on X0X's 512-frame halves, or halves larger
+than the default 1024), the quantum that empties the queue must also run the rest of the half
+buffer, and X0X dropped every fourth quantum (458 in 6 s at 240 MHz). `fm1_render` raises the cap
+by that rest (`Pace::least`); `simulate` checks no quantum is short for halves of 128-2048 frames.
 
 The status line's "M instructions/s" was cpu0's run budget in 20k chunks. It is now the speed:
 emulated time per time spent emulating, as `bench.mjs` and `fm1-live --bench` print it. The copied

@@ -37,8 +37,10 @@ function jitImports(exports, stats) {
 // How much a quantum may emulate, in the emulator's run budget (cpu0's instructions, at most
 // one per cycle): while the firmware boots, 20 ms of emulated time, so a boot is quick (there is
 // no audio to keep yet); once audio plays, 1.5 quanta, so a firmware that stalls or falls silent
-// does not hold the audio thread for 20 ms each quantum. The pace (fm1_ahead) needs one quantum;
-// without it (?ahead=0) a quantum may have to run a whole half buffer's time, so it keeps 20 ms.
+// does not hold the audio thread for 20 ms each quantum. The pace (fm1_ahead) needs one quantum
+// when it may run a whole DMA half buffer ahead; fm1_render raises the cap by the rest of the half
+// buffer when ahead is less (?ahead=256 with 512-frame halves). Without the pace (?ahead=0) a
+// quantum may have to run a whole half buffer's time, so it keeps 20 ms.
 const AHEAD_FRAMES = 1024;
 function budgets(mhz, frames) {
   return { boot: mhz * 1e6 * 0.02, play: mhz * 1e6 * 1.5 * frames / sampleRate };
