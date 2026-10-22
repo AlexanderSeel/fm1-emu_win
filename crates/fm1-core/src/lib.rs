@@ -1041,17 +1041,21 @@ impl Cpu {
     fn sreg_index(n: &str) -> usize {
         match n { "icfg" => 0, "reti" => 1, "retx" => 2, "rete" => 3, "sspn" => 4, "sr4" => 6, _ => 5 }
     }
+    /// `icfg` as read: low byte, the ISR priorities in progress (`icfg & 0xff` is the RTOS's
+    /// "in interrupt context" test); bit 9, the global enable `sti` / `cli` set and clear (the
+    /// SDK's cpu_irq_disabled() is `(icfg & 0x300) != 0x300`, bit 8 being the software master
+    /// enable; the stock RTOS asserted in os_mutex_pend while bit 9 read 0). Writes keep their own
+    /// bit 9 out of it.
+    #[inline]
+    fn icfg(&self) -> u32 {
+        let active = self.irq_levels.iter().fold(0u32, |m, &p| m | 1 << p);
+        (self.sreg_store[0] & !0x2ff) | active | if self.ie { 0x200 } else { 0 }
+    }
     fn sregs(&self, n: &str) -> u32 {
         if n == "cnum" {
             self.core_id
         } else if n == "icfg" {
-            // low byte: the ISR priorities in progress (`icfg & 0xff` is the
-            // RTOS's "in interrupt context" test); bit 9: the global enable `sti` / `cli`
-            // set and clear (the SDK's cpu_irq_disabled() is `(icfg & 0x300) != 0x300`,
-            // bit 8 being the software master enable; the stock RTOS asserted in
-            // os_mutex_pend while bit 9 read 0). Writes keep their own bit 9 out of it.
-            let active = self.irq_levels.iter().fold(0u32, |m, &p| m | 1 << p);
-            (self.sreg_store[0] & !0x2ff) | active | if self.ie { 0x200 } else { 0 }
+            self.icfg()
         } else if n == "psr" {
             (self.sreg_store[5] & !0xf) | self.flags
         } else {
@@ -1305,6 +1309,16 @@ impl Cpu {
         None
     }
 
+    /// `exec_fast` for a `quiet` op (CPU state only: the compilers call it without the bus).
+    #[cfg(native_jit)]
+    fn exec_quiet(&mut self, f: Fast) {
+        match f {
+            Fast::SetIe { on: false } => self.ie = false,
+            Fast::IcfgRd { d } => self.regs[(d & 15) as usize] = self.icfg(),
+            _ => unreachable!("exec_quiet: {f:?}"),
+        }
+    }
+
     /// `exec_fast` for the rarer micro-ops.
     #[inline(never)]
     fn exec_rare<B: Bus>(&mut self, bus: &mut B, f: Fast, next_pc: u32) -> Option<u32> {
@@ -1320,7 +1334,7 @@ impl Cpu {
                     bus.irq_window();
                 }
             }
-            Fast::IcfgRd { d } => self.regs[(d & 15) as usize] = self.sregs("icfg"),
+            Fast::IcfgRd { d } => self.regs[(d & 15) as usize] = self.icfg(),
             Fast::IcfgWr { s } => {
                 self.sreg_store[0] = self.regs[(s & 15) as usize];
                 bus.irq_window();
@@ -5127,6 +5141,13 @@ impl Fast {
             Fast::AddRI { .. } => true,
             _ => false,
         }
+    }
+
+    /// Does this op touch only the CPU (no bus, no clock, no interrupt window) and never jump?
+    /// `cli` and `R = icfg`: compiled code calls `Cpu::exec_quiet` for them, not the executor.
+    #[cfg(native_jit)]
+    fn quiet(&self) -> bool {
+        matches!(self, Fast::SetIe { on: false } | Fast::IcfgRd { .. })
     }
 
     /// May this op change pc to anything but the next instruction?
