@@ -68,6 +68,10 @@ pub struct Ctx {
     irq: u32,
     /// the chain slot of the exit taken back to Rust (null: not a chainable exit)
     slot: *mut u64,
+    /// the bus's count of code-word writes at entry, as RAM guards compare it (`RamGuard::ver`;
+    /// u64::MAX - 1: the bus keeps none). It stays the count while compiled code runs: a write
+    /// to a code word sets brk, and the code leaves right after that instruction.
+    ver: u64,
     /// it left after a swapped pair with an interrupt pending: `run_fast` stops there too
     stop: u32,
     _pad: u32,
@@ -75,6 +79,8 @@ pub struct Ctx {
 }
 const OFF_BRK: u32 = 24;
 const OFF_SLOT: u32 = 32;
+const OFF_VER: u32 = 40;
+const _: () = assert!(std::mem::offset_of!(Ctx, ver) == OFF_VER as usize);
 const _: () = assert!(std::mem::offset_of!(Ctx, brk) == OFF_BRK as usize);
 const _: () = assert!(std::mem::offset_of!(Ctx, irq) == OFF_BRK as usize + 4);
 const _: () = assert!(std::mem::offset_of!(Ctx, slot) == OFF_SLOT as usize);
@@ -333,6 +339,7 @@ pub(crate) unsafe fn run<B: Bus>(code: *const u8, cpu: &mut Cpu, bus: &mut B, me
         brk: 0,
         irq: 2,
         slot: std::ptr::null_mut(),
+        ver: bus.code_writes().unwrap_or(u64::MAX - 1),
         stop: 0,
         _pad: 0,
         code_version: bus.code_writes(),
@@ -484,22 +491,35 @@ fn op_helper<B: Bus>(op: &Fast, profile: bool) -> u64 {
 
 // Each RAM body owns an immutable snapshot. Even an old incoming chain remains safe
 // after its block has been rebuilt: it must validate the code it actually executes.
+#[repr(C)]
 struct RamGuard {
+    /// the bus's count of code-word writes when the snapshot was last found current (u64::MAX:
+    /// never, or the bus keeps none): while `Ctx::ver` is the same, compiled code enters
+    /// without calling `h_ram_ok` (generated code reads it: offset 0)
+    ver: u64,
     pc: u32,
     bytes: Box<[u8]>,
-    version: Option<u64>,
+}
+const _: () = assert!(std::mem::offset_of!(RamGuard, ver) == 0);
+
+impl RamGuard {
+    fn new(pc: u32, bytes: Box<[u8]>) -> RamGuard {
+        RamGuard { ver: u64::MAX, pc, bytes }
+    }
 }
 
 code_abi! {
+/// A RAM body's guard when its count is not `Ctx::ver`: is the snapshot what memory holds?
 fn h_ram_ok<B: Bus>(ctx: *mut Ctx, guard: *mut RamGuard) -> u32 {
     let ctx = unsafe { &mut *ctx };
     let bus = unsafe { &mut *(ctx.bus as *mut B) };
     let guard = unsafe { &mut *guard };
     let version = bus.code_writes();
-    if version.is_some() && guard.version == version { return 1; }
     let valid = crate::ram_code(bus, guard.pc)
         .is_some_and(|now| now.len() >= guard.bytes.len() && now[..guard.bytes.len()] == *guard.bytes);
-    if valid { guard.version = version; }
+    if valid {
+        guard.ver = version.unwrap_or(u64::MAX);
+    }
     valid as u32
 }
 }
@@ -1284,11 +1304,16 @@ fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], pc0: u32, mem
         let len = len.min((mem.ram_len as usize).checked_sub(off)?);
         // SAFETY: jit_mem provides a live RAM allocation, and the range is checked above.
         let bytes = unsafe { std::slice::from_raw_parts(mem.ram.add(off), len) }.into();
-        guards.push(Box::new(RamGuard { pc: pc0, bytes, version: None }));
-        let guard = guards.last_mut().unwrap().as_mut();
+        guards.push(Box::new(RamGuard::new(pc0, bytes)));
+        let guard = guards.last_mut().unwrap().as_mut() as *mut RamGuard as u64;
         let valid = g.a.label();
+        // no code word written since the snapshot was last found current: no call
+        g.a.ldr_x(9, CTX, OFF_VER);
+        g.a.mov64(1, guard);
+        g.a.ldr_x(10, 1, 0);
+        g.a.cmp_x(9, 10);
+        g.a.b_cond(AC::Eq, valid);
         g.a.mov_x(0, CTX);
-        g.a.mov64(1, guard as *mut RamGuard as u64);
         g.call(h_ram_ok::<B> as *const () as u64);
         g.a.cbnz(0, valid);
         g.exit_imm(pc0, 0);
@@ -1534,6 +1559,48 @@ mod tests {
             assert_eq!((regs(&cpu), cpu.pc), (regs(&e), pc), "{head:?} then {tail:?}");
             assert_eq!(bus.data, reference.data, "{head:?} then {tail:?}");
         }
+    }
+
+    /// A RAM body enters without `h_ram_ok` while the bus's count of code-word writes is the
+    /// one its snapshot was last found current at (`RamGuard::ver`); a write the bus counts
+    /// sends it to `h_ram_ok`, which compares the snapshot: still the same (the write was not to
+    /// its bytes) enters, else back to Rust. A compiled store into its own code word leaves
+    /// right after it, and the body is not entered again.
+    #[test]
+    fn ram_guards_compare_the_write_count_inline() {
+        let mut bus = Memory::new(); let mem = bus.jit_mem().unwrap();
+        bus.flags.fill(0); // (no watched words yet: compiled stores go straight to RAM)
+        let mut j = Jit::new(false).unwrap();
+        let ops = [op(Fast::MovI { d: 0, v: 42 }), op(Fast::St { s: 2, b: Base::Reg(1), off: 0, w: 1 })];
+        let code = hot(&mut j, 0, 32, &ops, &mem);
+        let guard = &j.guards[0];
+        assert_eq!(guard.ver, u64::MAX);
+        let fresh = |r1: u32| { let mut c = Cpu::new(32); (c.regs[1], c.regs[2]) = (r1, 0x5a); c };
+        // the first entry finds the snapshot current (a call), the count is kept
+        let mut cpu = fresh(200);
+        assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10) }.0, 2);
+        assert_eq!((cpu.regs[0], cpu.pc, bus.data[200]), (42, 36, 0x5a));
+        assert_eq!(j.guards[0].ver, bus.version);
+        // the snapshot changed behind the bus's back (no count): the inline compare enters
+        // anyway (the bus counts every write that can reach code: that is what it relies on)
+        bus.data[32] ^= 0xff;
+        let mut cpu = fresh(200);
+        assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10) }.0, 2);
+        bus.data[32] ^= 0xff;
+        // a counted write elsewhere: h_ram_ok compares, finds it current, takes the new count
+        bus.write8(100, 1);
+        let mut cpu = fresh(200);
+        assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10) }.0, 2);
+        assert_eq!(j.guards[0].ver, bus.version);
+        // the body's store into its own code (a watched word: through the bus, which counts it):
+        // it leaves right after, and the next entry finds the snapshot changed
+        bus.flags[33 / 4] = 1;
+        let mut cpu = fresh(33);
+        assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10) }.0, 2);
+        assert_eq!((bus.data[33], cpu.pc), (0x5a, 36));
+        let mut cpu = fresh(200);
+        assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10) }.0, 0);
+        assert_eq!((cpu.regs[0], cpu.pc), (0, 32));
     }
 
     #[test]
