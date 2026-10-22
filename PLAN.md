@@ -864,6 +864,41 @@ would not help. It also says to close the developer tools (with a debugger attac
 own spikes at the cost of more latency; moving the emulation to a Worker (P-core placement on
 hybrid CPUs) is 5.27's estimate, not tried.
 
+## 5.30 Micro-ops for what still went through the executor or step; pairs that run second first (2026-10-22)
+
+From the interpreter and JIT reviews of 5.27, the items that need no new generated code in either
+native backend (the generated-code ones — returns through a pc table, compiled swapped pairs, the
+RAM guard's version compared inline, predicated prefixes — follow on top):
+
+- `call R` / `goto R` are micro-ops (`Fast::CallR`, `Fast::GotoR`; compiled code calls the
+  executor for them). Blocks no longer end at them. Few are left on core 0 now (Melodee about
+  60 K a second), so the gain is small; with 5.28's budgets it moves no audio.
+- Routes 18 / 19, loads and stores with an increment, are the micro-ops every backend compiles
+  inline: `LdPost` / `StPost`, `Ld` / `St` for a word at an offset (`inc_mem_fast`). A load into
+  its own base register and the pre-increments stay raw (exec_raw's rule differs there). JIT:
+  Grimm 2.8x -> 5.6x, FM-106 +70%, OberVave +34%, and a dozen catalog firmwares +80-165%.
+- RAM blocks are checked by the bus's code-write count natively too (was the wasm build's only;
+  the native JIT's RAM guards already relied on it): every write that can reach a block's bytes is
+  counted, compiled code's inline stores included. Melodee interpreted +12%.
+- `Fast::Swap`: a dual-issue pair whose second instruction reads what a register-only head writes
+  (so it cannot be glued), where the head reads and writes nothing the second writes and not both
+  set the flags, is one op of two instructions that runs the second first, then the head — the
+  pair rule's result. `run_fast` runs it whole when nothing is in progress, both fit the budget and
+  the second one's tick is not due; else as the two careful steps. Careful: compiled code still
+  stops before it (the follow-up can compile it). Plain ops in an if-else then-part apply
+  `finish`'s skip rule without the general careful path. FM1-DOOM +15% JIT, +10% interpreted.
+- `cli` and `R = icfg`: compiled code calls a quiet helper (CPU state only: no tick sync, nothing
+  due after) with the same arguments as `h_op`; icfg is read without a string match. GhoulBox +5%.
+
+Exactness: all 82 catalog firmwares, the stock one and FM1 Open, JIT and interpreted, 8 s with
+keys: byte-identical to master, and JIT == interpreter on every one. The browser build gives
+master's audio on Felucca, FM1-DOOM, Melodee and the stock firmware, JIT and not. New tests: route
+18 / 19 micro-ops against exec_raw's arm (20000 random encodings), swapped pairs against the pair
+rule (random heads and second instructions: registers, flags, sp, rets, pc, memory), a real pair
+in a block cut by the budget, and the JIT random-state test with call R, goto R, cli, sti and both
+icfg moves (interrupt state compared). Speed (this Mac, loaded; one run per firmware): JIT
+geomean +16%, interpreted +4%.
+
 ## 6. Phase 5 — Boot & integration
 
 - Boot stock firmware to a stable idle/main-loop state.

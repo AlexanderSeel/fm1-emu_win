@@ -372,6 +372,32 @@ fn h_op<B: Bus, const PROF: bool>(ctx: *mut Ctx, op: *const Fast, idx: u32, next
 }
 }
 
+code_abi! {
+/// `h_op` for a `Fast::quiet` op (`cli`, `R = icfg`): CPU state only, so as for an op compiled
+/// inline, no ticks to sync first and nothing due after (it cannot change either).
+fn h_op_quiet<const PROF: bool>(ctx: *mut Ctx, op: *const Fast, _idx: u32, _next_pc: u32) -> u64 {
+    // SAFETY: as h_op.
+    let ctx = unsafe { &mut *ctx };
+    let cpu = unsafe { &mut *ctx.cpu };
+    if PROF {
+        cpu.profile_helper(unsafe { &*op });
+    }
+    cpu.exec_quiet(unsafe { *op });
+    0
+}
+}
+
+/// The helper compiled code calls for an op it has no code of its own for: `h_op`, or for a
+/// quiet one `h_op_quiet` (the same arguments and result).
+fn op_helper<B: Bus>(op: &Fast, profile: bool) -> u64 {
+    match (op.quiet(), profile) {
+        (true, true) => h_op_quiet::<true> as *const () as u64,
+        (true, false) => h_op_quiet::<false> as *const () as u64,
+        (false, true) => h_op::<B, true> as *const () as u64,
+        (false, false) => h_op::<B, false> as *const () as u64,
+    }
+}
+
 // Each RAM body owns an immutable snapshot. Even an old incoming chain remains safe
 // after its block has been rebuilt: it must validate the code it actually executes.
 struct RamGuard {
@@ -424,7 +450,6 @@ struct Gen<'a> {
     exit: Label,
     h_read: u64,
     h_write: u64,
-    h_op: u64,
 }
 
 fn off_reg(r: u8) -> u32 {
@@ -680,7 +705,6 @@ fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<
         exit,
         h_read: h_read::<B> as *const () as u64,
         h_write: h_write::<B> as *const () as u64,
-        h_op: if profile { h_op::<B, true> as *const () as u64 } else { h_op::<B, false> as *const () as u64 },
     };
     // prologue (entry from Rust); chained blocks enter at the body
     g.a.stp_pre(29, 30, SP, -FRAME);
@@ -1120,7 +1144,7 @@ fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<
                 g.a.mov64(1, p as *const Fast as u64);
                 g.idx_w2(idx);
                 g.a.mov32(3, next_pc);
-                g.call(g.h_op);
+                g.call(op_helper::<B>(&other, profile));
                 let fall = g.a.label();
                 g.a.tbz(0, 32, fall); // bit 32: jumped (x0)
                 g.exit_reg(0, count);
@@ -1250,7 +1274,8 @@ mod tests {
 
     /// Every micro-op the compilers emit inline (and some through the executor), each alone in a block, from random registers
     /// (floats among them: NaN, both zeros, infinities, out of the integers' range): compiled
-    /// code and the interpreter must leave the same registers, sp, rets, pc and memory.
+    /// code and the interpreter must leave the same registers, sp, rets, pc, memory and interrupt
+    /// state (`ie`, icfg).
     #[test]
     fn compiled_ops_match_interpreter_from_random_state() {
         use crate::{Cond, Op, RmwOp};
@@ -1319,7 +1344,9 @@ mod tests {
             Fast::Goto { target: 0x40 }, Fast::Call { target: 0x40 }, Fast::Rts,
             Fast::LdW { d: 0, b: 8, off: 4 }, Fast::LdWSp { d: 0, off: 8 }, Fast::LdBu { d: 0, b: 10, off: 3 },
             Fast::StW { s: 1, b: 8, off: 4 }, Fast::StWSp { s: 1, off: 8 },
-            Fast::PopRets, Fast::PushRet, Fast::PopRet]);
+            Fast::PopRets, Fast::PushRet, Fast::PopRet,
+            Fast::CallR { r: 1 }, Fast::CallR { r: 8 }, Fast::GotoR { r: 2 }, Fast::GotoR { r: 9 },
+            Fast::SetIe { on: false }, Fast::SetIe { on: true }, Fast::IcfgRd { d: 3 }, Fast::IcfgWr { s: 4 }]);
         let mut jit = Jit::new(false).unwrap();
         for (j, mut fast) in cases.into_iter().enumerate() {
             for round in 0..24 {
@@ -1336,15 +1363,19 @@ mod tests {
                 cpu.regs[8] = 64 + (rnd() % 32) * 4; cpu.regs[9] = 65 + (rnd() % 32) * 2; cpu.regs[10] = 129 + rnd() % 64;
                 cpu.regs[11] = rnd() % 16;
                 cpu.sp = 192; cpu.rets = 0x0200_1234;
+                // (the interrupt state `cli`, `sti` and icfg read and write)
+                cpu.ie = rnd() & 1 != 0; cpu.sreg_store[0] = rnd(); cpu.irq_levels = (0..rnd() % 3).map(|_| (rnd() % 8) as u8).collect();
                 if let Fast::DecBr { ref mut v, .. } = fast { *v = cpu.regs[3].wrapping_sub(1); }
                 let mut expected = Cpu::new(0);
                 expected.regs = cpu.regs; expected.sp = cpu.sp; expected.rets = cpu.rets;
+                (expected.ie, expected.sreg_store, expected.irq_levels) = (cpu.ie, cpu.sreg_store, cpu.irq_levels.clone());
                 expected.pc = expected.exec_fast(&mut reference, fast, 2).unwrap_or(2);
                 let code = hot(&mut jit, j * 24 + round, 0, &[op(fast)], &mem);
                 assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 1) }.0, 1, "{fast:?}");
                 let regs = |c: &Cpu| c.regs.map(|r| format!("{r:08x}"));
                 assert_eq!((regs(&cpu), cpu.sp, cpu.rets, cpu.pc), (regs(&expected), expected.sp, expected.rets, expected.pc),
                     "case {j} round {round}: {fast:?}");
+                assert_eq!((cpu.ie, cpu.sreg_store), (expected.ie, expected.sreg_store), "case {j} round {round}: {fast:?}");
                 assert_eq!(bus.data, reference.data, "case {j} round {round}: {fast:?}");
             }
         }
