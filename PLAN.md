@@ -853,7 +853,11 @@ runs in one stretch instead of 4096-instruction ones (a skip was cut at 4096): t
 stops at the release of cpu1 and says how far it got, and the rest of the 4096-chunk the
 release fell in is still not run, so cpu1 starts where it did. (That forfeit is master's
 accounting kept for the same output; dropping it would move every dual-core firmware's timeline
-by up to 4095 instructions, once.)
+by up to 4095 instructions, once.) No probe while a release is latched (`Soc::cpu1_release`):
+the block loop then breaks after every `run_fast` return, and a skip would carry cpu0 past where
+it stops without one. Master latches it again on any later 0 -> 1 of 0x10008 bit 3, with cpu1
+already running, and nothing takes it (cpu0 then runs one instruction a slice); no firmware
+tested does that, and the latch is for a change of its own.
 
 All 82 catalog firmwares, the stock one and FM1 Open, JIT and interpreted, --bench 8000 with
 keys: the same audio as before, byte for byte, JIT = interpreter, also with FM1_NO_LOOPSKIP;

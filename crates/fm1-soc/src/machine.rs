@@ -477,7 +477,9 @@ pub fn run_blocks(cpu: &mut Cpu, soc: &mut Soc, n: u32, pending_tick: &mut bool)
             }
         }
         let now = soc.periph.cycles;
-        if soc.loop_skip.enabled && n - done >= PROBE_MIN && !soc.periph.any_pending() && soc.loop_skip.may_probe(now) {
+        // not while a release is latched: run_fast's return must break below where it would
+        // without the skip (lib.rs latches again on any later 0 -> 1 of 0x10008 bit 3)
+        if soc.loop_skip.enabled && !soc.cpu1_release && n - done >= PROBE_MIN && !soc.periph.any_pending() && soc.loop_skip.may_probe(now) {
             if soc.periph.next_due < soc.periph.cycles + PROBE_MIN as u64 {
                 soc.loop_skip.next_try = soc.periph.next_due; // too close to the next event
             } else {
@@ -864,5 +866,203 @@ mod tests {
         c1.step(&mut Core1Loads(&mut soc)).unwrap();
         assert_eq!(c1.regs[3], 0xdead_beef);
         assert!(Core1Bus { soc: &mut soc, budget: 1 }.jit_mem().is_some());
+    }
+
+    /// `run_both` with the JIT on or off and a setup for both, in uneven chunks; after every chunk
+    /// equal in more: the core's whole state, the ADC, the pending latches, the timer word's reads,
+    /// the first 16 KiB of RAM.
+    fn run_both_jit(code: &[u8], regs: &[(usize, u32)], jit: bool, setup: &dyn Fn(&mut Soc), total: u32) -> (Cpu, Soc) {
+        let (mut a, mut sa) = machine(code, regs, true);
+        let (mut b, mut sb) = machine(code, regs, false);
+        a.jit_on = jit;
+        b.jit_on = jit;
+        setup(&mut sa);
+        setup(&mut sb);
+        let (mut ta, mut tb) = (false, false);
+        let mut done = 0u32;
+        let mut x = 12345u32;
+        while done < total {
+            x = x.wrapping_mul(1103515245).wrapping_add(12345);
+            let n = (1024 + (x >> 8) % 3000).min(total - done);
+            assert_eq!(run_blocks(&mut a, &mut sa, n, &mut ta), Ok(n));
+            assert_eq!(run_blocks(&mut b, &mut sb, n, &mut tb), Ok(n));
+            done += n;
+            assert_eq!((a.pc, a.regs, a.insn_count, ta, a.plain_state()), (b.pc, b.regs, b.insn_count, tb, b.plain_state()), "after {done}");
+            assert_eq!(sa.periph.cycles, sb.periph.cycles, "after {done}");
+            assert_eq!(sa.periph.adc_state(), sb.periph.adc_state(), "after {done}");
+            assert_eq!(sa.p33.snap(), sb.p33.snap(), "after {done}");
+            assert_eq!(sa.periph.any_pending(), sb.periph.any_pending(), "after {done}");
+            assert_eq!(sa.ticks, sb.ticks, "after {done}");
+            for w in (0..0x4000u32).step_by(4) {
+                assert_eq!(sa.ram.read32(w), sb.ram.read32(w), "ram {w:#x} after {done}");
+            }
+        }
+        assert_eq!(sb.loop_skip.probes, 0);
+        (a, sa)
+    }
+
+    #[test]
+    fn timer5_pending_poll_skipped_to_the_cycle() {
+        // r2 = [0x10900] until bit 15 (T5 pending, ~29 k cycles a period), then ack ([0x10900] =
+        // 0x4001), 200 loads and round again: a skip one round long or short shows as another pc
+        let mut code = [LOAD.as_slice(), &[0x60, 0xff, 0x00, 0x2c, 0xfb, 0xff], &STORE].concat();
+        for _ in 0..200 {
+            code.extend_from_slice(&LOAD);
+        }
+        let o = (-(code.len() as i32 + 6) / 2) as u16;
+        code.extend_from_slice(&[0x60, 0xff, 0x00, 0x20, o as u8, (o >> 8) as u8]);
+        let regs = [(1, 0x10900 + 544), (5, 0x10900 + 128), (3, 0x4001)];
+        let setup = |s: &mut Soc| {
+            s.write32(0x10908, 731);
+            s.write32(0x10900, 1);
+        };
+        for jit in [false, true] {
+            let (_, soc) = run_both_jit(&code, &regs, jit, &setup, 3_000_000);
+            assert!(soc.loop_skip.skipped > 1_000_000, "jit {jit}: {} skipped", soc.loop_skip.skipped);
+        }
+    }
+
+    #[test]
+    fn adc_poll_with_the_pot_moving_skipped_to_the_cycle() {
+        // [0x13100] = 0x50 (a conversion, no IRQ), r2 = [0x13104], round again; the pot moves at
+        // uneven times, so a skip past a move shows in r2
+        let code = [STORE.as_slice(), &LOAD, &[0x60, 0xff, 0x00, 0x20, 0xf9, 0xff]].concat();
+        let regs = [(1, 0x13104 + 544), (5, 0x13100 + 128), (3, 0x50)];
+        let setup = |s: &mut Soc| {
+            for i in 0..30u64 {
+                s.periph.script.push_back((10_007 + i * 33_331 + i * i * 3, Action::Adc { ch: 0, value: (i * 37 % 1024) as u16 }));
+            }
+        };
+        for jit in [false, true] {
+            let (_, soc) = run_both_jit(&code, &regs, jit, &setup, 1_200_000);
+            assert!(soc.loop_skip.skipped > 500_000, "jit {jit}: {} skipped", soc.loop_skip.skipped);
+        }
+    }
+
+    #[test]
+    fn failed_probe_undoes_the_adc_start() {
+        // [0x13100] = 0x50, then the counting timer word (refused): the conversion is undone,
+        // and the next event is where it was
+        let code = [STORE.as_slice(), &LOAD, &[0x60, 0xff, 0x00, 0x20, 0xf9, 0xff]].concat();
+        let (mut cpu, mut soc) = machine(&code, &[(1, 0x1080c + 544), (5, 0x13100 + 128), (3, 0x50)], true);
+        soc.periph.next_due = soc.periph.cycles + 100_000;
+        let before = (soc.periph.adc_state(), soc.periph.next_due, soc.periph.cycles, cpu.plain_state());
+        assert_eq!(probe_loop(&mut cpu, &mut soc, 5000), 0);
+        assert_eq!(before, (soc.periph.adc_state(), soc.periph.next_due, soc.periph.cycles, cpu.plain_state()));
+    }
+
+    #[test]
+    fn cpu0_polling_what_cpu1_stores_skipped_to_the_cycle() {
+        // cpu1: 3000 loads, then [w] = 0x20, then spins. cpu0: polls w while bit 5 is clear, then
+        // 200 loads, then spins. With the skip and without: the same after every run_dual.
+        const W: u32 = RAM_BASE + 0x2000;
+        let mut code = [LOAD.as_slice(), &[0x60, 0xff, 0x20, 0x20, 0xfb, 0xff]].concat();
+        for _ in 0..200 {
+            code.extend_from_slice(&LOAD);
+        }
+        code.extend_from_slice(&[0x60, 0xff, 0x00, 0x20, 0xfd, 0xff]);
+        let c1_at = code.len() as u32;
+        for _ in 0..3000 {
+            code.extend_from_slice(&LOAD);
+        }
+        code.extend_from_slice(&STORE);
+        code.extend_from_slice(&[0x60, 0xff, 0x00, 0x20, 0xfd, 0xff]);
+        let both = |skip: bool| {
+            let (mut cpu, soc) = machine(&code, &[(1, W + 544)], skip);
+            cpu.jit_on = true;
+            let mut c1 = Cpu::new(XIP_BASE + c1_at);
+            c1.core_id = 1;
+            c1.jit_on = true;
+            c1.regs[1] = RAM_BASE + 544;
+            c1.regs[5] = W + 128;
+            c1.regs[3] = 0x20;
+            (cpu, soc, Some(c1))
+        };
+        let (mut a, mut sa, mut a1) = both(true);
+        let (mut b, mut sb, mut b1) = both(false);
+        let (mut ta, mut tb) = (false, false);
+        for i in 0..60u32 {
+            let n = 3000 + (i * 977) % 5000;
+            run_dual(&mut a1, &mut sa, n, 1 << 20, true, |s, k| run_blocks(&mut a, s, k, &mut ta)).unwrap();
+            run_dual(&mut b1, &mut sb, n, 1 << 20, true, |s, k| run_blocks(&mut b, s, k, &mut tb)).unwrap();
+            assert_eq!((a.pc, a.regs, a.insn_count), (b.pc, b.regs, b.insn_count), "call {i}");
+            let (x, y) = (a1.as_ref().unwrap(), b1.as_ref().unwrap());
+            assert_eq!((x.pc, x.regs, x.insn_count), (y.pc, y.regs, y.insn_count), "cpu1, call {i}");
+            assert_eq!(sa.periph.cycles, sb.periph.cycles, "call {i}");
+        }
+        assert!(sa.loop_skip.hits > 0);
+    }
+
+    #[test]
+    fn pure_reads_change_nothing_and_hold_still() {
+        // every address `pure_read` takes, on both boards with every timer, the OS tick and the ADC
+        // running: the same word 777 cycles later (no event between), and no counter, random
+        // generator or unknown-access log moved. A new peripheral word that counts or clears on
+        // read and is taken by mistake fails here.
+        for board in [crate::Board::Fm1, crate::Board::Smk37] {
+            let mut soc = Soc::new(1 << 20, vec![0; 0x1000]);
+            soc.set_board(board);
+            soc.write32(0x10800, 1);
+            soc.write32(0x10804, 0);
+            soc.write32(0x10908, 60_000);
+            soc.write32(0x10900, 1);
+            soc.write32(0x1eef0f4, 2_400_000);
+            soc.write32(0x1eef0ec, 1);
+            for i in 0..4u32 {
+                soc.write32(0x10408 + 0x100 * i, 50_000);
+                soc.write32(0x10400 + 0x100 * i, 1);
+            }
+            soc.write32(0x12e20, 256);
+            soc.write32(0x12e00, 0x800);
+            soc.write32(0x13100, 0x50);
+            soc.advance(0);
+            soc.periph.cycles += 1000;
+            let mut bad = Vec::new();
+            for (lo, hi) in [(0x10000u32, 0x60000u32), (0x1eee000, 0x1eee300), (0x1eef000, 0x1eef400)] {
+                for at in (lo..hi).step_by(4) {
+                    if !soc.pure_read(at) {
+                        continue;
+                    }
+                    let before = (soc.ticks, soc.unknown_log.len(), soc.rand);
+                    let v1 = soc.read32(at);
+                    soc.periph.cycles += 777;
+                    let v2 = soc.read32(at);
+                    soc.periph.cycles -= 777;
+                    if v1 != v2 || before != (soc.ticks, soc.unknown_log.len(), soc.rand) {
+                        bad.push((at, v1, v2));
+                    }
+                }
+            }
+            assert!(bad.is_empty(), "{board:?}: {bad:x?}");
+        }
+    }
+
+    #[test]
+    fn latched_release_in_the_dual_phase_stops_cpu0_where_it_would_without_the_skip() {
+        // cpu1 already runs and the firmware sets 0x10008 bit 3 again (0 -> 1): `cpu1_release`
+        // is latched and nothing takes it, so run_blocks breaks after every run_fast return.
+        // cpu0 polls a RAM word from RAM code a step at a time: a probe must not run on past
+        // such a break. (That cpu0 then runs one instruction a slice is master's latch, PLAN 5.31.)
+        let both = |skip: bool| {
+            let (_, mut soc) = machine(&[0x60, 0xff, 0x00, 0x20, 0xfd, 0xff], &[], skip);
+            soc.ram.load(0x8000, &[LOAD.as_slice(), &[0x60, 0xff, 0x00, 0x20, 0xf9, 0xff]].concat());
+            let mut cpu = Cpu::new(RAM_BASE + 0x8000);
+            cpu.no_ram_blocks = true;
+            cpu.regs[1] = RAM_BASE + 0x100 + 544;
+            let mut c1 = Cpu::new(XIP_BASE);
+            c1.core_id = 1;
+            soc.write32(0x10008, 0);
+            soc.write32(0x10008, 8);
+            assert!(soc.cpu1_release);
+            (cpu, soc, Some(c1))
+        };
+        let (mut a, mut sa, mut a1) = both(true);
+        let (mut b, mut sb, mut b1) = both(false);
+        let (mut ta, mut tb) = (false, false);
+        for i in 0..20 {
+            run_dual(&mut a1, &mut sa, 8192, 1 << 20, false, |s, k| run_blocks(&mut a, s, k, &mut ta)).unwrap();
+            run_dual(&mut b1, &mut sb, 8192, 1 << 20, false, |s, k| run_blocks(&mut b, s, k, &mut tb)).unwrap();
+            assert_eq!((a.pc, a.insn_count, sa.periph.cycles), (b.pc, b.insn_count, sb.periph.cycles), "call {i}");
+        }
     }
 }

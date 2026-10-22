@@ -222,7 +222,7 @@ pub struct Cpu {
     #[cfg(target_arch = "wasm32")]
     bver: Vec<u64>,
     /// FM1_NO_RAM_BLOCKS: RAM code a step at a time (the reference)
-    no_ram_blocks: bool,
+    pub no_ram_blocks: bool,
     /// Instructions per execute route (index 31 = the micro-op fast path),
     /// and per class name on the slow path — for tuning the dispatcher.
     pub route_hist: [u64; 32],
