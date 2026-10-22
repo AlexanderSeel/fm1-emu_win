@@ -5923,8 +5923,26 @@ fn fast_raw(route: u16, insn: &Instruction, alu4: &Option<Alu4>, bittest: &Optio
         2 => Some(Fast::Nop),
         // (the arms read bits below 32 only; route 21's table-less form carries the whole window)
         27 if insn.entry.len == 4 => Some(Fast::Raw { route: RAW_POP_RETS_MASK, raw: raw as u32 }),
+        // accesses that update their base (routes 18 / 19, `[++rB=rI]` / `[rB++=rI]` 32) as the
+        // micro-ops that give exactly the arm's result, which the JITs compile inline: in an
+        // audio loop they are most of what went through the interpreter's executor (Melodee
+        // 1.4.5: 1.5 million a second). The arm stays for a load into the base (its base update
+        // comes last, the micro-ops' first or from the loaded value), route 32's store of the
+        // base or of a high half, and words idx_inc does not take
         18 | 19 => Some(inc_mem_fast(route as u8, raw as u32)),
-        16 | 21 | 22 | 27 | 32 | 39 | 40 | 41 => Some(Fast::Raw { route: route as u8, raw: raw as u32 }),
+        32 => Some(match idx_inc(raw) {
+            Some(m) if !m.high && m.d != m.b => {
+                let (d, b, i, w, signed) = (m.d as u8, m.b as u8, m.i as u8, m.w, m.signed);
+                match (m.pre, m.store) {
+                    (true, false) => Fast::LdPre { d, b, i, w, signed, inc: 0 },
+                    (true, true) => Fast::StPre { s: d, b, i, w, inc: 0 },
+                    (false, false) => Fast::LdPostR { d, b, i, w, signed },
+                    (false, true) => Fast::StPostR { s: d, b, i, w },
+                }
+            }
+            _ => Fast::Raw { route: 32, raw: raw as u32 },
+        }),
+        16 | 21 | 22 | 27 | 39 | 40 | 41 => Some(Fast::Raw { route: route as u8, raw: raw as u32 }),
         26 if insn.entry.len == 4 => Some(Fast::PushMask { mask: ((raw >> 16) & 0xffff) as u16 }),
         28 if insn.entry.len == 4 => Some(Fast::PopMask { mask: ((raw >> 16) & 0xffff) as u16 }),
         35 => {
@@ -6169,16 +6187,16 @@ fn sp_mem_raw(raw: u64) -> Option<SpMem> {
 #[derive(Clone, Copy, Debug)]
 struct IncMem { d: usize, b: usize, w: u8, store: bool, signed: bool, inc: i32, pre: bool, post: bool }
 /// Routes 18 / 19 as micro-ops the compilers have (exec_raw's arm, its rules kept): a
-/// post-increment is `LdPost` / `StPost`, a word at an offset `Ld` / `St`. A post-increment load
-/// into its own base must stay raw: exec_raw updates the base after the load, so it leaves the
-/// incremented base, while `LdPost` adds to what was loaded (it reads b after the load). A
-/// pre-increment would be exact as `LdPre` / `StPre` (`i: 16`, base == data included), but stays
-/// raw: compiled code would gain nothing, since the compilers reach `LdPre` / `StPre` through the
-/// executor, the same call the raw route makes.
+/// pre-increment is `LdPre` / `StPre` (`i: 16`, base == data included), a post-increment
+/// `LdPost` / `StPost`, a word at an offset `Ld` / `St`. A post-increment load into its own base
+/// must stay raw: exec_raw updates the base after the load, so it leaves the incremented base,
+/// while `LdPost` adds to what was loaded (it reads b after the load).
 fn inc_mem_fast(route: u8, raw: u32) -> Fast {
     let m = decode_inc_mem(route, raw as u64);
     let (d, b, inc) = (m.d as u8, m.b as u8, m.inc as u32);
     match (m.store, m.pre, m.post) {
+        (false, true, _) => Fast::LdPre { d, b, i: 16, w: m.w, signed: m.signed, inc },
+        (true, true, _) => Fast::StPre { s: d, b, i: 16, w: m.w, inc },
         (true, false, true) => Fast::StPost { s: d, b, w: m.w, inc },
         (false, false, true) if d != b => Fast::LdPost { d, b, w: m.w, signed: m.signed, inc },
         (true, false, false) => Fast::St { s: d, b: Base::Reg(b), off: inc, w: m.w },
