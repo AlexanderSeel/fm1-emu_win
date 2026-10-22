@@ -14,7 +14,7 @@
 //! host (the interpreter); conversions to integers saturate as Rust's `as` does (cvttss2si alone
 //! gives 0x8000_0000 for NaN and out of range); min / max through the interpreter's executor.
 
-use super::{h_op, h_ram_ok, h_read, h_write, off_hold, off_pc, off_reg, off_rets, off_sp, JitMem, RamGuard, OFF_BRK, OFF_SLOT};
+use super::{h_ram_ok, h_read, h_write, off_hold, off_pc, off_reg, off_rets, off_sp, op_helper, JitMem, RamGuard, OFF_BRK, OFF_SLOT};
 use crate::jit_x64::{m, mx, Alu, Asm, Cc, Fop, Label, Reg, Sh, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP, R10, R11, R12, R13, R14, R15, R8, R9};
 use crate::{Base, Bus, Cond, Fast, Op, RmwOp};
 
@@ -36,7 +36,6 @@ struct Gen<'a> {
     exit: Label,
     h_read: u64,
     h_write: u64,
-    h_op: u64,
 }
 
 fn icond(c: Cond) -> Cc {
@@ -327,7 +326,6 @@ pub(super) fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards
         exit,
         h_read: h_read::<B> as *const () as u64,
         h_write: h_write::<B> as *const () as u64,
-        h_op: if profile { h_op::<B, true> as *const () as u64 } else { h_op::<B, false> as *const () as u64 },
     };
     // prologue (entry from Rust: rdi cpu, rsi ctx, rdx ram, rcx xip, r8d limit, r9 code flags);
     // chained blocks enter at the body. Six pushes and the frame keep rsp 16-byte aligned for
@@ -811,7 +809,7 @@ pub(super) fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards
                 g.a.mov_ri64(RSI, p as *const Fast as u64);
                 g.idx(RDX, idx);
                 g.a.mov_ri(RCX, next_pc);
-                g.call(g.h_op);
+                g.call(op_helper::<B>(&other, profile));
                 let fall = g.a.label();
                 g.a.bt64(RAX, 32); // bit 32: jumped (target in eax)
                 g.a.jcc(Cc::Ae, fall);

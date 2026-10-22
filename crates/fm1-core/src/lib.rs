@@ -208,6 +208,8 @@ pub struct Cpu {
     /// the ops of every block back to back, the blocks, and a direct-mapped
     /// pc -> block+1 table (0 = none).
     bops: Vec<BOp>,
+    /// `Fast::Swap`'s pairs: (head, second instruction, the head's length)
+    swaps: Vec<(Fast, Fast, u8)>,
     blocks: Vec<(u32, u32, u32)>,
     bmap: Vec<u32>,
     /// Per block: for one over RAM code, the bytes it was built from. RAM can change (code
@@ -217,9 +219,8 @@ pub struct Cpu {
     /// The stock firmware's synth renders on cpu1 from RAM: without blocks it ran a step at
     /// a time.
     bbytes: Vec<Option<Box<[u8]>>>,
-    /// Per block over RAM, in the wasm build: the bus's count of code-word writes when the block
-    /// was last found current (`ram_block_ok`: the same count, no compare).
-    #[cfg(target_arch = "wasm32")]
+    /// Per block over RAM: the bus's count of code-word writes when the block was last found
+    /// current (`ram_block_ok`: the same count, no compare).
     bver: Vec<u64>,
     /// FM1_NO_RAM_BLOCKS: RAM code a step at a time (the reference)
     pub no_ram_blocks: bool,
@@ -641,14 +642,18 @@ impl Cpu {
                     n += 1;
                 } else {
                     sync!();
-                    // (finish() inside counts this instruction itself)
-                    let (still, stop) = self.exec_careful(bus, op.fast, op.pair_head, careful, next_pc);
-                    n += 1;
+                    // (it counts what it runs in insn_count itself; a swapped pair is two)
+                    let r = self.exec_careful_op(bus, i, careful, next_pc, budget - n);
+                    n += r & 3;
                     synced = n;
                     pc = self.pc;
-                    careful = still;
-                    if stop {
+                    careful = r & 4 != 0;
+                    if r & 8 != 0 {
                         return Ok((n, false));
+                    }
+                    if r & 16 != 0 {
+                        // (a swapped pair cut after its head: the second one's tick is spent)
+                        return Ok((n, true));
                     }
                 }
                 if pc != next_pc {
@@ -658,20 +663,91 @@ impl Cpu {
         }
     }
 
+    /// An op `run_fast` cannot run plainly, packed: bits 0-1 the instructions run, then still
+    /// careful (4), stop (8: the pair, block or loop ended with an interrupt pending), the next
+    /// tick due (16: it was spent). A `Fast::Swap` pair runs whole, its second instruction first
+    /// (it sees the registers from before the head), when nothing is in progress, both fit the
+    /// budget and the second one's tick is not due; else as the careful steps it stands for. A
+    /// plain op inside an if-else block's then-part (nothing else in progress) applies `finish`'s
+    /// skip rule itself. Anything else is `exec_careful`. (Out of line, and told the op's index,
+    /// not the op: run_fast's loop keeps its registers.)
+    #[inline(never)]
+    fn exec_careful_op<B: Bus>(&mut self, bus: &mut B, i: u32, gated: bool, next_pc: u32, room: u32) -> u32 {
+        let pack = |k: u32, still: bool, stop: bool, due: bool| k | (still as u32) << 2 | (stop as u32) << 3 | (due as u32) << 4;
+        let op = self.bops[i as usize];
+        if let Fast::Swap { idx } = op.fast {
+            let (head, tail, hlen) = self.swaps[idx as usize];
+            let head_next = self.pc.wrapping_add(hlen as u32);
+            if !gated && room >= 2 && !bus.next_tick_due() {
+                let _ = bus.tick();
+                let jumped = self.exec_fast(bus, tail, next_pc);
+                let _ = self.exec_fast(bus, head, head_next);
+                self.insn_count += 2;
+                self.pc = jumped.unwrap_or(next_pc);
+                // (the careful path stops after a pair when an interrupt is pending)
+                return pack(2, false, bus.irq_pending(), false);
+            }
+            // a head always leaves its pair in progress: never a stop
+            let (still, _) = self.exec_careful(bus, head, true, gated, head_next);
+            if self.pc != head_next || room < 2 {
+                // (a rep loop or then-part ended at the head; the budget ends there): run_fast
+                // goes on at pc as after any careful step
+                return pack(1, still, false, false);
+            }
+            if bus.tick() {
+                return pack(1, still, false, true);
+            }
+            let (still, stop) = self.exec_careful(bus, tail, false, still, next_pc);
+            return pack(2, still, stop, false);
+        }
+        // (not a glued head: the careful path runs it as the pair it is)
+        if gated && !op.careful && !op.pair_head && self.pred_skips.len() == 1 && self.pair_pending.is_none() && self.rep_end == 0 && self.hold_irq == 0 {
+            // `finish` for one pending skip and nothing else in progress
+            let mut pc = self.exec_fast(bus, op.fast, next_pc).unwrap_or(next_pc);
+            self.insn_count += 1;
+            let (te, ee) = self.pred_skips[0];
+            let mut still = true;
+            if pc >= te {
+                if pc == te {
+                    pc = ee;
+                }
+                self.pred_skips.clear();
+                still = false;
+            }
+            self.pc = pc;
+            return pack(1, still, !still && bus.irq_pending(), false);
+        }
+        let (still, stop) = self.exec_careful(bus, op.fast, op.pair_head, gated, next_pc);
+        pack(1, still, stop, false)
+    }
+
     /// How many instructions the block at pc holds up to `stop` (an instruction of it after the
-    /// first, if one starts there) or its end (0: its first one needs `step`): a budget for
-    /// `run_fast` that runs that much, compiled or not, and stops there. (cpu1's idle probe: it
+    /// first, if one starts there) or its end (0: the block is empty, its first instruction needs
+    /// `step`): a budget for `run_fast` that runs that much, compiled or not, and stops there.
+    /// Instructions, not ops: a `Swap` counts two, so a block may hold more than 32. A `stop` at a
+    /// Swap's second instruction counts through the head only, and `run_fast` then runs the head
+    /// alone, as the careful path does, leaving the pair pending at `stop`. (cpu1's idle probe: it
     /// looks for the way back to where it began, which may lie inside a block.)
     pub fn block_len_to<B: Bus>(&mut self, bus: &mut B, stop: u32) -> u32 {
         let Ok(Some((_, start, len))) = self.block_at(bus, self.pc) else { return 0 };
         let mut at = self.pc;
-        for k in 0..len {
+        let mut k = 0;
+        for j in start..start + len {
             if k > 0 && at == stop {
                 return k;
             }
-            at = at.wrapping_add(self.bops[(start + k) as usize].len as u32);
+            let op = self.bops[j as usize];
+            k += 1;
+            if let Fast::Swap { idx } = op.fast {
+                // two instructions; stopping at the second one runs the head alone
+                if at.wrapping_add(self.swaps[idx as usize].2 as u32) == stop {
+                    return k;
+                }
+                k += 1;
+            }
+            at = at.wrapping_add(op.len as u32);
         }
-        len
+        k
     }
 
     /// The block of micro-ops starting at pc (XIP code only): built on first
@@ -809,13 +885,14 @@ impl Cpu {
         (q == end).then_some(then)
     }
 
-    /// Is RAM block `id` still built from what memory holds now? In the wasm build, by the bus's
-    /// count of writes to code words when it keeps one: the same count as when the block was last
-    /// found current, nothing has changed; else the bytes are compared. Native block lookup
-    /// compares bytes; compiled RAM chain targets keep separate versioned snapshots.
+    /// Is RAM block `id` still built from what memory holds now? By the bus's count of writes to
+    /// code words when it keeps one: the same count as when the block was last found current,
+    /// nothing has changed; else the bytes are compared. (Sound because every write that can
+    /// reach a block's bytes is counted: the bus's own writes check the word's code flag, and
+    /// compiled code's inline stores, native and wasm, take the bus for a flagged word. Compiled
+    /// RAM chain targets keep separate versioned snapshots, `jit::RamGuard`.)
     #[inline]
     fn ram_block_ok<B: Bus>(&mut self, bus: &mut B, id: usize) -> bool {
-        #[cfg(target_arch = "wasm32")]
         if let Some(w) = bus.code_writes() {
             if self.bver[id] == w {
                 return true;
@@ -862,9 +939,9 @@ impl Cpu {
         if self.bops.len() > 1 << 22 {
             // (cannot happen for one image, but never grow without bound)
             self.bops.clear();
+            self.swaps.clear();
             self.blocks.clear();
             self.bbytes.clear();
-            #[cfg(target_arch = "wasm32")]
             self.bver.clear();
             self.bmap.iter_mut().for_each(|x| *x = 0);
             #[cfg(native_jit)]
@@ -899,6 +976,17 @@ impl Cpu {
                             op.careful = false;
                             op.glue = true;
                             glued = true;
+                        } else if f.swappable_with(tf) {
+                            // the second reads what the head writes: one op for both, the
+                            // second first (`exec_careful_op`; careful, the compilers keep away)
+                            self.swaps.push((f, tf, l.len));
+                            let idx = self.swaps.len() as u32 - 1;
+                            self.bops.push(BOp { fast: Fast::Swap { idx }, len: l.len + t.len, careful: true, pair_head: true, glue: false });
+                            p = q + t.len as u32;
+                            if tf.may_jump() {
+                                break;
+                            }
+                            continue;
                         }
                     }
                 }
@@ -921,7 +1009,6 @@ impl Cpu {
         }
         self.bbytes.resize(self.blocks.len() - 1, None);
         self.bbytes.push(bytes);
-        #[cfg(target_arch = "wasm32")]
         {
             self.bver.resize(self.blocks.len() - 1, u64::MAX);
             self.bver.push(bus.code_writes().unwrap_or(u64::MAX));
@@ -1045,17 +1132,21 @@ impl Cpu {
     fn sreg_index(n: &str) -> usize {
         match n { "icfg" => 0, "reti" => 1, "retx" => 2, "rete" => 3, "sspn" => 4, "sr4" => 6, _ => 5 }
     }
+    /// `icfg` as read: low byte, the ISR priorities in progress (`icfg & 0xff` is the RTOS's
+    /// "in interrupt context" test); bit 9, the global enable `sti` / `cli` set and clear (the
+    /// SDK's cpu_irq_disabled() is `(icfg & 0x300) != 0x300`, bit 8 being the software master
+    /// enable; the stock RTOS asserted in os_mutex_pend while bit 9 read 0). Writes keep their own
+    /// bit 9 out of it.
+    #[inline]
+    fn icfg(&self) -> u32 {
+        let active = self.irq_levels.iter().fold(0u32, |m, &p| m | 1 << p);
+        (self.sreg_store[0] & !0x2ff) | active | if self.ie { 0x200 } else { 0 }
+    }
     fn sregs(&self, n: &str) -> u32 {
         if n == "cnum" {
             self.core_id
         } else if n == "icfg" {
-            // low byte: the ISR priorities in progress (`icfg & 0xff` is the
-            // RTOS's "in interrupt context" test); bit 9: the global enable `sti` / `cli`
-            // set and clear (the SDK's cpu_irq_disabled() is `(icfg & 0x300) != 0x300`,
-            // bit 8 being the software master enable; the stock RTOS asserted in
-            // os_mutex_pend while bit 9 read 0). Writes keep their own bit 9 out of it.
-            let active = self.irq_levels.iter().fold(0u32, |m, &p| m | 1 << p);
-            (self.sreg_store[0] & !0x2ff) | active | if self.ie { 0x200 } else { 0 }
+            self.icfg()
         } else if n == "psr" {
             (self.sreg_store[5] & !0xf) | self.flags
         } else {
@@ -1309,17 +1400,32 @@ impl Cpu {
         None
     }
 
+    /// `exec_fast` for a `quiet` op (CPU state only: the compilers call it without the bus).
+    #[cfg(native_jit)]
+    fn exec_quiet(&mut self, f: Fast) {
+        match f {
+            Fast::SetIe { on: false } => self.ie = false,
+            Fast::IcfgRd { d } => self.regs[(d & 15) as usize] = self.icfg(),
+            _ => unreachable!("exec_quiet: {f:?}"),
+        }
+    }
+
     /// `exec_fast` for the rarer micro-ops.
     #[inline(never)]
     fn exec_rare<B: Bus>(&mut self, bus: &mut B, f: Fast, next_pc: u32) -> Option<u32> {
         match f {
+            Fast::CallR { r } => {
+                self.rets = next_pc;
+                return Some(self.regs[(r & 15) as usize]);
+            }
+            Fast::GotoR { r } => return Some(self.regs[(r & 15) as usize]),
             Fast::SetIe { on } => {
                 self.ie = on;
                 if on {
                     bus.irq_window();
                 }
             }
-            Fast::IcfgRd { d } => self.regs[(d & 15) as usize] = self.sregs("icfg"),
+            Fast::IcfgRd { d } => self.regs[(d & 15) as usize] = self.icfg(),
             Fast::IcfgWr { s } => {
                 self.sreg_store[0] = self.regs[(s & 15) as usize];
                 bus.irq_window();
@@ -4737,6 +4843,191 @@ mod tests {
         let (c, _) = run1(&[0xd4, 0xed, 0x02, 0x39], &[(0x1000, 0x8001)]);
         assert_eq!((c.regs[3], c.regs[0]), (0xffff_8001, 0x1000 + 146));
     }
+
+    /// Routes 18 / 19 as micro-ops (`inc_mem_fast`) against exec_raw's arm, from random
+    /// encodings (every width, both routes, base = data register among them) and registers.
+    #[test]
+    fn inc_mem_micro_ops_match_the_raw_arm() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed as u32 };
+        let mut kinds = std::collections::HashMap::new();
+        for k in 0..20000 {
+            let route = if k & 1 == 0 { 18u8 } else { 19 };
+            let mut raw = rnd() & !0xff00 | [0xec, 0xed, 0xee, 0xef][(k >> 1) % 4] << 8;
+            if k % 7 == 0 {
+                raw = raw & !0x00f0_0000 | (raw >> 28) << 20; // the base register is the data one
+            }
+            let f = inc_mem_fast(route, raw);
+            *kinds.entry(format!("{route} {:?}", std::mem::discriminant(&f))).or_insert(0) += 1;
+            let mut ram = FlatRam::new((0..0x4000).map(|_| rnd() as u8).collect());
+            let mut cpu = Cpu::new(0);
+            for r in 0..16 {
+                cpu.regs[r] = 0x1000 + rnd() % 0x2000;
+            }
+            let (mut ref_ram, mut reference) = (FlatRam::new(ram.mem.clone()), Cpu::new(0));
+            reference.regs = cpu.regs;
+            assert_eq!(cpu.exec_fast(&mut ram, f, 4), None);
+            assert_eq!(reference.exec_fast(&mut ref_ram, Fast::Raw { route, raw }, 4), None);
+            assert_eq!(cpu.regs, reference.regs, "route {route} raw {raw:08x}: {f:?}");
+            assert!(ram.mem == ref_ram.mem, "route {route} raw {raw:08x}: {f:?}");
+        }
+        // (each form came up: post-increment loads and stores, word offsets, and the raw rest)
+        assert!(kinds.len() >= 6, "{kinds:?}");
+    }
+
+    /// `Fast::Swap`'s rule: for random register-only heads and random second instructions that
+    /// `swappable_with` accepts, the second one first and then the head leaves what the pair
+    /// rule (`exec_fast_paired`, as `step` runs pairs) leaves: registers, flags, sp, rets, pc,
+    /// memory. And the order matters: head first gives something else for some of them.
+    #[test]
+    fn swapped_pairs_match_the_pair_rule() {
+        let seed = std::cell::Cell::new(0x853c_49e6_748f_ea9bu64);
+        let rnd = || { let mut s = seed.get(); s ^= s << 13; s ^= s >> 7; s ^= s << 17; seed.set(s); s as u32 };
+        let ops = [Op::Add, Op::Sub, Op::RSub, Op::Or, Op::Xor, Op::And, Op::AndNot, Op::Mul, Op::Shl, Op::Shr, Op::Sar];
+        let conds = [Cond::Eq, Cond::Ne, Cond::LtU, Cond::GtU, Cond::LeU, Cond::GeU, Cond::LtS, Cond::GtS, Cond::LeS, Cond::GeS];
+        let reg_op = |x: u32, r: &dyn Fn() -> u8| -> Fast {
+            let op = ops[x as usize / 32 % ops.len()];
+            match x % 17 {
+                0 => Fast::Mov { d: r(), s: r() },
+                1 => Fast::MovI { d: r(), v: x },
+                2 => Fast::Alu3 { d: r(), a: r(), b: r(), op },
+                3 => Fast::Alu3I { d: r(), a: r(), v: x >> 7, op },
+                4 => Fast::Alu2 { d: r(), b: r(), op },
+                5 => Fast::Alu2I { d: r(), v: x >> 9, op },
+                6 => Fast::A4 { d: r(), s: r(), op, rk: (x >> 5) as u8 % 3, rv: if (x >> 5) % 3 == 1 { x >> 3 } else { r() as u32 } },
+                7 => Fast::AddRI { d: r(), s: r(), v: x >> 4 },
+                8 => Fast::ShlI { d: r(), s: r(), n: (x >> 8) as u8 % 32 },
+                9 => Fast::SarI { d: r(), s: r(), n: (x >> 8) as u8 % 32 },
+                10 => Fast::Ext { d: r(), s: r(), part: (x >> 8) as u8 % 3, signed: x & 0x100 != 0 },
+                11 => Fast::BitExt { d: r(), s: r(), p: (x >> 8) as u8 % 32, l: (x >> 16) as u8 % 32, signed: x & 0x80 != 0 },
+                12 => Fast::BitIns { d: r(), s: r(), p: (x >> 8) as u8 % 32, l: (x >> 16) as u8 % 32 },
+                13 => Fast::Mov2 { dh: r(), dl: r(), sh: r(), sl: r() },
+                14 => Fast::Mov2I { dh: r(), dl: r(), v: x },
+                15 => Fast::Un { d: r(), s: r(), k: (x >> 8) as u8 % 7 },
+                _ => Fast::MinMax { d: r(), a: r(), b: r(), kind: (x >> 8) as u8 % 4 },
+            }
+        };
+        let (mut tried, mut swapped, mut order_matters) = (0, 0, 0);
+        while swapped < 4000 {
+            tried += 1;
+            assert!(tried < 1_000_000, "too few swappable pairs");
+            let r = || (rnd() % 16) as u8;
+            let head = reg_op(rnd(), &r);
+            let x = rnd();
+            let w = [1u8, 2, 4][x as usize % 3];
+            let (target, cond) = (0x0200_0040, conds[x as usize / 8 % conds.len()]);
+            let tail = match x % 23 {
+                0 => Fast::Ld { d: r(), b: Base::Reg(r()), off: x >> 24, w, signed: x & 8 != 0 },
+                1 => Fast::St { s: r(), b: Base::Reg(r()), off: x >> 24, w },
+                2 => Fast::LdPost { d: r(), b: r(), w, signed: x & 8 != 0, inc: x >> 26 },
+                3 => Fast::StPost { s: r(), b: r(), w, inc: x >> 26 },
+                4 => Fast::LdIdx { d: r(), b: r(), i: r(), sh: (x >> 4) as u8 % 3, w, signed: x & 8 != 0 },
+                5 => Fast::StIdx { s: r(), b: r(), i: r(), sh: (x >> 4) as u8 % 3, w },
+                6 => Fast::Rmw { b: r(), w, op: RmwOp::Add, off: x >> 26, v: x },
+                7 => Fast::MemA4 { b: r(), off: (x >> 26) as _, op: Op::Add, rk: 0, rv: r() as u32 },
+                8 => Fast::BrI { a: r(), v: x >> 20, cond, target },
+                9 => Fast::BrR { a: r(), b: r(), cond, target },
+                10 => Fast::BitBr { r: r(), mk: 0, ne: x & 8 != 0, mv: r() as u32, target },
+                11 => Fast::Call { target },
+                12 => Fast::CallR { r: r() },
+                13 => Fast::GotoR { r: r() },
+                14 => Fast::Rts,
+                15 => Fast::DecBr { r: r(), cond, v: x >> 20, target },
+                16 => Fast::Ld { d: r(), b: Base::Sp, off: x >> 26, w, signed: false },
+                17 => Fast::St { s: r(), b: Base::Sp, off: x >> 26, w },
+                _ => reg_op(rnd(), &r),
+            };
+            // (as build_block: a pair that cannot be glued, the second reads what the head writes)
+            if !head.swappable_with(tail) || head.regs_rw().unwrap().1 & tail.regs_rw().unwrap().0 == 0 {
+                continue;
+            }
+            swapped += 1;
+            let mut mem = vec![0u8; 0x8000];
+            mem.iter_mut().for_each(|b| *b = rnd() as u8);
+            let mut start = Cpu::new(0x0200_0000);
+            for i in 0..16 {
+                start.regs[i] = match rnd() % 4 { 0 => rnd() % 40, 1 => 0x1000 + rnd() % 0x4000, _ => rnd() };
+            }
+            (start.flags, start.sp, start.rets) = (rnd() & 15, 0x6000 + rnd() % 0x100, 0x0200_1234);
+            let (head_next, next) = (0x0200_0004, 0x0200_0006);
+            let state = |c: &Cpu, ram: &FlatRam| (c.regs, c.flags, c.sp, c.rets, ram.mem.clone());
+            // the pair rule
+            let (mut pair, mut pair_ram) = (Cpu::new(0), FlatRam::new(mem.clone()));
+            (pair.regs, pair.flags, pair.sp, pair.rets) = (start.regs, start.flags, start.sp, start.rets);
+            let _ = pair.exec_fast_paired(&mut pair_ram, head, true, head_next);
+            let pair_pc = pair.exec_fast_paired(&mut pair_ram, tail, false, next).unwrap_or(next);
+            assert!(pair.pair_pending.is_none());
+            // the second instruction first
+            let (mut swap, mut swap_ram) = (Cpu::new(0), FlatRam::new(mem.clone()));
+            (swap.regs, swap.flags, swap.sp, swap.rets) = (start.regs, start.flags, start.sp, start.rets);
+            let swap_pc = swap.exec_fast(&mut swap_ram, tail, next).unwrap_or(next);
+            assert_eq!(swap.exec_fast(&mut swap_ram, head, head_next), None);
+            assert!(state(&swap, &swap_ram) == state(&pair, &pair_ram) && swap_pc == pair_pc, "{head:?} then {tail:?}");
+            // in program order instead
+            let (mut plain, mut plain_ram) = (Cpu::new(0), FlatRam::new(mem));
+            (plain.regs, plain.flags, plain.sp, plain.rets) = (start.regs, start.flags, start.sp, start.rets);
+            let _ = plain.exec_fast(&mut plain_ram, head, head_next);
+            let plain_pc = plain.exec_fast(&mut plain_ram, tail, next).unwrap_or(next);
+            if state(&plain, &plain_ram) != state(&pair, &pair_ram) || plain_pc != pair_pc {
+                order_matters += 1;
+            }
+        }
+        assert!(order_matters > swapped / 2, "{order_matters} of {swapped}");
+    }
+
+    /// A swappable pair in a block: run_fast runs it as one op of two instructions; cut by the
+    /// budget after its head, or stepped, it gives the same.
+    #[test]
+    fn swapped_pair_in_a_block() {
+        // a bus with XIP code at 0x02000000 (its low 64 KiB alias), no ticks due
+        struct Xip(FlatRam);
+        impl Bus for Xip {
+            fn read8(&mut self, a: u32) -> u8 { self.0.read8(a & 0xffff) }
+            fn read16(&mut self, a: u32) -> u16 { self.0.read16(a & 0xffff) }
+            fn read32(&mut self, a: u32) -> u32 { self.0.read32(a & 0xffff) }
+            fn write8(&mut self, a: u32, v: u8) { self.0.write8(a & 0xffff, v) }
+            fn write16(&mut self, a: u32, v: u16) { self.0.write16(a & 0xffff, v) }
+            fn write32(&mut self, a: u32, v: u32) { self.0.write32(a & 0xffff, v) }
+            fn next_tick_due(&self) -> bool { false }
+        }
+        // `00 d7` r0 = r0.b0 (u) #  paired with `c8 4b` b[r4+11] = r0 (the store sees the old
+        // r0), then two nops
+        let code = [0x00, 0xd7, 0xc8, 0x4b, 0x00, 0x00, 0x00, 0x00];
+        let fresh = || {
+            let mut mem = vec![0u8; 0x10000];
+            mem[..code.len()].copy_from_slice(&code);
+            let mut cpu = Cpu::new(0x0200_0000);
+            (cpu.regs[0], cpu.regs[4]) = (0x1234_5678, 0x1000);
+            (cpu, Xip(FlatRam::new(mem)))
+        };
+        let (mut stepped, mut sbus) = fresh();
+        for _ in 0..4 {
+            stepped.step(&mut sbus).unwrap();
+        }
+        assert_eq!((stepped.regs[0], sbus.0.mem[0x100b]), (0x78, 0x78));
+        for budget in 1..=4 {
+            let (mut cpu, mut bus) = fresh();
+            let mut n = 0;
+            while n < 4 {
+                let (k, _) = cpu.run_fast(&mut bus, budget.min(4 - n)).unwrap();
+                assert!(k > 0);
+                n += k;
+            }
+            assert!(matches!(cpu.bops[0].fast, Fast::Swap { .. }), "{:?}", cpu.bops[0]);
+            assert_eq!((cpu.regs, cpu.pc, cpu.insn_count), (stepped.regs, stepped.pc, stepped.insn_count));
+            assert!(bus.0.mem == sbus.0.mem);
+        }
+        // cut after the head: the pair is in progress, the second instruction comes next
+        let (mut cpu, mut bus) = fresh();
+        assert_eq!(cpu.block_len_to(&mut bus, 0x0200_0002), 1);
+        assert_eq!(cpu.block_len_to(&mut bus, 0x0200_0006), 3);
+        assert_eq!(cpu.run_fast(&mut bus, 1).unwrap(), (1, false));
+        assert!(cpu.pair_pending.is_some());
+        assert_eq!(cpu.pc, 0x0200_0002);
+        assert_eq!(cpu.run_fast(&mut bus, 3).unwrap(), (3, false));
+        assert_eq!((cpu.regs, cpu.pc, cpu.insn_count), (stepped.regs, stepped.pc, stepped.insn_count));
+        assert!(bus.0.mem == sbus.0.mem);
+    }
 }
 
 /// Substring test for the short syntax/class strings: a plain window scan
@@ -4898,7 +5189,7 @@ impl Fast {
             Fast::BrR { a, b, .. } => (m(a) | m(b), 0),
             Fast::BitBr { r, mk, mv, .. } => (m(r) | rhs(mk, mv), 0),
             Fast::DecBr { r, .. } => (m(r), m(r)),
-            Fast::Tb { r, .. } => (m(r), 0),
+            Fast::Tb { r, .. } | Fast::CallR { r } | Fast::GotoR { r } => (m(r), 0),
             Fast::Goto { .. } | Fast::Call { .. } | Fast::Rts | Fast::Nop | Fast::SpAdd { .. }
             | Fast::PushRet | Fast::PopRet | Fast::PopRets => (0, 0),
             Fast::PushRets { n } => (range(n), 0),
@@ -4909,8 +5200,80 @@ impl Fast {
                 let pb = if post { m(base) } else { 0 };
                 if store { (mask | m(base), pb) } else { (m(base), mask | pb) }
             }
-            Fast::IfBlk { .. } | Fast::SetIe { .. } | Fast::IcfgWr { .. } | Fast::Raw { .. } => return None,
+            Fast::IfBlk { .. } | Fast::SetIe { .. } | Fast::IcfgWr { .. } | Fast::Raw { .. } | Fast::Swap { .. } => return None,
         })
+    }
+
+    /// Can this pair head (not glued: `tail` reads what it writes) run after `tail`, with the
+    /// pair's result? The head works on registers only (no bus, sp, rets, special register or
+    /// jump), reads and writes nothing the tail writes, and neither reads the flags nor both set
+    /// them. The pair rule holds the head's registers back until the tail has run; the
+    /// tail first, then the head, is that. (`regs_rw` must be exact for the tail's writes.)
+    fn swappable_with(&self, tail: Fast) -> bool {
+        let reg_only = matches!(self, Fast::Mov { .. } | Fast::MovI { .. } | Fast::Alu3 { .. } | Fast::Alu3I { .. }
+            | Fast::Alu2 { .. } | Fast::Alu2I { .. } | Fast::A4 { .. } | Fast::AddRI { .. } | Fast::ShlI { .. }
+            | Fast::SarI { .. } | Fast::Ext { .. } | Fast::BitExt { .. } | Fast::BitIns { .. } | Fast::Mov2 { .. }
+            | Fast::Mov2I { .. } | Fast::Un { .. } | Fast::MinMax { .. });
+        match (reg_only, self.regs_rw(), tail.regs_rw()) {
+            (true, Some((hr, hw)), Some((_, tw))) => {
+                (hr | hw) & tw == 0 && !(self.sets_flags() && tail.sets_flags()) && !self.reads_flags() && !tail.reads_flags()
+                    && !matches!(tail, Fast::IfBlk { .. } | Fast::Swap { .. })
+            }
+            _ => false,
+        }
+    }
+
+    /// Does this op set the arithmetic flags? (`alu_f`'s add / subtract, `AddRI`; no other
+    /// micro-op touches them, but `Raw` and `Swap` may; neither is ever swapped). Every op is
+    /// listed, so a new one has to say: `swappable_with` is only sound if this is right.
+    fn sets_flags(&self) -> bool {
+        match *self {
+            Fast::Alu3 { op, .. } | Fast::Alu3I { op, .. } | Fast::Alu2 { op, .. } | Fast::Alu2I { op, .. } | Fast::A4 { op, .. } => {
+                matches!(op, Op::Add | Op::Sub | Op::RSub)
+            }
+            Fast::AddRI { .. } | Fast::Raw { .. } | Fast::Swap { .. } => true,
+            Fast::Mov { .. } | Fast::MovI { .. } | Fast::Ld { .. } | Fast::St { .. } | Fast::BrI { .. } | Fast::BrR { .. }
+            | Fast::FOp { .. } | Fast::Goto { .. } | Fast::Call { .. } | Fast::Rts | Fast::CallR { .. } | Fast::GotoR { .. }
+            | Fast::BitBr { .. } | Fast::LdIdx { .. } | Fast::StIdx { .. } | Fast::Rmw { .. } | Fast::LdPost { .. }
+            | Fast::StPost { .. } | Fast::DecBr { .. } | Fast::Ext { .. } | Fast::MemA4 { .. } | Fast::Nop
+            | Fast::PushRets { .. } | Fast::PopPc { .. } | Fast::PushMask { .. } | Fast::PopMask { .. } | Fast::PushRet
+            | Fast::PopRet | Fast::MinMax { .. } | Fast::IfBlk { .. } | Fast::BrIEq { .. } | Fast::BrINe { .. }
+            | Fast::LdW { .. } | Fast::LdWSp { .. } | Fast::LdBu { .. } | Fast::StW { .. } | Fast::StWSp { .. }
+            | Fast::ShlI { .. } | Fast::SarI { .. } | Fast::SpAdd { .. } | Fast::SpFromR { .. } | Fast::RFromSp { .. }
+            | Fast::BitExt { .. } | Fast::BitIns { .. } | Fast::SetIe { .. } | Fast::IcfgRd { .. } | Fast::IcfgWr { .. }
+            | Fast::BlockMove { .. } | Fast::PopRets | Fast::Tb { .. } | Fast::Mov2 { .. } | Fast::Mov2I { .. }
+            | Fast::Un { .. } | Fast::Div { .. } | Fast::LdPre { .. } | Fast::StPre { .. } | Fast::LdPostR { .. }
+            | Fast::StPostR { .. } => false,
+        }
+    }
+
+    /// Does this op read the arithmetic flags? No micro-op does (`addc` / `subc` and `psr` reads
+    /// are `step`'s), but `Raw` and `Swap` may (neither is ever swapped). Every op is listed, as
+    /// for `sets_flags`, so a new one has to say.
+    fn reads_flags(&self) -> bool {
+        match *self {
+            Fast::Raw { .. } | Fast::Swap { .. } => true,
+            Fast::Mov { .. } | Fast::MovI { .. } | Fast::Alu3 { .. } | Fast::Alu3I { .. } | Fast::Alu2 { .. }
+            | Fast::Alu2I { .. } | Fast::Ld { .. } | Fast::St { .. } | Fast::BrI { .. } | Fast::BrR { .. } | Fast::FOp { .. }
+            | Fast::Goto { .. } | Fast::Call { .. } | Fast::Rts | Fast::CallR { .. } | Fast::GotoR { .. } | Fast::A4 { .. }
+            | Fast::BitBr { .. } | Fast::LdIdx { .. } | Fast::StIdx { .. } | Fast::Rmw { .. } | Fast::LdPost { .. }
+            | Fast::StPost { .. } | Fast::DecBr { .. } | Fast::Ext { .. } | Fast::MemA4 { .. } | Fast::Nop
+            | Fast::PushRets { .. } | Fast::PopPc { .. } | Fast::PushMask { .. } | Fast::PopMask { .. } | Fast::PushRet
+            | Fast::PopRet | Fast::MinMax { .. } | Fast::IfBlk { .. } | Fast::BrIEq { .. } | Fast::BrINe { .. }
+            | Fast::LdW { .. } | Fast::LdWSp { .. } | Fast::LdBu { .. } | Fast::StW { .. } | Fast::StWSp { .. }
+            | Fast::AddRI { .. } | Fast::ShlI { .. } | Fast::SarI { .. } | Fast::SpAdd { .. } | Fast::SpFromR { .. }
+            | Fast::RFromSp { .. } | Fast::BitExt { .. } | Fast::BitIns { .. } | Fast::SetIe { .. } | Fast::IcfgRd { .. }
+            | Fast::IcfgWr { .. } | Fast::BlockMove { .. } | Fast::PopRets | Fast::Tb { .. } | Fast::Mov2 { .. }
+            | Fast::Mov2I { .. } | Fast::Un { .. } | Fast::Div { .. } | Fast::LdPre { .. } | Fast::StPre { .. }
+            | Fast::LdPostR { .. } | Fast::StPostR { .. } => false,
+        }
+    }
+
+    /// Does this op touch only the CPU (no bus, no clock, no interrupt window) and never jump?
+    /// `cli` and `R = icfg`: compiled code calls `Cpu::exec_quiet` for them, not the executor.
+    #[cfg(native_jit)]
+    fn quiet(&self) -> bool {
+        matches!(self, Fast::SetIe { on: false } | Fast::IcfgRd { .. })
     }
 
     /// May this op change pc to anything but the next instruction?
@@ -4918,7 +5281,7 @@ impl Fast {
         matches!(
             self,
             Fast::BrI { .. } | Fast::BrR { .. } | Fast::Goto { .. } | Fast::Call { .. } | Fast::Rts
-                | Fast::BitBr { .. } | Fast::DecBr { .. } | Fast::PopPc { .. } | Fast::PopRet | Fast::PopMask { .. }
+                | Fast::CallR { .. } | Fast::GotoR { .. } | Fast::BitBr { .. } | Fast::DecBr { .. } | Fast::PopPc { .. } | Fast::PopRet | Fast::PopMask { .. }
                 | Fast::IfBlk { .. } | Fast::BrIEq { .. } | Fast::BrINe { .. } | Fast::Tb { .. }
         )
     }
@@ -5097,6 +5460,12 @@ enum Fast {
     Goto { target: u32 },
     Call { target: u32 },
     Rts,
+    /// `call R` / `goto R`: a call or jump to a register's value
+    CallR { r: u8 },
+    GotoR { r: u8 },
+    /// A dual-issue pair run second instruction first (`Cpu::swaps`, `Fast::swappable_with`):
+    /// one op of two instructions, careful, run by `run_fast`'s careful path only.
+    Swap { idx: u32 },
     /// `R = R op x` from the 4-byte ALU decoder: rk 0 = register, 1 =
     /// immediate, 2 = `1 << R`.
     A4 { d: u8, s: u8, op: Op, rk: u8, rv: u32 },
@@ -5280,7 +5649,8 @@ fn fast_raw(route: u16, insn: &Instruction, alu4: &Option<Alu4>, bittest: &Optio
         2 => Some(Fast::Nop),
         // (the arms read bits below 32 only; route 21's table-less form carries the whole window)
         27 if insn.entry.len == 4 => Some(Fast::Raw { route: RAW_POP_RETS_MASK, raw: raw as u32 }),
-        16 | 18 | 19 | 21 | 22 | 27 | 32 | 39 | 40 | 41 => Some(Fast::Raw { route: route as u8, raw: raw as u32 }),
+        18 | 19 => Some(inc_mem_fast(route as u8, raw as u32)),
+        16 | 21 | 22 | 27 | 32 | 39 | 40 | 41 => Some(Fast::Raw { route: route as u8, raw: raw as u32 }),
         26 if insn.entry.len == 4 => Some(Fast::PushMask { mask: ((raw >> 16) & 0xffff) as u16 }),
         28 if insn.entry.len == 4 => Some(Fast::PopMask { mask: ((raw >> 16) & 0xffff) as u16 }),
         35 => {
@@ -5524,6 +5894,25 @@ fn sp_mem_raw(raw: u64) -> Option<SpMem> {
 ///     `b[r4+-163]` = 93-256)
 #[derive(Clone, Copy, Debug)]
 struct IncMem { d: usize, b: usize, w: u8, store: bool, signed: bool, inc: i32, pre: bool, post: bool }
+/// Routes 18 / 19 as micro-ops the compilers have (exec_raw's arm, its rules kept): a
+/// post-increment is `LdPost` / `StPost`, a word at an offset `Ld` / `St`. A post-increment load
+/// into its own base must stay raw: exec_raw updates the base after the load, so it leaves the
+/// incremented base, while `LdPost` adds to what was loaded (it reads b after the load). A
+/// pre-increment would be exact as `LdPre` / `StPre` (`i: 16`, base == data included), but stays
+/// raw: compiled code would gain nothing, since the compilers reach `LdPre` / `StPre` through the
+/// executor, the same call the raw route makes.
+fn inc_mem_fast(route: u8, raw: u32) -> Fast {
+    let m = decode_inc_mem(route, raw as u64);
+    let (d, b, inc) = (m.d as u8, m.b as u8, m.inc as u32);
+    match (m.store, m.pre, m.post) {
+        (true, false, true) => Fast::StPost { s: d, b, w: m.w, inc },
+        (false, false, true) if d != b => Fast::LdPost { d, b, w: m.w, signed: m.signed, inc },
+        (true, false, false) => Fast::St { s: d, b: Base::Reg(b), off: inc, w: m.w },
+        (false, false, false) => Fast::Ld { d, b: Base::Reg(b), off: inc, w: m.w, signed: m.signed },
+        _ => Fast::Raw { route, raw },
+    }
+}
+
 fn decode_inc_mem(route: u8, raw: u64) -> IncMem {
     let w = match (raw >> 8) & 0xff { 0xec => 4u8, 0xed => 2, _ => 1 };
     let d = ((raw >> 28) & 0xf) as usize;
@@ -5790,6 +6179,8 @@ fn fast_of(insn: &Instruction, s: &'static str) -> Option<Fast> {
         }
         "call #i" => Some(Fast::Call { target: target(0)? }),
         "rts" => Some(Fast::Rts),
+        "call R" => Some(Fast::CallR { r: r(0)? }),
+        "goto R" => Some(Fast::GotoR { r: r(0)? }),
         "{rets} = [sp++]" => Some(Fast::PopRets),
         "tbb [R]" | "tbh [R]" => Some(Fast::Tb { r: r(0)?, half: s.starts_with("tbh") }),
         "R = R & ~R" => Some(Fast::Alu3 { d: r(0)?, a: r(1)?, b: r(2)?, op: Op::AndNot }),
