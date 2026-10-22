@@ -213,6 +213,8 @@ pub struct Jit {
     /// computed jumps' targets: pc -> compiled body, direct-mapped by pc (`Gen::ind`); a body
     /// is entered from it as from a chain slot (it checks the limit and its RAM snapshot)
     itab: Box<[ITab]>,
+    /// compile the checks for `Cpu::stop_pc` / `stop_io` at each body's entry (`Cpu::stop_checks`)
+    pub(crate) stops: bool,
 }
 
 /// An `itab` entry (generated code reads it: pc at 0, body at 8).
@@ -261,6 +263,8 @@ pub(crate) struct Prefix {
     /// it may run inside a then-part or rep loop (`Cpu::prefix_inside`): no glued pair whose
     /// head may use the bus (compiled code could leave between the two), no if-else block
     inside_ok: bool,
+    /// it is its block whole: a runner's stretch may run on from it (`Cpu::stop_pc`)
+    pub whole: bool,
 }
 
 // SAFETY: the code cache and the compiled entries are owned by one Cpu and only used by the
@@ -279,7 +283,7 @@ const HOT: u32 = 32;
 impl Jit {
     pub fn new(profile: bool) -> Option<Jit> {
         let itab = (0..1 << ITAB_BITS).map(itab_empty).collect();
-        Some(Jit { cache: CodeCache::new(64 << 20)?, state: Vec::new(), guards: Vec::new(), profile, itab })
+        Some(Jit { cache: CodeCache::new(64 << 20)?, state: Vec::new(), guards: Vec::new(), profile, itab, stops: false })
     }
 
     /// Will `entry` compile block `id` on its next call? (Then `Cpu::then_of` looks for the
@@ -323,11 +327,12 @@ impl Jit {
                 let then = then.filter(|_| plen + 1 == ops.len() && matches!(ops[plen].fast, Fast::IfBlk { has_else: true, .. }) && !ops[plen].pair_head);
                 let with_if = then.is_some();
                 let plen = plen + with_if as usize;
-                let e = match self.compile_prefix::<B>(&ops[..plen], swaps, then.unwrap_or(&[]), pc0, mem, table, true) {
+                let whole = plen == ops.len();
+                let e = match self.compile_prefix::<B>(&ops[..plen], swaps, then.unwrap_or(&[]), pc0, mem, table, true, whole) {
                     None => Entry::No,
                     Some(p) if !with_if => Entry::Code(p, Some(p).filter(|p| p.inside_ok)),
                     // (the ops before the if-else block, for runs inside a construct)
-                    Some(p) => Entry::Code(p, self.compile_prefix::<B>(&ops[..plen - 1], swaps, &[], pc0, mem, false, false).filter(|q| q.inside_ok)),
+                    Some(p) => Entry::Code(p, self.compile_prefix::<B>(&ops[..plen - 1], swaps, &[], pc0, mem, false, false, false).filter(|q| q.inside_ok)),
                 };
                 self.state[id] = e;
                 match e {
@@ -342,12 +347,13 @@ impl Jit {
     /// over RAM may go in the computed jumps' table; `listed`: it goes there at all (the block's
     /// own prefix: a pc has one body there).
     #[allow(clippy::too_many_arguments)]
-    fn compile_prefix<B: Bus>(&mut self, ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], then: &[crate::BOp], pc0: u32, mem: &JitMem, table: bool, listed: bool) -> Option<Prefix> {
+    fn compile_prefix<B: Bus>(&mut self, ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], then: &[crate::BOp], pc0: u32, mem: &JitMem, table: bool, listed: bool, whole: bool) -> Option<Prefix> {
         if ops.is_empty() {
             return None;
         }
         let itab = self.itab.as_ptr() as u64;
-        let (code, body) = compile::<B>(ops, swaps, then, pc0, mem, &mut self.guards, self.profile, itab)?;
+        let stops = self.stops.then_some(whole);
+        let (code, body) = compile::<B>(ops, swaps, then, pc0, mem, &mut self.guards, self.profile, itab, stops)?;
         let p = self.cache.write(&code)?;
         // SAFETY: body is a byte offset inside the code just written
         let body = unsafe { p.add(body) };
@@ -360,6 +366,7 @@ impl Jit {
             insns: insns(ops) + then.len() as u32,
             end: pc0 + ops.iter().map(|o| o.len as u32).sum::<u32>(),
             inside_ok: !ops.iter().any(|o| (o.glue && !o.fast.reg_only()) || (o.careful && !matches!(o.fast, Fast::Swap { .. }))),
+            whole,
         })
     }
 
@@ -462,6 +469,7 @@ fn h_read<B: Bus>(ctx: *mut Ctx, addr: u32, idx: u32, w: u32) -> u32 {
     let ctx = unsafe { &mut *ctx };
     let bus = unsafe { &mut *(ctx.bus as *mut B) };
     unsafe { sync(ctx, bus, idx) };
+    stop_io(ctx);
     let v = match w {
         1 => bus.read8(addr) as u32,
         2 => bus.read16(addr) as u32,
@@ -481,6 +489,7 @@ fn h_write<B: Bus>(ctx: *mut Ctx, addr: u32, v: u32, idx: u32, w: u32) {
     let ctx = unsafe { &mut *ctx };
     let bus = unsafe { &mut *(ctx.bus as *mut B) };
     unsafe { sync(ctx, bus, idx) };
+    stop_io(ctx);
     match w {
         1 => bus.write8(addr, v as u8),
         2 => bus.write16(addr, v as u16),
@@ -503,6 +512,9 @@ fn h_op<B: Bus, const PROF: bool>(ctx: *mut Ctx, op: *const Fast, idx: u32, next
     let bus = unsafe { &mut *(ctx.bus as *mut B) };
     let cpu = unsafe { &mut *ctx.cpu };
     unsafe { sync(ctx, bus, idx) };
+    if cpu.stop_pc != 0 {
+        cpu.stop_io = 1;
+    }
     if PROF {
         cpu.profile_helper(unsafe { &*op });
     }
@@ -636,6 +648,8 @@ struct Gen<'a> {
     h_pair: u64,
     /// `Jit::itab`'s address
     itab: u64,
+    /// the runner's stop checks are compiled (`Jit::stops`)
+    stops: bool,
 }
 
 fn off_reg(r: u8) -> u32 {
@@ -646,6 +660,23 @@ fn off_sp() -> u32 {
 }
 fn off_rets() -> u32 {
     std::mem::offset_of!(Cpu, rets) as u32
+}
+/// A runner's stop is set (`Cpu::stop_pc`): this access may reach a peripheral.
+fn stop_io(ctx: &mut Ctx) {
+    // SAFETY: ctx.cpu is the live Cpu `run` was given.
+    let cpu = unsafe { &mut *ctx.cpu };
+    if cpu.stop_pc != 0 {
+        cpu.stop_io = 1;
+    }
+}
+fn off_stop_pc() -> u32 {
+    std::mem::offset_of!(Cpu, stop_pc) as u32
+}
+fn off_stop_io() -> u32 {
+    std::mem::offset_of!(Cpu, stop_io) as u32
+}
+fn off_stop_rest() -> u32 {
+    std::mem::offset_of!(Cpu, stop_rest) as u32
 }
 fn off_hold() -> u32 {
     std::mem::offset_of!(Cpu, hold_irq) as u32
@@ -878,22 +909,33 @@ impl Gen<'_> {
         self.a.bind(done);
     }
 
-    /// After an instruction that may have called the bus: leave if the next tick is due.
-    fn check_brk_hold(&mut self, next_pc: u32, count: u32) {
+    /// After an instruction that may have called the bus: leave if the next tick is due (or
+    /// code was written), `rest` instructions before the block's end (`Cpu::stop_rest`).
+    fn check_brk_hold(&mut self, next_pc: u32, count: u32, rest: u32) {
         let go = self.a.label();
         self.a.ldr(9, CTX, OFF_BRK);
         self.a.cbz(9, go);
         self.a.mov32(9, 1);
         self.a.str(9, CPU, off_hold());
+        self.rest(rest);
         self.exit_imm(next_pc, count);
         self.a.bind(go);
     }
-    fn check_brk(&mut self, next_pc: u32, count: u32) {
+    fn check_brk(&mut self, next_pc: u32, count: u32, rest: u32) {
         let go = self.a.label();
         self.a.ldr(9, CTX, OFF_BRK);
         self.a.cbz(9, go);
+        self.rest(rest);
         self.exit_imm(next_pc, count);
         self.a.bind(go);
+    }
+    /// Leaving `rest` instructions before the block's end: a runner's stretch learns where the
+    /// block's call ends (`Cpu::stop_rest`).
+    fn rest(&mut self, rest: u32) {
+        if self.stops && rest > 0 {
+            self.a.mov32(9, rest);
+            self.a.str(9, CPU, off_stop_rest());
+        }
     }
     /// Inside an if-else block's then-part, after an op that may have used the bus: leave if
     /// the next tick is due, with the skip (te, ee) for `Cpu::pred_skips` (`Ctx::pred`).
@@ -1390,7 +1432,7 @@ fn emit_op<B: Bus>(g: &mut Gen, fast: Fast, idx: u32, next_pc: u32, profile: boo
             if other.may_jump() {
                 // a jump through the interpreter (`pop` with pc in its mask) that fell
                 // through: leave first if the next tick is due, as after any bus access
-                g.check_brk(next_pc, count);
+                g.check_brk(next_pc, count, 0);
                 g.chain(next_pc, count);
             }
         }
@@ -1401,8 +1443,8 @@ fn emit_op<B: Bus>(g: &mut Gen, fast: Fast, idx: u32, next_pc: u32, profile: boo
 /// Native code for a block prefix of plain micro-ops (none careful), and its body's offset.
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_arguments)]
-fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], then: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<Box<RamGuard>>, profile: bool, itab: u64) -> Option<(Vec<u8>, usize)> {
-    for o in [off_reg(15), off_sp(), off_rets(), off_pc(), off_hold()] {
+fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], then: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<Box<RamGuard>>, profile: bool, itab: u64, stops: Option<bool>) -> Option<(Vec<u8>, usize)> {
+    for o in [off_reg(15), off_sp(), off_rets(), off_pc(), off_hold(), off_stop_pc(), off_stop_io(), off_stop_rest()] {
         if o >= 16384 {
             return None;
         }
@@ -1417,6 +1459,7 @@ fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], then: &[crate
         h_write: h_write::<B> as *const () as u64,
         h_pair: h_pair::<B> as *const () as u64,
         itab,
+        stops: stops.is_some(),
     };
     // prologue (entry from Rust); chained blocks enter at the body
     g.a.stp_pre(29, 30, SP, -FRAME);
@@ -1433,6 +1476,32 @@ fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], then: &[crate
     g.a.mov_x(FLAGS, 5);
     g.a.movz(DONE, 0, 0);
     let body = g.a.here();
+    // a runner's stretch (`Cpu::stop_pc`): entered after the call's first block, from the end
+    // of a block compiled whole, this is where one of the runner's calls ends. Back to Rust
+    // here when the runner could decide otherwise from here on: the stop lies in this block,
+    // a helper may have reached a peripheral, the stretch is spent (32 short of the limit), or
+    // this block isn't compiled whole (its rest runs interpreted)
+    if let Some(whole) = stops {
+        let (go, stop) = (g.a.label(), g.a.label());
+        g.a.cbz(DONE, go);
+        g.a.ldr(9, CPU, off_stop_pc());
+        g.a.cbz(9, go);
+        if whole {
+            let bytes: u32 = ops.iter().map(|o| o.len as u32).sum();
+            g.a.mov32(10, pc0);
+            g.a.sub(9, 9, 10);
+            g.a.cmp_imm(9, bytes);
+            g.a.b_cond(AC::Lo, stop);
+            g.a.ldr(9, CPU, off_stop_io());
+            g.a.cbnz(9, stop);
+            g.a.add_imm(9, DONE, 32);
+            g.a.cmp(9, LIMIT);
+            g.a.b_cond(AC::Lo, go);
+        }
+        g.a.bind(stop);
+        g.exit_imm(pc0, 0);
+        g.a.bind(go);
+    }
     // the whole prefix must fit the call's limit, else back to Rust before running any of it
     {
         let fits = g.a.label();
@@ -1512,11 +1581,12 @@ fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], then: &[crate
         }
         let bus_used = emit_op::<B>(&mut g, op.fast, ins, next_pc, profile);
         if bus_used && !op.fast.may_jump() {
+            let rest = insns(ops) - (ins + 1);
             if op.glue {
                 // leaving between a glued pair's two instructions: interrupts wait for the second
-                g.check_brk_hold(next_pc, ins + 1);
+                g.check_brk_hold(next_pc, ins + 1, rest);
             } else {
-                g.check_brk(next_pc, ins + 1);
+                g.check_brk(next_pc, ins + 1, rest);
             }
         }
         ins += 1;
@@ -1887,16 +1957,57 @@ mod tests {
     }
 
     #[test]
+    fn a_runners_stretch_leaves_where_a_call_would_end() {
+        let mut bus = Memory::new(); let mem = bus.jit_mem().unwrap();
+        let mut cpu = Cpu::new(0); let mut j = Jit::new(false).unwrap();
+        j.stops = true;
+        // 0: goto 32; 32: two ops (bytes 32..36); 64: an op, then one that runs interpreted
+        let from = hot(&mut j, 0, 0, &[op(Fast::Goto { target: 32 })], &mem);
+        let to = hot(&mut j, 1, 32, &[op(Fast::MovI { d: 0, v: 42 }), op(Fast::MovI { d: 1, v: 7 })], &mem);
+        let from2 = hot(&mut j, 2, 96, &[op(Fast::Goto { target: 64 })], &mem);
+        let careful = BOp { careful: true, ..op(Fast::Nop) };
+        hot(&mut j, 3, 64, &[op(Fast::MovI { d: 2, v: 5 }), careful], &mem);
+        for (code, id) in [(from, 1), (from2, 3)] {
+            let (_, slot, _) = unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 100, false) };
+            unsafe { *slot = j.body(id).unwrap() as u64; }
+        }
+        let mut go = |code, stop_pc, stop_io, cap| {
+            cpu.regs = [0; 16]; cpu.stop_pc = stop_pc; cpu.stop_io = stop_io;
+            let k = unsafe { run(code, &mut cpu, &mut bus, &mem, 0, cap, false) }.0;
+            (k, cpu.pc, cpu.regs[0])
+        };
+        // no stretch, or nothing to stop for: on into the next block
+        assert_eq!(go(from, 0, 0, 100), (3, 36, 42));
+        assert_eq!(go(from, 0x40, 0, 100), (3, 36, 42));
+        // back before it: the stop starts it or lies in it, a peripheral was reached, or the
+        // stretch is spent (32 short of the limit)
+        assert_eq!(go(from, 32, 0, 100), (1, 32, 0));
+        assert_eq!(go(from, 34, 0, 100), (1, 32, 0));
+        assert_eq!(go(from, 36, 0, 100), (3, 36, 42));
+        assert_eq!(go(from, 0x40, 1, 100), (1, 32, 0));
+        assert_eq!(go(from, 0x40, 0, 33), (1, 32, 0));
+        assert_eq!(go(from, 0x40, 0, 34), (3, 36, 42));
+        // a block not compiled whole: only outside a stretch
+        assert_eq!(go(from2, 0, 0, 100).0, 2);
+        assert_eq!(go(from2, 0x1000, 0, 100), (1, 64, 0));
+        // never at the call's first block
+        assert_eq!(go(to, 32, 1, 100), (2, 36, 42));
+        cpu.stop_pc = 0; cpu.stop_io = 0;
+    }
+    #[test]
     fn code_store_exits_before_following_instruction() {
         let mut bus = Memory::new(); let mem = bus.jit_mem().unwrap();
         let mut cpu = Cpu::new(0); let mut j = Jit::new(false).unwrap();
         cpu.regs[0] = 123; cpu.regs[1] = 2;
+        j.stops = true;
         let code = hot(&mut j, 0, 0, &[
             op(Fast::St { s: 0, b: Base::Reg(1), off: 0, w: 4 }),
-            op(Fast::MovI { d: 2, v: 99 })], &mem);
+            op(Fast::MovI { d: 2, v: 99 }), op(Fast::MovI { d: 3, v: 98 })], &mem);
         assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10, false) }.0, 1);
         assert_eq!(cpu.pc, 2); assert_eq!(cpu.regs[2], 0);
         assert_eq!(bus.read32(2), 123); assert_eq!(bus.version, 1);
+        // (a runner's stretch learns where the block would have ended)
+        assert_eq!(cpu.stop_rest, 2);
     }
     #[test]
     fn direct_ops_match_interpreter_with_aliases_and_edge_fields() {
