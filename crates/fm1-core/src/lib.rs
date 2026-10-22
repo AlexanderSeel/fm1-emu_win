@@ -542,14 +542,22 @@ impl Cpu {
                     if self.jit.is_none() {
                         self.jit = jit::Jit::new(self.profile).map(Box::new);
                     }
+                    // (a block about to be compiled that ends in an if-else block: its then-part)
+                    let mut then = None;
+                    if self.jit.as_ref().is_some_and(|j| j.compiles_next(id)) {
+                        then = self.then_of(bus, id, pc);
+                        if self.blocks.get(id) != Some(&(pc, start, len)) {
+                            continue; // (looking for it rebuilt the block table: look again)
+                        }
+                    }
                     let code = match self.jit.as_mut() {
                         Some(j) => {
                             let table = bus.code_writes().is_some() && !mem.ram_code.is_null();
-                            j.entry::<B>(id, &self.bops[start as usize..(start + len) as usize], &self.swaps, pc, &mem, table)
+                            j.entry::<B>(id, &self.bops[start as usize..(start + len) as usize], &self.swaps, then.as_deref(), pc, &mem, table, inside)
                         }
                         None => None,
                     };
-                    let code = code.filter(|p| !inside || (p.inside_ok && self.prefix_inside(pc, p.end)));
+                    let code = code.filter(|p| !inside || self.prefix_inside(pc, p.end));
                     if let Some(jit::Prefix { code, insns, .. }) = code {
                         // (the code checks itself that its ticks fall before anything is due)
                         let extra = if n == 0 { 0 } else { 1 };
@@ -919,10 +927,27 @@ impl Cpu {
         out
     }
 
+    /// The then-part of the if-else block that ends block `id` (at pc), when there is one that
+    /// `then_part` gives: what the native JIT compiles in line with the if (`jit::Jit::entry`).
+    #[cfg(native_jit)]
+    #[inline(never)]
+    fn then_of<B: Bus>(&mut self, bus: &mut B, id: usize, pc: u32) -> Option<Vec<BOp>> {
+        let (_, start, len) = self.blocks[id];
+        let ops = &self.bops[start as usize..(start + len) as usize];
+        let last = ops.last()?;
+        match last.fast {
+            Fast::IfBlk { has_else: true, then_d, .. } if !last.pair_head => {
+                let next = pc + ops.iter().map(|o| o.len as u32).sum::<u32>();
+                self.then_part(bus, next, then_d)
+            }
+            _ => None,
+        }
+    }
+
     /// The then-part of an if-else block, `then_d` bytes from `pc`, when it is plain micro-ops
-    /// at the start of the block there (no jump, pair, careful op): what the wasm JIT compiles
-    /// in line with the if.
-    #[cfg(target_arch = "wasm32")]
+    /// at the start of the block there (no jump, pair, careful op): what the JITs compile in
+    /// line with the if.
+    #[cfg(any(target_arch = "wasm32", native_jit))]
     fn then_part<B: Bus>(&mut self, bus: &mut B, pc: u32, then_d: u16) -> Option<Vec<BOp>> {
         let mut then = Vec::new();
         let mut q = pc;

@@ -14,7 +14,7 @@
 //! host (the interpreter); conversions to integers saturate as Rust's `as` does (cvttss2si alone
 //! gives 0x8000_0000 for NaN and out of range); min / max through the interpreter's executor.
 
-use super::{h_pair, h_ram_ok, h_read, h_write, insns, off_hold, off_pc, off_reg, off_rets, off_sp, op_helper, JitMem, RamGuard, ITAB_BITS, OFF_BRK, OFF_SLOT, OFF_VER};
+use super::{h_pair, h_ram_ok, h_read, h_write, insns, off_hold, off_pc, off_reg, off_rets, off_sp, op_helper, JitMem, RamGuard, ITAB_BITS, OFF_BRK, OFF_PRED, OFF_SLOT, OFF_VER};
 use crate::jit_x64::{m, mx, Alu, Asm, Cc, Fop, Label, Mem, Reg, Sh, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP, R10, R11, R12, R13, R14, R15, R8, R9};
 use crate::{Base, Bus, Cond, Fast, Op, RmwOp};
 
@@ -341,9 +341,32 @@ impl Gen<'_> {
         self.exit_imm(next_pc, count);
         self.a.bind(go);
     }
-    /// After a swapped pair: leave if the next tick is due (or a code word was written), or an
-    /// interrupt is pending (then `run_fast` stops: `Ctx::stop`). Nothing to call while neither
-    /// brk is set nor `Ctx::irq` (none pending, known since the last helper).
+    /// Inside an if-else block's then-part, after an op that may have used the bus: leave if
+    /// the next tick is due, with the skip (te, ee) for `Cpu::pred_skips` (`Ctx::pred`).
+    fn check_brk_pred(&mut self, next_pc: u32, count: u32, te: u32, ee: u32) {
+        let go = self.a.label();
+        self.a.cmp_m_i8(m(CTX, OFF_BRK as i32), 0);
+        self.a.jcc(Cc::E, go);
+        self.a.st_imm(m(CTX, OFF_PRED as i32), te);
+        self.a.st_imm(m(CTX, OFF_PRED as i32 + 4), ee);
+        self.exit_imm(next_pc, count);
+        self.a.bind(go);
+    }
+    /// Jump to `taken` when a predicated block's condition holds (`exec_fast`'s IfBlk).
+    fn if_jump(&mut self, a: u8, rk: u8, fam: u8, alt: bool, rv: u32, taken: Label) {
+        self.rhs(rk, rv);
+        self.ld_reg(RAX, a);
+        if fam == 2 {
+            self.a.test_rr(RAX, RCX);
+            self.a.jcc(if alt { Cc::Ne } else { Cc::E }, taken);
+        } else {
+            self.branch(crate::cond_of_fam(fam as u64, alt), taken);
+        }
+    }
+    /// After a swapped pair (or an if-else block's then-part): leave if the next tick is due
+    /// (or a code word was written), or an interrupt is pending (then `run_fast` stops:
+    /// `Ctx::stop`). Nothing to call while neither brk is set nor `Ctx::irq` (none pending,
+    /// known since the last helper).
     fn check_pair(&mut self, next_pc: u32, count: u32) {
         let go = self.a.label();
         self.a.ld64(R11, m(CTX, OFF_BRK as i32)); // brk | irq << 32
@@ -499,14 +522,7 @@ fn emit_op<B: Bus>(g: &mut Gen, fast: Fast, idx: u32, next_pc: u32, profile: boo
         Fast::IfBlk { a, rk, fam, alt, has_else: false, rv, then_d, .. } => {
             // without an else part a predicated block is a conditional jump over its then part
             let taken = g.a.label();
-            g.rhs(rk, rv);
-            g.ld_reg(RAX, a);
-            if fam == 2 {
-                g.a.test_rr(RAX, RCX);
-                g.a.jcc(if alt { Cc::Ne } else { Cc::E }, taken);
-            } else {
-                g.branch(crate::cond_of_fam(fam as u64, alt), taken);
-            }
+            g.if_jump(a, rk, fam, alt, rv, taken);
             g.chain(next_pc.wrapping_add(then_d as u32), count);
             g.a.bind(taken);
             g.chain(next_pc, count);
@@ -824,7 +840,8 @@ fn emit_op<B: Bus>(g: &mut Gen, fast: Fast, idx: u32, next_pc: u32, profile: boo
 }
 
 /// Native code for a block prefix of plain micro-ops (none careful), and its body's offset.
-pub(super) fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], pc0: u32, mem: &JitMem, guards: &mut Vec<Box<RamGuard>>, profile: bool, itab: u64) -> Option<(Vec<u8>, usize)> {
+#[allow(clippy::too_many_arguments)]
+pub(super) fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], then: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<Box<RamGuard>>, profile: bool, itab: u64) -> Option<(Vec<u8>, usize)> {
     let mut a = Asm::new();
     let exit = a.label();
     let mut g = Gen {
@@ -854,7 +871,7 @@ pub(super) fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], pc
     // the whole prefix must fit the call's limit, else back to Rust before running any of it
     {
         let fits = g.a.label();
-        g.a.lea(R11, m(DONE, insns(ops) as i32));
+        g.a.lea(R11, m(DONE, (insns(ops) + then.len() as u32) as i32));
         g.a.cmp_rm(R11, m(RSP, LIMIT));
         g.a.jcc(Cc::Be, fits);
         g.exit_imm(pc0, 0);
@@ -863,7 +880,7 @@ pub(super) fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], pc
 
     if !(0x0200_0000..0x0400_0000).contains(&pc0) {
         let off = pc0.wrapping_sub(mem.ram_base) as usize;
-        let len = ops.iter().map(|op| op.len as usize).sum::<usize>() + 6;
+        let len = ops.iter().chain(then).map(|op| op.len as usize).sum::<usize>() + 6;
         let len = len.min((mem.ram_len as usize).checked_sub(off)?);
         // SAFETY: jit_mem provides a live RAM allocation, and the range is checked above.
         let bytes = unsafe { std::slice::from_raw_parts(mem.ram.add(off), len) }.into();
@@ -901,6 +918,32 @@ pub(super) fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], pc
             ins += 2;
             pc = next_pc;
             continue;
+        }
+        if let Fast::IfBlk { a, rk, fam, alt, has_else: true, rv, then_d, else_d } = op.fast {
+            // an if-else block with its then-part (`Jit::entry`: the block's last op): not taken,
+            // on at the else part; taken, the then-part, then past the else part. Interrupts wait
+            // through the then-part (an exit inside it leaves the skip in `Ctx::pred`, for
+            // pred_skips) and after it the careful path stops if one is pending (`check_pair`).
+            let te = next_pc.wrapping_add(then_d as u32);
+            let ee = te.wrapping_add(else_d as u32);
+            let taken = g.a.label();
+            g.if_jump(a, rk, fam, alt, rv, taken);
+            g.chain(te, ins + 1);
+            g.a.bind(taken);
+            let (mut tpc, mut j) = (next_pc, ins + 1);
+            for (k, t) in then.iter().enumerate() {
+                let tnext = tpc + t.len as u32;
+                if emit_op::<B>(&mut g, t.fast, j, tnext, profile) && k + 1 < then.len() {
+                    g.check_brk_pred(tnext, j + 1, te, ee);
+                }
+                (tpc, j) = (tnext, j + 1);
+            }
+            if !then.is_empty() {
+                g.check_pair(ee, j);
+            }
+            g.chain(ee, j);
+            ins = j;
+            break;
         }
         let bus_used = emit_op::<B>(&mut g, op.fast, ins, next_pc, profile);
         if bus_used && !op.fast.may_jump() {

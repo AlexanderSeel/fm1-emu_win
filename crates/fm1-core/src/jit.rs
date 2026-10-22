@@ -76,11 +76,16 @@ pub struct Ctx {
     stop: u32,
     /// inside a then-part or rep loop: a pair does not stop for an interrupt (`h_pair`)
     inside: u32,
+    /// it left inside an if-else block's then-part: its (end, else part's end), for
+    /// `Cpu::pred_skips` (0: not)
+    pred: [u32; 2],
     code_version: Option<u64>,
 }
 const OFF_BRK: u32 = 24;
 const OFF_SLOT: u32 = 32;
 const OFF_VER: u32 = 40;
+const OFF_PRED: u32 = 56;
+const _: () = assert!(std::mem::offset_of!(Ctx, pred) == OFF_PRED as usize);
 const _: () = assert!(std::mem::offset_of!(Ctx, ver) == OFF_VER as usize);
 const _: () = assert!(std::mem::offset_of!(Ctx, brk) == OFF_BRK as usize);
 const _: () = assert!(std::mem::offset_of!(Ctx, irq) == OFF_BRK as usize + 4);
@@ -230,7 +235,9 @@ fn itab_slot(pc: u32) -> usize {
 #[derive(Clone, Copy)]
 enum Entry {
     Cold(u32),
-    Code(Prefix),
+    /// the prefix, and the one to run inside a then-part or rep loop (`Prefix::inside_ok`; when
+    /// the prefix takes in an if-else block, the ops before it, compiled on their own)
+    Code(Prefix, Option<Prefix>),
     No,
 }
 
@@ -246,8 +253,8 @@ pub(crate) struct Prefix {
     /// the pc after its last instruction
     pub end: u32,
     /// it may run inside a then-part or rep loop (`Cpu::prefix_inside`): no glued pair whose
-    /// head may use the bus (compiled code could leave between the two)
-    pub inside_ok: bool,
+    /// head may use the bus (compiled code could leave between the two), no if-else block
+    inside_ok: bool,
 }
 
 // SAFETY: the code cache and the compiled entries are owned by one Cpu and only used by the
@@ -269,16 +276,29 @@ impl Jit {
         Some(Jit { cache: CodeCache::new(64 << 20)?, state: Vec::new(), guards: Vec::new(), profile, itab })
     }
 
-    /// The compiled code of block `id` (prefix length), compiling it once it is hot. `swaps`:
-    /// `Cpu::swaps`, the pairs of its `Fast::Swap` ops. `table`: a body over RAM may go in the
-    /// computed jumps' table (what `Cpu::jit_body_at` asks of a chain target: the bus counts
-    /// code writes and compiled stores see the code flags).
-    pub(crate) fn entry<B: Bus>(&mut self, id: usize, ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], pc0: u32, mem: &JitMem, table: bool) -> Option<Prefix> {
+    /// Will `entry` compile block `id` on its next call? (Then `Cpu::then_of` looks for the
+    /// then-part of an if-else block that ends it.)
+    pub(crate) fn compiles_next(&self, id: usize) -> bool {
+        match self.state.get(id) {
+            None => HOT <= 1,
+            Some(Entry::Cold(c)) => c + 1 >= HOT,
+            _ => false,
+        }
+    }
+
+    /// The compiled code of block `id`, compiling it once it is hot. `swaps`: `Cpu::swaps`, the
+    /// pairs of its `Fast::Swap` ops. `then`: the block ends in an if-else block and this is its
+    /// then-part (plain ops, `Cpu::then_part`): the prefix may take both in. `table`: a body over
+    /// RAM may go in the computed jumps' table (what `Cpu::jit_body_at` asks of a chain target:
+    /// the bus counts code writes and compiled stores see the code flags).
+    /// `inside`: the prefix to run inside a then-part or rep loop (`Prefix::inside_ok`), if any.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn entry<B: Bus>(&mut self, id: usize, ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], then: Option<&[crate::BOp]>, pc0: u32, mem: &JitMem, table: bool, inside: bool) -> Option<Prefix> {
         if self.state.len() <= id {
             self.state.resize(id + 1, Entry::Cold(0));
         }
         match self.state[id] {
-            Entry::Code(p) => Some(p),
+            Entry::Code(p, q) => if inside { q } else { Some(p) },
             Entry::No => None,
             Entry::Cold(c) if c + 1 < HOT => {
                 self.state[id] = Entry::Cold(c + 1);
@@ -293,45 +313,54 @@ impl Jit {
                         _ => !o.careful,
                     })
                     .count();
-                let e = if plen == 0 {
-                    Entry::No
-                } else {
-                    let itab = self.itab.as_ptr() as u64;
-                    match compile::<B>(&ops[..plen], swaps, pc0, mem, &mut self.guards, self.profile, itab) {
-                        Some((code, body)) => match self.cache.write(&code) {
-                            Some(p) => {
-                                // SAFETY: body is a byte offset inside the code just written
-                                let body = unsafe { p.add(body) };
-                                if table || (0x0200_0000..0x0400_0000).contains(&pc0) {
-                                    self.itab[itab_slot(pc0)] = ITab { pc: pc0, _pad: 0, body: body as u64 };
-                                }
-                                let ops = &ops[..plen];
-                                Entry::Code(Prefix {
-                                    code: p,
-                                    body,
-                                    insns: insns(ops),
-                                    end: pc0 + ops.iter().map(|o| o.len as u32).sum::<u32>(),
-                                    inside_ok: !ops.iter().any(|o| o.glue && !o.fast.reg_only()),
-                                })
-                            }
-                            None => Entry::No,
-                        },
-                        None => Entry::No,
-                    }
+                // an if-else block ending it (careful: interpreted, else) with its then-part
+                let then = then.filter(|_| plen + 1 == ops.len() && matches!(ops[plen].fast, Fast::IfBlk { has_else: true, .. }) && !ops[plen].pair_head);
+                let with_if = then.is_some();
+                let plen = plen + with_if as usize;
+                let e = match self.compile_prefix::<B>(&ops[..plen], swaps, then.unwrap_or(&[]), pc0, mem, table, true) {
+                    None => Entry::No,
+                    Some(p) if !with_if => Entry::Code(p, Some(p).filter(|p| p.inside_ok)),
+                    // (the ops before the if-else block, for runs inside a construct)
+                    Some(p) => Entry::Code(p, self.compile_prefix::<B>(&ops[..plen - 1], swaps, &[], pc0, mem, false, false).filter(|q| q.inside_ok)),
                 };
                 self.state[id] = e;
                 match e {
-                    Entry::Code(p) => Some(p),
+                    Entry::Code(p, q) => if inside { q } else { Some(p) },
                     _ => None,
                 }
             }
         }
     }
 
+    /// Compile `ops` (and an if-else block's then-part, `then`) starting at pc0. `table`: a body
+    /// over RAM may go in the computed jumps' table; `listed`: it goes there at all (the block's
+    /// own prefix: a pc has one body there).
+    #[allow(clippy::too_many_arguments)]
+    fn compile_prefix<B: Bus>(&mut self, ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], then: &[crate::BOp], pc0: u32, mem: &JitMem, table: bool, listed: bool) -> Option<Prefix> {
+        if ops.is_empty() {
+            return None;
+        }
+        let itab = self.itab.as_ptr() as u64;
+        let (code, body) = compile::<B>(ops, swaps, then, pc0, mem, &mut self.guards, self.profile, itab)?;
+        let p = self.cache.write(&code)?;
+        // SAFETY: body is a byte offset inside the code just written
+        let body = unsafe { p.add(body) };
+        if listed && (table || (0x0200_0000..0x0400_0000).contains(&pc0)) {
+            self.itab[itab_slot(pc0)] = ITab { pc: pc0, _pad: 0, body: body as u64 };
+        }
+        Some(Prefix {
+            code: p,
+            body,
+            insns: insns(ops) + then.len() as u32,
+            end: pc0 + ops.iter().map(|o| o.len as u32).sum::<u32>(),
+            inside_ok: !ops.iter().any(|o| (o.glue && !o.fast.reg_only()) || (o.careful && !matches!(o.fast, Fast::Swap { .. }))),
+        })
+    }
+
     /// The chain target of block `id`, if it is compiled.
     pub(crate) fn body(&self, id: usize) -> Option<*const u8> {
         match self.state.get(id) {
-            Some(Entry::Code(p)) => Some(p.body),
+            Some(Entry::Code(p, _)) => Some(p.body),
             _ => None,
         }
     }
@@ -366,10 +395,17 @@ pub(crate) unsafe fn run<B: Bus>(code: *const u8, cpu: &mut Cpu, bus: &mut B, me
         ver: bus.code_writes().unwrap_or(u64::MAX - 1),
         stop: 0,
         inside: inside as u32,
+        pred: [0; 2],
         code_version: bus.code_writes(),
     };
     let f: CodeFn = unsafe { std::mem::transmute(code) };
     let k = f(cpu as *mut Cpu, &mut ctx, mem.ram, mem.xip, limit, mem.ram_code);
+    if ctx.pred[0] != 0 {
+        // (as the if-else op put it there)
+        let (te, ee) = (ctx.pred[0], ctx.pred[1]);
+        cpu.pred_skips.retain(|&(t, _)| t != te);
+        cpu.pred_skips.push((te, ee));
+    }
     if k > 0 {
         // the ticks of the instructions run, less those the helpers applied already
         let need = (k - 1) + extra;
@@ -845,9 +881,36 @@ impl Gen<'_> {
         self.exit_imm(next_pc, count);
         self.a.bind(go);
     }
-    /// After a swapped pair: leave if the next tick is due (or a code word was written), or an
-    /// interrupt is pending (then `run_fast` stops: `Ctx::stop`). Nothing to call while neither
-    /// brk is set nor `Ctx::irq` (none pending, known since the last helper).
+    /// Inside an if-else block's then-part, after an op that may have used the bus: leave if
+    /// the next tick is due, with the skip (te, ee) for `Cpu::pred_skips` (`Ctx::pred`).
+    fn check_brk_pred(&mut self, next_pc: u32, count: u32, te: u32, ee: u32) {
+        let go = self.a.label();
+        self.a.ldr(9, CTX, OFF_BRK);
+        self.a.cbz(9, go);
+        self.a.mov32(9, te);
+        self.a.str(9, CTX, OFF_PRED);
+        self.a.mov32(9, ee);
+        self.a.str(9, CTX, OFF_PRED + 4);
+        self.exit_imm(next_pc, count);
+        self.a.bind(go);
+    }
+    /// Jump to `taken` when a predicated block's condition holds (`exec_fast`'s IfBlk).
+    fn if_jump(&mut self, a: u8, rk: u8, fam: u8, alt: bool, rv: u32, taken: Label) {
+        self.rhs(rk, rv);
+        self.ld_reg(0, a);
+        let c = if fam == 2 {
+            self.a.tst(0, 1);
+            if alt { AC::Ne } else { AC::Eq }
+        } else {
+            self.cmp(fam >= 8, 0, 1);
+            acond(crate::cond_of_fam(fam as u64, alt))
+        };
+        self.a.b_cond(c, taken);
+    }
+    /// After a swapped pair (or an if-else block's then-part): leave if the next tick is due
+    /// (or a code word was written), or an interrupt is pending (then `run_fast` stops:
+    /// `Ctx::stop`). Nothing to call while neither brk is set nor `Ctx::irq` (none pending,
+    /// known since the last helper).
     fn check_pair(&mut self, next_pc: u32, count: u32) {
         let go = self.a.label();
         self.a.ldr_x(9, CTX, OFF_BRK); // brk | irq << 32
@@ -1003,16 +1066,7 @@ fn emit_op<B: Bus>(g: &mut Gen, fast: Fast, idx: u32, next_pc: u32, profile: boo
         Fast::IfBlk { a, rk, fam, alt, has_else: false, rv, then_d, .. } => {
             // without an else part a predicated block is a conditional jump over its then part
             let taken = g.a.label();
-            g.rhs(rk, rv);
-            g.ld_reg(0, a);
-            let c = if fam == 2 {
-                g.a.tst(0, 1);
-                if alt { AC::Ne } else { AC::Eq }
-            } else {
-                g.cmp(fam >= 8, 0, 1);
-                acond(crate::cond_of_fam(fam as u64, alt))
-            };
-            g.a.b_cond(c, taken);
+            g.if_jump(a, rk, fam, alt, rv, taken);
             g.chain(next_pc.wrapping_add(then_d as u32), count);
             g.a.bind(taken);
             g.chain(next_pc, count);
@@ -1285,7 +1339,8 @@ fn emit_op<B: Bus>(g: &mut Gen, fast: Fast, idx: u32, next_pc: u32, profile: boo
 
 /// Native code for a block prefix of plain micro-ops (none careful), and its body's offset.
 #[cfg(target_arch = "aarch64")]
-fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], pc0: u32, mem: &JitMem, guards: &mut Vec<Box<RamGuard>>, profile: bool, itab: u64) -> Option<(Vec<u8>, usize)> {
+#[allow(clippy::too_many_arguments)]
+fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], then: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<Box<RamGuard>>, profile: bool, itab: u64) -> Option<(Vec<u8>, usize)> {
     for o in [off_reg(15), off_sp(), off_rets(), off_pc(), off_hold()] {
         if o >= 16384 {
             return None;
@@ -1320,7 +1375,7 @@ fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], pc0: u32, mem
     // the whole prefix must fit the call's limit, else back to Rust before running any of it
     {
         let fits = g.a.label();
-        g.a.add_imm(9, DONE, insns(ops));
+        g.a.add_imm(9, DONE, insns(ops) + then.len() as u32);
         g.a.cmp(9, LIMIT);
         g.a.b_cond(AC::Ls, fits);
         g.exit_imm(pc0, 0);
@@ -1329,7 +1384,7 @@ fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], pc0: u32, mem
 
     if !(0x0200_0000..0x0400_0000).contains(&pc0) {
         let off = pc0.wrapping_sub(mem.ram_base) as usize;
-        let len = ops.iter().map(|op| op.len as usize).sum::<usize>() + 6;
+        let len = ops.iter().chain(then).map(|op| op.len as usize).sum::<usize>() + 6;
         let len = len.min((mem.ram_len as usize).checked_sub(off)?);
         // SAFETY: jit_mem provides a live RAM allocation, and the range is checked above.
         let bytes = unsafe { std::slice::from_raw_parts(mem.ram.add(off), len) }.into();
@@ -1368,6 +1423,32 @@ fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], pc0: u32, mem
             pc = next_pc;
             continue;
         }
+        if let Fast::IfBlk { a, rk, fam, alt, has_else: true, rv, then_d, else_d } = op.fast {
+            // an if-else block with its then-part (`Jit::entry`: the block's last op): not taken,
+            // on at the else part; taken, the then-part, then past the else part. Interrupts wait
+            // through the then-part (an exit inside it leaves the skip in `Ctx::pred`, for
+            // pred_skips) and after it the careful path stops if one is pending (`check_pair`).
+            let te = next_pc.wrapping_add(then_d as u32);
+            let ee = te.wrapping_add(else_d as u32);
+            let taken = g.a.label();
+            g.if_jump(a, rk, fam, alt, rv, taken);
+            g.chain(te, ins + 1);
+            g.a.bind(taken);
+            let (mut tpc, mut j) = (next_pc, ins + 1);
+            for (k, t) in then.iter().enumerate() {
+                let tnext = tpc + t.len as u32;
+                if emit_op::<B>(&mut g, t.fast, j, tnext, profile) && k + 1 < then.len() {
+                    g.check_brk_pred(tnext, j + 1, te, ee);
+                }
+                (tpc, j) = (tnext, j + 1);
+            }
+            if !then.is_empty() {
+                g.check_pair(ee, j);
+            }
+            g.chain(ee, j);
+            ins = j;
+            break;
+        }
         let bus_used = emit_op::<B>(&mut g, op.fast, ins, next_pc, profile);
         if bus_used && !op.fast.may_jump() {
             if op.glue {
@@ -1404,10 +1485,11 @@ mod tests {
     use crate::{Base, BOp};
     /// 256 bytes of RAM at 0 (no XIP); a word read at `MMIO` and up gives `mmio`, and makes the
     /// next tick due when `due_on_mmio` (a peripheral touched, as the Soc does).
-    struct Memory { data: Vec<u8>, flags: Vec<u8>, version: u64, mmio: u32, due_on_mmio: bool, due: bool }
+    /// (`irq`: an interrupt pending; a write at `MMIO` and up sets it from the value's bit 0)
+    struct Memory { data: Vec<u8>, flags: Vec<u8>, version: u64, mmio: u32, due_on_mmio: bool, due: bool, irq: bool }
     const MMIO: u32 = 0x1000;
     impl Memory {
-        fn new() -> Self { Self { data: vec![0; 256], flags: vec![1; 65], version: 0, mmio: 0, due_on_mmio: false, due: false } }
+        fn new() -> Self { Self { data: vec![0; 256], flags: vec![1; 65], version: 0, mmio: 0, due_on_mmio: false, due: false, irq: false } }
     }
     impl Bus for Memory {
         fn read8(&mut self, a: u32) -> u8 { self.data[a as usize] }
@@ -1420,11 +1502,18 @@ mod tests {
             }
             u32::from_le_bytes(self.data[a as usize..a as usize+4].try_into().unwrap())
         }
-        fn write8(&mut self, a: u32, v: u8) { self.data[a as usize] = v; self.version += 1; }
+        fn write8(&mut self, a: u32, v: u8) {
+            if a >= MMIO {
+                (self.irq, self.due) = (v & 1 != 0, self.due || self.due_on_mmio);
+                return;
+            }
+            self.data[a as usize] = v; self.version += 1;
+        }
         fn write16(&mut self, a: u32, v: u16) { self.data[a as usize..a as usize+2].copy_from_slice(&v.to_le_bytes()); self.version += 1; }
         fn write32(&mut self, a: u32, v: u32) { self.data[a as usize..a as usize+4].copy_from_slice(&v.to_le_bytes()); self.version += 1; }
         fn tick_room(&self) -> u64 { 1000 }
         fn next_tick_due(&self) -> bool { self.due }
+        fn irq_pending(&self) -> bool { self.irq }
         fn add_ticks(&mut self, _: u64) {}
         fn code_writes(&self) -> Option<u64> { Some(self.version) }
         fn jit_mem(&mut self) -> Option<JitMem> {
@@ -1434,8 +1523,8 @@ mod tests {
     }
     fn op(fast: Fast) -> BOp { BOp { fast, len: 2, careful: false, pair_head: false, glue: false } }
     fn hot(j: &mut Jit, id: usize, pc: u32, ops: &[BOp], mem: &JitMem) -> *const u8 {
-        for _ in 0..HOT { j.entry::<Memory>(id, ops, &[], pc, mem, true); }
-        j.entry::<Memory>(id, ops, &[], pc, mem, true).unwrap().code
+        for _ in 0..HOT { j.entry::<Memory>(id, ops, &[], None, pc, mem, true, false); }
+        j.entry::<Memory>(id, ops, &[], None, pc, mem, true, false).unwrap().code
     }
     #[test]
     fn ram_chain_rejects_changed_target_and_respects_budget() {
@@ -1577,8 +1666,8 @@ mod tests {
             let pc = e.exec_fast_paired(&mut reference, tail, false, 4).unwrap_or(4);
             // the pair alone: it fits a limit of 2, not 1
             let swap = BOp { fast: Fast::Swap { idx: 0 }, len: 4, careful: true, pair_head: true, glue: false };
-            for _ in 0..HOT { jit.entry::<Memory>(id, &[swap], &[(head, tail, 2)], 0, &mem, true); }
-            let code = jit.entry::<Memory>(id, &[swap], &[(head, tail, 2)], 0, &mem, true).unwrap().code;
+            for _ in 0..HOT { jit.entry::<Memory>(id, &[swap], &[(head, tail, 2)], None, 0, &mem, true, false); }
+            let code = jit.entry::<Memory>(id, &[swap], &[(head, tail, 2)], None, 0, &mem, true, false).unwrap().code;
             id += 1;
             let regs0 = cpu.regs;
             assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 1, false) }.0, 0, "{head:?} {tail:?}");
@@ -1630,6 +1719,74 @@ mod tests {
         let mut cpu = fresh(200);
         assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10, false) }.0, 0);
         assert_eq!((cpu.regs[0], cpu.pc), (0, 32));
+    }
+
+    /// An if-else block compiled with its then-part in tow (`Jit::entry`'s `then`) against the
+    /// careful path (`exec_careful`, as run_fast runs it, stopping where a tick comes due): not
+    /// taken, on at the else part; taken, the then-part and past the else part, stopping there
+    /// with an interrupt pending; a then-part instruction that makes the next tick due leaves
+    /// right after it with the skip in pred_skips (or, the last one, past the else part).
+    #[test]
+    fn if_else_blocks_with_their_then_part_match_the_careful_path() {
+        use crate::Op;
+        let mut seed = 0x1357_9bdf_2468_ace0u64;
+        let mut rnd = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed as u32 };
+        let mut jit = Jit::new(false).unwrap();
+        let mut id = 0;
+        for round in 0..3000 {
+            let (x, y) = (rnd(), rnd());
+            let fam = [0u8, 1, 2, 4, 5, 6][x as usize % 6];
+            let (rk, alt) = ((x >> 4) as u8 % 3, x & 0x100 != 0);
+            let rv = if rk == 1 { rnd() % 8 } else { (x >> 9) % 4 };
+            // (careful, as the decoder makes an if-else block)
+            let iff = |then_d, else_d| BOp { careful: true, ..op(Fast::IfBlk { a: 0, rk, fam, alt, has_else: true, rv, then_d, else_d }) };
+            // a then-part of 0-4 plain ops, a byte store to a peripheral among them now and then
+            let mut then = vec![];
+            for k in 0..y % 5 {
+                then.push(op(match (rnd() % 4, k) {
+                    (0, _) if y & 0x100 != 0 => Fast::St { s: 2, b: Base::Reg(9), off: 0, w: 1 },
+                    (1, _) => Fast::Alu2I { d: 1, v: rnd() % 7, op: Op::Add },
+                    (2, _) => Fast::MovI { d: 3, v: rnd() },
+                    _ => Fast::St { s: 1, b: Base::Reg(8), off: 0, w: 4 },
+                }));
+            }
+            let then_d = 2 * then.len() as u16;
+            let else_d = 2 * (1 + rnd() % 4) as u16;
+            let (te, ee) = (2 + then_d as u32, 2 + (then_d + else_d) as u32);
+            let block = [iff(then_d, else_d)];
+            let mut bus = Memory::new();
+            bus.flags.fill(0);
+            (bus.irq, bus.due_on_mmio) = (rnd() % 3 == 0, rnd() % 2 == 0);
+            let mem = bus.jit_mem().unwrap();
+            let mut cpu = Cpu::new(0);
+            for r in 0..4 { cpu.regs[r] = rnd() % 6; }
+            (cpu.regs[8], cpu.regs[9], cpu.regs[2]) = (64 + 4 * (rnd() % 16), MMIO, rnd());
+            let mut e = Cpu::new(0);
+            e.regs = cpu.regs;
+            let mut reference = Memory { data: bus.data.clone(), flags: bus.flags.clone(), version: 0, mmio: 0, due_on_mmio: bus.due_on_mmio, due: false, irq: bus.irq };
+            // the careful path: the if (nothing in progress), then its then-part while one is
+            let (mut k, mut stop) = (1, false);
+            let (mut still, _) = e.exec_careful(&mut reference, block[0].fast, false, false, 2);
+            let mut at = 2;
+            if still && at != te {
+                for t in &then {
+                    let (s2, st) = e.exec_careful(&mut reference, t.fast, false, true, at + 2);
+                    (still, stop, k, at) = (s2, st, k + 1, at + 2);
+                    if stop || reference.next_tick_due() {
+                        break;
+                    }
+                }
+            }
+            for _ in 0..HOT { jit.entry::<Memory>(id, &block, &[], Some(&then), 0, &mem, true, false); }
+            let p = jit.entry::<Memory>(id, &block, &[], Some(&then), 0, &mem, true, false).unwrap();
+            id += 1;
+            assert_eq!(p.insns, 1 + then.len() as u32);
+            let (got, _, got_stop) = unsafe { run(p.code, &mut cpu, &mut bus, &mem, 0, 10, false) };
+            let what = format!("round {round}: {:?} then {:?}", block[0].fast, then.iter().map(|o| o.fast).collect::<Vec<_>>());
+            assert_eq!((got, cpu.pc, got_stop), (k, e.pc, stop), "{what}");
+            assert_eq!((cpu.regs, &cpu.pred_skips, &bus.data), (e.regs, &e.pred_skips, &reference.data), "{what}");
+            let _ = (te, ee, still);
+        }
     }
 
     #[test]
