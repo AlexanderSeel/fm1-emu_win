@@ -824,6 +824,42 @@ budget now ends), the same levels (peaks within 2 counts); speed geomean -1.3% J
 interpreted (noise). This also unblocks changes that move block boundaries (5.27's review: the
 polling-loop skip without its 4096 cap, untimed peripheral writes).
 
+## 5.29 The browser's audio schedule, its speed readout and its clock advice (2026-10-22)
+
+From 5.27's browser review and issue #21. Half the catalog hands out audio in 256- or 512-frame DMA
+half buffers, and `fm1_render` ran the machine only when the queue was short of a quantum's 128
+frames: every second or fourth quantum emulated 5.8 or 11.6 ms at once and the others nothing, so a
+device needed 2-4x real time not to drop out. `fm1_ahead` (fm1-web's `Pace`) makes each quantum
+also run its share of emulated time (the credit carried over, so the pace is the audio clock's)
+while the queue holds less than one half buffer beyond the quantum. Time that a short queue forced
+is not owed back, so the pace moves ahead of the half buffers until they come before they are
+needed. Half buffers no larger than a quantum (Felucca, the stock firmware) run as before. The same
+20k chunks run in the same order, so the audio is the same: all 98 packages byte for byte over the
+common length. Cost: input lands up to one half buffer later (X0X mean 7.3 ms, max 11.6; FM1GM max
+5.8 ms; Felucca and stock 0). In Node at 240 MHz, steady quanta over 2.9 ms: X0X 421 -> 21 (playing
+a pattern 420 -> 74), FM1GM 145 -> 2, FOMAJAM 836 -> 7, CS-1 840 -> 145, Tonitor 140 -> 4; all 98:
+14109 -> 3027, with the speed unchanged (geomean 2.32x). What remains on X0X and CS-1 is their own
+uneven work per emulated millisecond (X0X's slow quanta cost twice its mean), not the schedule.
+
+The worklet's budget was 20 ms of emulated time per quantum throughout. Now that holds while a
+firmware boots (Tonitor boots 3.8 s silent), and once audio plays it is 1.5 quanta (with the pace
+on), so a stalled firmware no longer holds the audio thread ~7 quanta' worth at a time.
+`?ahead=0` turns the pace off and keeps the 20 ms.
+
+The status line's "M instructions/s" was cpu0's run budget in 20k chunks. It is now the speed:
+emulated time per time spent emulating, as `bench.mjs` and `fm1-live --bench` print it. The copied
+report gives it per second, the idle-skipped share (`fm1_idle_ms`), the JIT's regions, failures and
+compile time, and a worst quantum that leaves out boot quanta. The warning's advice to lower the
+clock assumed the cost scales with it. The stock firmware idles 43/69/83% of the time at 60/120/240
+MHz, idle skipping removes that, and it runs at 2.62x real time at 60 MHz and 2.39x at 240. Felucca
+runs at 4.96x and 2.01x, X0X at 4.17x and 1.74x, CS-1 at 2.96x and 1.32x: about a quarter fixed
+cost plus the cycles run. The warning now estimates the load at a lower clock from the measured idle
+share. It offers a lower clock only where that brings the load down, and otherwise says why it
+would not help. It also says to close the developer tools (with a debugger attached the wasm runs
+3-4x slower). Left open: a work-based lead (running further ahead in cheap quanta) would absorb X0X's
+own spikes at the cost of more latency; moving the emulation to a Worker (P-core placement on
+hybrid CPUs) is 5.27's estimate, not tried.
+
 ## 6. Phase 5 — Boot & integration
 
 - Boot stock firmware to a stable idle/main-loop state.
