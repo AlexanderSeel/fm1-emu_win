@@ -74,7 +74,8 @@ pub struct Ctx {
     ver: u64,
     /// it left after a swapped pair with an interrupt pending: `run_fast` stops there too
     stop: u32,
-    _pad: u32,
+    /// inside a then-part or rep loop: a pair does not stop for an interrupt (`h_pair`)
+    inside: u32,
     code_version: Option<u64>,
 }
 const OFF_BRK: u32 = 24;
@@ -229,9 +230,24 @@ fn itab_slot(pc: u32) -> usize {
 #[derive(Clone, Copy)]
 enum Entry {
     Cold(u32),
-    /// function start, body (chain target), prefix length
-    Code(*const u8, *const u8, u32),
+    Code(Prefix),
     No,
+}
+
+/// A block's compiled prefix.
+#[derive(Clone, Copy)]
+pub(crate) struct Prefix {
+    /// the function Rust calls (`run`)
+    pub code: *const u8,
+    /// the chain target
+    body: *const u8,
+    /// instructions in it (a swapped pair is two)
+    pub insns: u32,
+    /// the pc after its last instruction
+    pub end: u32,
+    /// it may run inside a then-part or rep loop (`Cpu::prefix_inside`): no glued pair whose
+    /// head may use the bus (compiled code could leave between the two)
+    pub inside_ok: bool,
 }
 
 // SAFETY: the code cache and the compiled entries are owned by one Cpu and only used by the
@@ -257,12 +273,12 @@ impl Jit {
     /// `Cpu::swaps`, the pairs of its `Fast::Swap` ops. `table`: a body over RAM may go in the
     /// computed jumps' table (what `Cpu::jit_body_at` asks of a chain target: the bus counts
     /// code writes and compiled stores see the code flags).
-    pub(crate) fn entry<B: Bus>(&mut self, id: usize, ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], pc0: u32, mem: &JitMem, table: bool) -> Option<(*const u8, u32)> {
+    pub(crate) fn entry<B: Bus>(&mut self, id: usize, ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], pc0: u32, mem: &JitMem, table: bool) -> Option<Prefix> {
         if self.state.len() <= id {
             self.state.resize(id + 1, Entry::Cold(0));
         }
         match self.state[id] {
-            Entry::Code(p, _, n) => Some((p, n)),
+            Entry::Code(p) => Some(p),
             Entry::No => None,
             Entry::Cold(c) if c + 1 < HOT => {
                 self.state[id] = Entry::Cold(c + 1);
@@ -289,7 +305,14 @@ impl Jit {
                                 if table || (0x0200_0000..0x0400_0000).contains(&pc0) {
                                     self.itab[itab_slot(pc0)] = ITab { pc: pc0, _pad: 0, body: body as u64 };
                                 }
-                                Entry::Code(p, body, plen as u32)
+                                let ops = &ops[..plen];
+                                Entry::Code(Prefix {
+                                    code: p,
+                                    body,
+                                    insns: insns(ops),
+                                    end: pc0 + ops.iter().map(|o| o.len as u32).sum::<u32>(),
+                                    inside_ok: !ops.iter().any(|o| o.glue && !o.fast.reg_only()),
+                                })
                             }
                             None => Entry::No,
                         },
@@ -298,7 +321,7 @@ impl Jit {
                 };
                 self.state[id] = e;
                 match e {
-                    Entry::Code(p, _, n) => Some((p, n)),
+                    Entry::Code(p) => Some(p),
                     _ => None,
                 }
             }
@@ -308,7 +331,7 @@ impl Jit {
     /// The chain target of block `id`, if it is compiled.
     pub(crate) fn body(&self, id: usize) -> Option<*const u8> {
         match self.state.get(id) {
-            Some(Entry::Code(_, b, _)) => Some(*b),
+            Some(Entry::Code(p)) => Some(p.body),
             _ => None,
         }
     }
@@ -324,11 +347,12 @@ impl Jit {
 
 /// Run compiled code: returns the instructions executed, the chain slot of the exit taken (or
 /// null), and whether it stopped after a swapped pair with an interrupt pending (where
-/// `run_fast` stops too); cpu.pc is set.
+/// `run_fast` stops too); cpu.pc is set. `inside`: inside a then-part or rep loop (the careful
+/// path does not stop after a pair there, so neither does compiled code).
 ///
 /// # Safety
 /// `code` must come from `Jit::entry` for this bus type and the memory `mem` describes.
-pub(crate) unsafe fn run<B: Bus>(code: *const u8, cpu: &mut Cpu, bus: &mut B, mem: &JitMem, extra: u32, cap: u32) -> (u32, *mut u64, bool) {
+pub(crate) unsafe fn run<B: Bus>(code: *const u8, cpu: &mut Cpu, bus: &mut B, mem: &JitMem, extra: u32, cap: u32, inside: bool) -> (u32, *mut u64, bool) {
     // instructions this call may run: their ticks ((k - 1) + extra) must all fit tick_room
     let limit = (bus.tick_room() + 1).saturating_sub(extra as u64).min(1 << 30).min(cap as u64) as u32;
     let mut ctx = Ctx {
@@ -341,7 +365,7 @@ pub(crate) unsafe fn run<B: Bus>(code: *const u8, cpu: &mut Cpu, bus: &mut B, me
         slot: std::ptr::null_mut(),
         ver: bus.code_writes().unwrap_or(u64::MAX - 1),
         stop: 0,
-        _pad: 0,
+        inside: inside as u32,
         code_version: bus.code_writes(),
     };
     let f: CodeFn = unsafe { std::mem::transmute(code) };
@@ -466,6 +490,11 @@ fn h_pair<B: Bus>(ctx: *mut Ctx) -> u32 {
     // SAFETY: as h_read.
     let ctx = unsafe { &mut *ctx };
     let bus = unsafe { &mut *(ctx.bus as *mut B) };
+    if ctx.inside != 0 {
+        // (the construct goes on after the pair: interrupts wait)
+        ctx.irq = 0;
+        return ctx.brk;
+    }
     let p = bus.irq_pending();
     ctx.irq = p as u32;
     ctx.stop = p as u32;
@@ -1406,7 +1435,7 @@ mod tests {
     fn op(fast: Fast) -> BOp { BOp { fast, len: 2, careful: false, pair_head: false, glue: false } }
     fn hot(j: &mut Jit, id: usize, pc: u32, ops: &[BOp], mem: &JitMem) -> *const u8 {
         for _ in 0..HOT { j.entry::<Memory>(id, ops, &[], pc, mem, true); }
-        j.entry::<Memory>(id, ops, &[], pc, mem, true).unwrap().0
+        j.entry::<Memory>(id, ops, &[], pc, mem, true).unwrap().code
     }
     #[test]
     fn ram_chain_rejects_changed_target_and_respects_budget() {
@@ -1414,15 +1443,15 @@ mod tests {
         let mut cpu = Cpu::new(0); let mut j = Jit::new(false).unwrap();
         let from = hot(&mut j, 0, 0, &[op(Fast::Goto { target: 32 })], &mem);
         hot(&mut j, 1, 32, &[op(Fast::MovI { d: 0, v: 42 })], &mem);
-        let (_, slot, _) = unsafe { run(from, &mut cpu, &mut bus, &mem, 0, 10) };
+        let (_, slot, _) = unsafe { run(from, &mut cpu, &mut bus, &mem, 0, 10, false) };
         assert!(!slot.is_null());
         unsafe { *slot = j.body(1).unwrap() as u64; }
-        assert_eq!(unsafe { run(from, &mut cpu, &mut bus, &mem, 0, 1) }.0, 1);
+        assert_eq!(unsafe { run(from, &mut cpu, &mut bus, &mem, 0, 1, false) }.0, 1);
         assert_eq!(cpu.regs[0], 0);
-        assert_eq!(unsafe { run(from, &mut cpu, &mut bus, &mem, 0, 10) }.0, 2);
+        assert_eq!(unsafe { run(from, &mut cpu, &mut bus, &mem, 0, 10, false) }.0, 2);
         assert_eq!(cpu.regs[0], 42);
         bus.write8(32, 1); cpu.regs[0] = 0;
-        assert_eq!(unsafe { run(from, &mut cpu, &mut bus, &mem, 0, 10) }.0, 1);
+        assert_eq!(unsafe { run(from, &mut cpu, &mut bus, &mem, 0, 10, false) }.0, 1);
         assert_eq!(cpu.pc, 32); assert_eq!(cpu.regs[0], 0);
     }
     /// Returns and computed jumps go straight on into the compiled body of their target through
@@ -1442,34 +1471,34 @@ mod tests {
             // into the body at 32, which runs to its end (then exits there: nothing compiled at 36)
             bus.mmio = 32;
             let mut cpu = fresh(32);
-            assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10) }.0, 3, "{what}");
+            assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10, false) }.0, 3, "{what}");
             assert_eq!((cpu.regs[0], cpu.regs[1], cpu.pc), (42, 7, 36), "{what}");
             // the limit: the target's prefix does not fit, so back to Rust before it
             let mut cpu = fresh(32);
-            assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 2) }.0, 1, "{what}");
+            assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 2, false) }.0, 1, "{what}");
             assert_eq!((cpu.regs[0], cpu.pc), (0, 32), "{what}");
             // nothing compiled there (and an odd pc that maps to the same entry)
             for to in [64, 33, 32 + (2 << ITAB_BITS)] {
                 bus.mmio = to;
                 let mut cpu = fresh(to);
-                assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10) }.0, 1, "{what}");
+                assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10, false) }.0, 1, "{what}");
                 assert_eq!((cpu.regs[0], cpu.pc), (0, to), "{what}");
             }
         }
         // call R leaves its return address
         let mut cpu = fresh(32);
-        unsafe { run(callr, &mut cpu, &mut bus, &mem, 0, 10) };
+        unsafe { run(callr, &mut cpu, &mut bus, &mem, 0, 10, false) };
         assert_eq!(cpu.rets, 6);
         // a pop from a peripheral that makes the next tick due: leave at the target
         (bus.mmio, bus.due_on_mmio) = (32, true);
         let mut cpu = fresh(32);
-        assert_eq!(unsafe { run(pop, &mut cpu, &mut bus, &mem, 0, 10) }.0, 1);
+        assert_eq!(unsafe { run(pop, &mut cpu, &mut bus, &mem, 0, 10, false) }.0, 1);
         assert_eq!((cpu.regs[0], cpu.pc, cpu.sp), (0, 32, MMIO + 4));
         (bus.due, bus.due_on_mmio) = (false, false);
         // the target's code changed (a write the bus counts): its guard sends it back to Rust
         bus.write8(33, 0xff);
         let mut cpu = fresh(32);
-        assert_eq!(unsafe { run(rts, &mut cpu, &mut bus, &mem, 0, 10) }.0, 1);
+        assert_eq!(unsafe { run(rts, &mut cpu, &mut bus, &mem, 0, 10, false) }.0, 1);
         assert_eq!((cpu.regs[0], cpu.pc), (0, 32));
         // a reset forgets the table
         j.reset();
@@ -1549,12 +1578,12 @@ mod tests {
             // the pair alone: it fits a limit of 2, not 1
             let swap = BOp { fast: Fast::Swap { idx: 0 }, len: 4, careful: true, pair_head: true, glue: false };
             for _ in 0..HOT { jit.entry::<Memory>(id, &[swap], &[(head, tail, 2)], 0, &mem, true); }
-            let code = jit.entry::<Memory>(id, &[swap], &[(head, tail, 2)], 0, &mem, true).unwrap().0;
+            let code = jit.entry::<Memory>(id, &[swap], &[(head, tail, 2)], 0, &mem, true).unwrap().code;
             id += 1;
             let regs0 = cpu.regs;
-            assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 1) }.0, 0, "{head:?} {tail:?}");
+            assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 1, false) }.0, 0, "{head:?} {tail:?}");
             assert_eq!(cpu.regs, regs0);
-            assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 2) }.0, 2, "{head:?} {tail:?}");
+            assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 2, false) }.0, 2, "{head:?} {tail:?}");
             let regs = |c: &Cpu| c.regs.map(|r| format!("{r:08x}"));
             assert_eq!((regs(&cpu), cpu.pc), (regs(&e), pc), "{head:?} then {tail:?}");
             assert_eq!(bus.data, reference.data, "{head:?} then {tail:?}");
@@ -1578,28 +1607,28 @@ mod tests {
         let fresh = |r1: u32| { let mut c = Cpu::new(32); (c.regs[1], c.regs[2]) = (r1, 0x5a); c };
         // the first entry finds the snapshot current (a call), the count is kept
         let mut cpu = fresh(200);
-        assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10) }.0, 2);
+        assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10, false) }.0, 2);
         assert_eq!((cpu.regs[0], cpu.pc, bus.data[200]), (42, 36, 0x5a));
         assert_eq!(j.guards[0].ver, bus.version);
         // the snapshot changed behind the bus's back (no count): the inline compare enters
         // anyway (the bus counts every write that can reach code: that is what it relies on)
         bus.data[32] ^= 0xff;
         let mut cpu = fresh(200);
-        assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10) }.0, 2);
+        assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10, false) }.0, 2);
         bus.data[32] ^= 0xff;
         // a counted write elsewhere: h_ram_ok compares, finds it current, takes the new count
         bus.write8(100, 1);
         let mut cpu = fresh(200);
-        assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10) }.0, 2);
+        assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10, false) }.0, 2);
         assert_eq!(j.guards[0].ver, bus.version);
         // the body's store into its own code (a watched word: through the bus, which counts it):
         // it leaves right after, and the next entry finds the snapshot changed
         bus.flags[33 / 4] = 1;
         let mut cpu = fresh(33);
-        assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10) }.0, 2);
+        assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10, false) }.0, 2);
         assert_eq!((bus.data[33], cpu.pc), (0x5a, 36));
         let mut cpu = fresh(200);
-        assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10) }.0, 0);
+        assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10, false) }.0, 0);
         assert_eq!((cpu.regs[0], cpu.pc), (0, 32));
     }
 
@@ -1611,7 +1640,7 @@ mod tests {
         let code = hot(&mut j, 0, 0, &[
             op(Fast::St { s: 0, b: Base::Reg(1), off: 0, w: 4 }),
             op(Fast::MovI { d: 2, v: 99 })], &mem);
-        assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10) }.0, 1);
+        assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10, false) }.0, 1);
         assert_eq!(cpu.pc, 2); assert_eq!(cpu.regs[2], 0);
         assert_eq!(bus.read32(2), 123); assert_eq!(bus.version, 1);
     }
@@ -1637,7 +1666,7 @@ mod tests {
             expected.regs = cpu.regs; expected.sp = cpu.sp; expected.rets = cpu.rets;
             expected.pc = expected.exec_fast(&mut reference, fast, 2).unwrap_or(2);
             let code = hot(&mut j, id, 0, &[op(fast)], &mem);
-            assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 1) }.0, 1, "{fast:?}");
+            assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 1, false) }.0, 1, "{fast:?}");
             assert_eq!((cpu.regs, cpu.sp, cpu.rets, cpu.pc), (expected.regs, expected.sp, expected.rets, expected.pc), "{fast:?}");
             assert_eq!(bus.data, reference.data, "{fast:?}");
         }
@@ -1742,7 +1771,7 @@ mod tests {
                 (expected.ie, expected.sreg_store, expected.irq_levels) = (cpu.ie, cpu.sreg_store, cpu.irq_levels.clone());
                 expected.pc = expected.exec_fast(&mut reference, fast, 2).unwrap_or(2);
                 let code = hot(&mut jit, j * 24 + round, 0, &[op(fast)], &mem);
-                assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 1) }.0, 1, "{fast:?}");
+                assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 1, false) }.0, 1, "{fast:?}");
                 let regs = |c: &Cpu| c.regs.map(|r| format!("{r:08x}"));
                 assert_eq!((regs(&cpu), cpu.sp, cpu.rets, cpu.pc), (regs(&expected), expected.sp, expected.rets, expected.pc),
                     "case {j} round {round}: {fast:?}");

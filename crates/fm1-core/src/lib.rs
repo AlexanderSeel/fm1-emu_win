@@ -532,8 +532,12 @@ impl Cpu {
                 sync!();
                 return Ok((n, false));
             };
+            // inside a then-part or a rep loop, nothing else in progress: a compiled prefix that
+            // cannot reach the construct's end still runs (`prefix_inside`)
             #[cfg(native_jit)]
-            if self.jit_on && !careful {
+            let inside = careful && self.pair_pending.is_none() && self.hold_irq == 0 && ((self.rep_end != 0) != !self.pred_skips.is_empty());
+            #[cfg(native_jit)]
+            if self.jit_on && (!careful || inside) {
                 if let Some(mem) = jit_mem {
                     if self.jit.is_none() {
                         self.jit = jit::Jit::new(self.profile).map(Box::new);
@@ -545,12 +549,15 @@ impl Cpu {
                         }
                         None => None,
                     };
-                    if let Some((code, _)) = code {
+                    let code = code.filter(|p| !inside || (p.inside_ok && self.prefix_inside(pc, p.end)));
+                    if let Some(jit::Prefix { code, insns, .. }) = code {
                         // (the code checks itself that its ticks fall before anything is due)
                         let extra = if n == 0 { 0 } else { 1 };
                         sync!();
+                        // (inside a construct: this prefix and no further, so no chaining on)
+                        let cap = if inside { (budget - n).min(insns) } else { budget - n };
                         // SAFETY: code was compiled for this bus type and memory map
-                        let (k, slot, stop) = unsafe { jit::run(code, self, bus, &mem, extra, budget - n) };
+                        let (k, slot, stop) = unsafe { jit::run(code, self, bus, &mem, extra, cap, inside) };
                         if self.profile { self.jit_entries += 1; self.jit_insns += k as u64; }
                         if k > 0 {
                             n += k;
@@ -561,8 +568,6 @@ impl Cpu {
                                 self.insn_count += (n - synced) as u64;
                                 return Ok((n, false));
                             }
-                            // (it left between the two instructions of a glued pair)
-                            careful = self.hold_irq != 0;
                             if !slot.is_null() {
                                 // a chainable exit came back: link it once its target is compiled
                                 if let Some(body) = self.jit_body_at(pc, bus.code_writes().is_some() && !mem.ram_code.is_null()) {
@@ -570,6 +575,18 @@ impl Cpu {
                                     unsafe { *slot = body as u64 };
                                 }
                             }
+                            if inside && !self.pred_skips.is_empty() {
+                                // (the then-part's rule for where its last instruction went; after
+                                // the link: the slot goes to where the code left, not past a skip)
+                                pc = self.finish_inside();
+                                if self.pred_skips.is_empty() && bus.irq_pending() {
+                                    self.insn_count += (n - synced) as u64;
+                                    return Ok((n, false));
+                                }
+                            }
+                            // (it left between the two instructions of a glued pair; or inside a
+                            // then-part or rep loop)
+                            careful = self.hold_irq != 0 || self.rep_end != 0 || !self.pred_skips.is_empty();
                             continue;
                         }
                     }
@@ -670,6 +687,38 @@ impl Cpu {
                 }
             }
         }
+    }
+
+    /// May a compiled prefix from pc to `end` run inside the then-part or rep loop in progress,
+    /// as the careful path would run it? Only when no instruction of it but the last can end the
+    /// construct: the then-parts' ends (where the careful path skips the else part) lie at or
+    /// past its end, the rep loop's end does not lie in it or at its end (the careful path counts
+    /// down when execution falls there). Then every instruction before the last leaves the
+    /// construct as it was, and run_fast applies `finish`'s rule for the last. Pairs: the careful
+    /// path runs them with the head's registers held back (`pair_pending`) and does not stop
+    /// after one (the construct goes on); compiled code gives the same registers after the pair
+    /// and does not stop either (`jit::run`'s `inside`), but it could leave between a glued
+    /// pair's two instructions only with the head's registers written (`hold_irq`): so a glued
+    /// head must not use the bus, the only way out between the two (`jit::Prefix::inside_ok`).
+    #[cfg(native_jit)]
+    #[inline]
+    fn prefix_inside(&self, pc: u32, end: u32) -> bool {
+        !(self.rep_end > pc && self.rep_end <= end) && self.pred_skips.iter().all(|&(te, _)| te >= end)
+    }
+
+    /// After a compiled prefix inside a then-part (`prefix_inside`): `finish`'s skip rule for
+    /// where its last instruction went (none before it reached a then-part's end); the pc. The
+    /// careful path then stops if that ended the construct and an interrupt is pending.
+    #[cfg(native_jit)]
+    #[inline(never)]
+    fn finish_inside(&mut self) -> u32 {
+        let pc = self.pc;
+        if let Some(i) = self.pred_skips.iter().position(|&(te, _)| te == pc) {
+            self.pc = self.pred_skips.remove(i).1;
+        }
+        let pc = self.pc;
+        self.pred_skips.retain(|&(te, _)| pc <= te);
+        pc
     }
 
     /// An op `run_fast` cannot run plainly, packed: bits 0-1 the instructions run, then still
@@ -5038,98 +5087,180 @@ mod tests {
         assert!(bus.0.mem == sbus.0.mem);
     }
 
+    /// A test bus with a clock and an interrupt source: XIP code at 0x0200_0000, RAM at 0; a
+    /// write to `MMIO` and up raises the interrupt (odd value) or clears it (even), and makes the
+    /// next tick due when `due_on_mmio` (as the Soc's peripherals do; core 1's bus does not).
+    #[cfg(native_jit)]
+    const MMIO: u32 = 0x0100_0000;
+    #[cfg(native_jit)]
+    struct Clocked { ram: Vec<u8>, xip: Vec<u8>, cycles: u64, next_due: u64, irq: bool, due_on_mmio: bool, writes: u32 }
+    #[cfg(native_jit)]
+    impl Clocked {
+        fn r8(&mut self, a: u32) -> u8 {
+            match a {
+                0x0200_0000.. => *self.xip.get((a - 0x0200_0000) as usize).unwrap_or(&0),
+                MMIO.. => 0,
+                _ => *self.ram.get(a as usize).unwrap_or(&0),
+            }
+        }
+        fn w8(&mut self, a: u32, v: u8) {
+            match a {
+                0x0200_0000.. => {}
+                MMIO.. => {
+                    self.irq = v & 1 != 0;
+                    self.writes += 1;
+                    if self.due_on_mmio { self.next_due = 0; }
+                }
+                _ => if let Some(b) = self.ram.get_mut(a as usize) { *b = v },
+            }
+        }
+    }
+    #[cfg(native_jit)]
+    impl Bus for Clocked {
+        fn read8(&mut self, a: u32) -> u8 { self.r8(a) }
+        fn read16(&mut self, a: u32) -> u16 { u16::from_le_bytes([self.r8(a), self.r8(a + 1)]) }
+        fn read32(&mut self, a: u32) -> u32 { u32::from_le_bytes([self.r8(a), self.r8(a + 1), self.r8(a + 2), self.r8(a + 3)]) }
+        fn write8(&mut self, a: u32, v: u8) { self.w8(a, v) }
+        fn write16(&mut self, a: u32, v: u16) { for (i, b) in v.to_le_bytes().into_iter().enumerate() { self.w8(a + i as u32, b) } }
+        fn write32(&mut self, a: u32, v: u32) { for (i, b) in v.to_le_bytes().into_iter().enumerate() { self.w8(a + i as u32, b) } }
+        fn tick(&mut self) -> bool { self.cycles += 1; self.cycles >= self.next_due }
+        fn irq_pending(&self) -> bool { self.irq }
+        fn tick_room(&self) -> u64 { self.next_due.saturating_sub(self.cycles + 1) }
+        fn add_ticks(&mut self, n: u64) { self.cycles += n; }
+        fn next_tick_due(&self) -> bool { self.cycles + 1 >= self.next_due }
+        fn jit_mem(&mut self) -> Option<JitMem> {
+            Some(JitMem { ram: self.ram.as_mut_ptr(), ram_base: 0, ram_len: self.ram.len() as u32, ram_code: std::ptr::null(),
+                xip: self.xip.as_ptr(), xip_base: 0x0200_0000, xip_len: self.xip.len() as u32 })
+        }
+    }
+
+    /// Runs of a test program on `Clocked`, as cpu0's block loop runs one (the SoC serviced at a
+    /// due tick with a random next deadline, random budgets), JIT or interpreted. `before` may
+    /// change the CPU before a call (round, a random number). Per call: (instructions, due, pc,
+    /// cycles, r0, interrupt pending); then the instructions retired, RAM, peripheral writes,
+    /// instructions run compiled, and of those, the ones run inside a then-part or rep loop.
+    #[cfg(native_jit)]
+    #[allow(clippy::type_complexity)]
+    fn drive_clocked(xip: &[u8], jit: bool, (irq, r4, due_on_mmio): (bool, u32, bool), seed: u64, before: &dyn Fn(&mut Cpu, u32, u64))
+        -> (Vec<(u32, bool, u32, u64, u32, bool)>, u64, Vec<u8>, u32, u64, u64) {
+        let mut bus = Clocked { ram: vec![0; 0x1000], xip: xip.to_vec(), cycles: 0, next_due: 5, irq, due_on_mmio, writes: 0 };
+        let mut cpu = Cpu::new(0x0200_0000);
+        (cpu.jit_on, cpu.profile) = (jit, true);
+        cpu.regs[4] = r4;
+        let mut rng = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let mut rnd = move || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng };
+        let (mut trace, mut ticked, mut inside) = (vec![], false, 0);
+        for round in 0..3000u32 {
+            if ticked || bus.tick() {
+                // (the SoC serviced: the next deadline)
+                bus.next_due = bus.cycles + 1 + rnd() % 48;
+            }
+            before(&mut cpu, round, rnd());
+            let (was_inside, compiled) = (cpu.rep_end != 0 || !cpu.pred_skips.is_empty(), cpu.jit_insns);
+            let budget = 1 + (rnd() % 48) as u32;
+            let (k, due) = match cpu.run_fast(&mut bus, budget).unwrap() {
+                (0, _) => { cpu.step(&mut bus).unwrap(); (1, false) }
+                r => r,
+            };
+            if was_inside {
+                inside += cpu.jit_insns - compiled;
+            }
+            ticked = due;
+            trace.push((k, due, cpu.pc, bus.cycles, cpu.regs[0], bus.irq));
+        }
+        (trace, cpu.insn_count, bus.ram, bus.writes, cpu.jit_insns, inside)
+    }
+
+    /// The test program for `drive_clocked`: `00 d7` r0 = r0.b0 (u) #  paired with `c8 4b`
+    /// b[r4+11] = r0 (a swapped pair: the store sees the old r0), `80 07` r0 += 1, nops, `f7 97`
+    /// at 0x10, a goto back to the pair. `cut`: at 6 the pair `00 d7` r0 = r0.b0 (u) # `80 07`
+    /// r0 += 1, which neither glues nor swaps (careful: the compiled prefix before it ends at 6
+    /// without a jump).
+    #[cfg(native_jit)]
+    fn clocked_loop(cut: bool) -> Vec<u8> {
+        let mut xip = vec![0u8; 0x1000];
+        xip[..6].copy_from_slice(&[0x00, 0xd7, 0xc8, 0x4b, 0x80, 0x07]);
+        if cut {
+            xip[6..10].copy_from_slice(&[0x00, 0xd7, 0x80, 0x07]);
+        }
+        xip[0x10..0x12].copy_from_slice(&[0xf7, 0x97]);
+        xip
+    }
+
+    /// (irq pending from the start, the store's target: RAM or a peripheral, the peripheral
+    /// makes the next tick due)
+    #[cfg(native_jit)]
+    const CLOCKED_SETUPS: [(bool, u32, bool); 5] =
+        [(false, 0x100, false), (true, 0x100, false), (false, MMIO - 11, true), (false, MMIO - 11, false), (true, MMIO - 11, false)];
+
     /// A swappable pair compiled (native JIT) against the interpreter, through `run_fast` with a
     /// clock and interrupts: random budgets and tick deadlines, an interrupt pending all along,
-    /// or raised by the pair's own store to a peripheral (which makes the next tick due, as the
-    /// Soc does, or not, as core 1's bus does). Every call must stop at the same instruction,
-    /// with the same result, and leave the same state.
+    /// or raised and cleared by the pair's own store to a peripheral (which makes the next tick
+    /// due, as the Soc does, or not, as core 1's bus does). Every call must stop at the same
+    /// instruction, with the same result, and leave the same state.
     #[cfg(native_jit)]
     #[test]
     fn compiled_swapped_pairs_stop_where_the_interpreter_does() {
-        const MMIO: u32 = 0x0100_0000;
-        struct Clocked { ram: Vec<u8>, xip: Vec<u8>, cycles: u64, next_due: u64, irq: bool, due_on_mmio: bool, writes: u32 }
-        impl Clocked {
-            fn r8(&mut self, a: u32) -> u8 {
-                match a {
-                    0x0200_0000.. => *self.xip.get((a - 0x0200_0000) as usize).unwrap_or(&0),
-                    MMIO.. => 0,
-                    _ => *self.ram.get(a as usize).unwrap_or(&0),
-                }
-            }
-            fn w8(&mut self, a: u32, v: u8) {
-                match a {
-                    0x0200_0000.. => {}
-                    MMIO.. => {
-                        // a peripheral: raises (or clears) the interrupt, maybe due at once
-                        self.irq = v & 1 != 0;
-                        self.writes += 1;
-                        if self.due_on_mmio { self.next_due = 0; }
-                    }
-                    _ => if let Some(b) = self.ram.get_mut(a as usize) { *b = v },
-                }
-            }
-        }
-        impl Bus for Clocked {
-            fn read8(&mut self, a: u32) -> u8 { self.r8(a) }
-            fn read16(&mut self, a: u32) -> u16 { u16::from_le_bytes([self.r8(a), self.r8(a + 1)]) }
-            fn read32(&mut self, a: u32) -> u32 { u32::from_le_bytes([self.r8(a), self.r8(a + 1), self.r8(a + 2), self.r8(a + 3)]) }
-            fn write8(&mut self, a: u32, v: u8) { self.w8(a, v) }
-            fn write16(&mut self, a: u32, v: u16) { for (i, b) in v.to_le_bytes().into_iter().enumerate() { self.w8(a + i as u32, b) } }
-            fn write32(&mut self, a: u32, v: u32) { for (i, b) in v.to_le_bytes().into_iter().enumerate() { self.w8(a + i as u32, b) } }
-            fn tick(&mut self) -> bool { self.cycles += 1; self.cycles >= self.next_due }
-            fn irq_pending(&self) -> bool { self.irq }
-            fn tick_room(&self) -> u64 { self.next_due.saturating_sub(self.cycles + 1) }
-            fn add_ticks(&mut self, n: u64) { self.cycles += n; }
-            fn next_tick_due(&self) -> bool { self.cycles + 1 >= self.next_due }
-            fn jit_mem(&mut self) -> Option<JitMem> {
-                Some(JitMem { ram: self.ram.as_mut_ptr(), ram_base: 0, ram_len: self.ram.len() as u32, ram_code: std::ptr::null(),
-                    xip: self.xip.as_ptr(), xip_base: 0x0200_0000, xip_len: self.xip.len() as u32 })
-            }
-        }
-        // `00 d7` r0 = r0.b0 (u) #  paired with `c8 4b` b[r4+11] = r0, `80 07` r0 += 1, five
-        // nops, `f7 97` goto back to the pair
-        let mut xip = vec![0u8; 0x1000];
-        xip[..6].copy_from_slice(&[0x00, 0xd7, 0xc8, 0x4b, 0x80, 0x07]);
-        xip[0x10..0x12].copy_from_slice(&[0xf7, 0x97]);
-        // (irq pending from the start, the store's target: RAM or a peripheral, the peripheral
-        // makes the next tick due)
-        for (irq, r4, due_on_mmio) in [(false, 0x100, false), (true, 0x100, false), (false, MMIO - 11, true), (false, MMIO - 11, false), (true, MMIO - 11, false)] {
+        let xip = clocked_loop(false);
+        // (the pair's store raises the interrupt with an odd r0, clears it with an even one:
+        // each time round the loop, or as the rounds go)
+        let before = |cpu: &mut Cpu, round: u32, _: u64| if cpu.pair_pending.is_none() && round % 7 == 0 { cpu.regs[0] = round & 0x3ff };
+        for setup in CLOCKED_SETUPS {
             for seed in 1..=4u64 {
-                let run = |jit: bool| {
-                    let mut bus = Clocked { ram: vec![0; 0x1000], xip: xip.clone(), cycles: 0, next_due: 5, irq, due_on_mmio, writes: 0 };
-                    let mut cpu = Cpu::new(0x0200_0000);
-                    (cpu.jit_on, cpu.profile) = (jit, true);
-                    cpu.regs[4] = r4;
-                    let mut rng = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
-                    let mut rnd = move || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng };
-                    let (mut trace, mut ticked) = (vec![], false);
-                    for round in 0..3000u32 {
-                        if ticked || bus.tick() {
-                            // (the SoC serviced: the next deadline)
-                            bus.next_due = bus.cycles + 1 + rnd() % 24;
-                        }
-                        // (the pair's store raises the interrupt with an odd r0, clears it with
-                        // an even one: each time round the loop, or as the rounds go)
-                        if cpu.pair_pending.is_none() && round % 7 == 0 {
-                            cpu.regs[0] = round & 0x3ff;
-                        }
-                        let budget = 1 + (rnd() % 24) as u32;
-                        let (k, due) = match cpu.run_fast(&mut bus, budget).unwrap() {
-                            (0, _) => { cpu.step(&mut bus).unwrap(); (1, false) }
-                            r => r,
-                        };
-                        ticked = due;
-                        trace.push((k, due, cpu.pc, bus.cycles, cpu.regs[0], bus.irq));
-                    }
-                    (trace, cpu.insn_count, bus.ram, bus.writes, cpu.jit_insns)
-                };
-                let (want, got) = (run(false), run(true));
+                let (want, got) = (drive_clocked(&xip, false, setup, seed, &before), drive_clocked(&xip, true, setup, seed, &before));
                 assert!(got.4 > 1000, "compiled code ran {} instructions", got.4);
                 for (i, (w, g)) in want.0.iter().zip(&got.0).enumerate() {
-                    assert_eq!(w, g, "call {i} (irq {irq}, r4 {r4:#x}, due_on_mmio {due_on_mmio}, seed {seed})");
+                    assert_eq!(w, g, "call {i} ({setup:?}, seed {seed})");
                 }
                 assert_eq!((want.1, &want.2, want.3), (got.1, &got.2, got.3));
             }
+        }
+    }
+
+    /// Compiled prefixes inside a then-part or a rep loop (`Cpu::prefix_inside`) against the
+    /// interpreter's careful path, through `run_fast` as above: from time to time, with nothing in
+    /// progress, the test opens an if-else block's then-part (its end anywhere in the loop or
+    /// past it, the skip to anywhere) or a rep loop (its end anywhere in the loop, 1-4 rounds)
+    /// as the instructions that start them would (and gives up one that never ends now and then). The construct's end (skip, count down, stop
+    /// for a pending interrupt), the pair in it, ticks and budgets: the same calls, the same state.
+    #[cfg(native_jit)]
+    #[test]
+    fn compiled_prefixes_inside_constructs_match_the_careful_path() {
+        let xip = clocked_loop(true);
+        let before = |cpu: &mut Cpu, round: u32, x: u64| {
+            if cpu.pair_pending.is_none() && round % 7 == 0 {
+                cpu.regs[0] = round & 0x3ff;
+            }
+            if cpu.pair_pending.is_some() || cpu.hold_irq != 0 || x % 3 != 0 {
+                return;
+            }
+            if cpu.rep_end != 0 || !cpu.pred_skips.is_empty() {
+                // (one that never ends, its end past the loop or behind the goto: given up now
+                // and then)
+                if x % 64 == 0 {
+                    (cpu.rep_end, cpu.pred_skips) = (0, vec![]);
+                }
+                return;
+            }
+            // (anywhere in the loop or just past it, often where the first prefix ends)
+            let at = |k: u64| 0x0200_0000 + if k % 4 == 0 { 6 } else { 2 * (k % 10) as u32 };
+            if x % 2 == 0 {
+                cpu.pred_skips.push((at(x >> 8), at(x >> 16)));
+            } else if at(x >> 8) != cpu.pc {
+                (cpu.rep_start, cpu.rep_end, cpu.rep_reg, cpu.rep_count) = (cpu.pc, at(x >> 8), None, 1 + (x >> 24) as u32 % 4);
+            }
+        };
+        for setup in CLOCKED_SETUPS {
+            let mut inside = 0;
+            for seed in 1..=6u64 {
+                let (want, got) = (drive_clocked(&xip, false, setup, seed, &before), drive_clocked(&xip, true, setup, seed, &before));
+                inside += got.5;
+                for (i, (w, g)) in want.0.iter().zip(&got.0).enumerate() {
+                    assert_eq!(w, g, "call {i} ({setup:?}, seed {seed})");
+                }
+                assert_eq!((want.1, &want.2, want.3), (got.1, &got.2, got.3));
+            }
+            assert!(inside > 5000, "compiled code ran {inside} instructions inside ({setup:?})");
         }
     }
 }
@@ -5314,17 +5445,21 @@ impl Fast {
     /// them. The pair rule holds the head's registers back until the tail has run; the
     /// tail first, then the head, is that. (`regs_rw` must be exact for the tail's writes.)
     fn swappable_with(&self, tail: Fast) -> bool {
-        let reg_only = matches!(self, Fast::Mov { .. } | Fast::MovI { .. } | Fast::Alu3 { .. } | Fast::Alu3I { .. }
-            | Fast::Alu2 { .. } | Fast::Alu2I { .. } | Fast::A4 { .. } | Fast::AddRI { .. } | Fast::ShlI { .. }
-            | Fast::SarI { .. } | Fast::Ext { .. } | Fast::BitExt { .. } | Fast::BitIns { .. } | Fast::Mov2 { .. }
-            | Fast::Mov2I { .. } | Fast::Un { .. } | Fast::MinMax { .. });
-        match (reg_only, self.regs_rw(), tail.regs_rw()) {
+        match (self.reg_only(), self.regs_rw(), tail.regs_rw()) {
             (true, Some((hr, hw)), Some((_, tw))) => {
                 (hr | hw) & tw == 0 && !(self.sets_flags() && tail.sets_flags()) && !self.reads_flags() && !tail.reads_flags()
                     && !matches!(tail, Fast::IfBlk { .. } | Fast::Swap { .. })
             }
             _ => false,
         }
+    }
+
+    /// Does this op work on registers only (no bus, sp, rets, special register or jump)?
+    fn reg_only(&self) -> bool {
+        matches!(self, Fast::Mov { .. } | Fast::MovI { .. } | Fast::Alu3 { .. } | Fast::Alu3I { .. }
+            | Fast::Alu2 { .. } | Fast::Alu2I { .. } | Fast::A4 { .. } | Fast::AddRI { .. } | Fast::ShlI { .. }
+            | Fast::SarI { .. } | Fast::Ext { .. } | Fast::BitExt { .. } | Fast::BitIns { .. } | Fast::Mov2 { .. }
+            | Fast::Mov2I { .. } | Fast::Un { .. } | Fast::MinMax { .. })
     }
 
     /// Does this op set the arithmetic flags? (`alu_f`'s add / subtract, `AddRI`; no other
