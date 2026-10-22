@@ -541,7 +541,7 @@ impl Cpu {
                     let code = match self.jit.as_mut() {
                         Some(j) => {
                             let table = bus.code_writes().is_some() && !mem.ram_code.is_null();
-                            j.entry::<B>(id, &self.bops[start as usize..(start + len) as usize], pc, &mem, table)
+                            j.entry::<B>(id, &self.bops[start as usize..(start + len) as usize], &self.swaps, pc, &mem, table)
                         }
                         None => None,
                     };
@@ -550,11 +550,17 @@ impl Cpu {
                         let extra = if n == 0 { 0 } else { 1 };
                         sync!();
                         // SAFETY: code was compiled for this bus type and memory map
-                        let (k, slot) = unsafe { jit::run(code, self, bus, &mem, extra, budget - n) };
+                        let (k, slot, stop) = unsafe { jit::run(code, self, bus, &mem, extra, budget - n) };
                         if self.profile { self.jit_entries += 1; self.jit_insns += k as u64; }
                         if k > 0 {
                             n += k;
                             pc = self.pc;
+                            if stop {
+                                // a swapped pair ended with an interrupt pending (`exec_careful_op`)
+                                self.pc = pc;
+                                self.insn_count += (n - synced) as u64;
+                                return Ok((n, false));
+                            }
                             // (it left between the two instructions of a glued pair)
                             careful = self.hold_irq != 0;
                             if !slot.is_null() {
@@ -5030,6 +5036,101 @@ mod tests {
         assert_eq!(cpu.run_fast(&mut bus, 3).unwrap(), (3, false));
         assert_eq!((cpu.regs, cpu.pc, cpu.insn_count), (stepped.regs, stepped.pc, stepped.insn_count));
         assert!(bus.0.mem == sbus.0.mem);
+    }
+
+    /// A swappable pair compiled (native JIT) against the interpreter, through `run_fast` with a
+    /// clock and interrupts: random budgets and tick deadlines, an interrupt pending all along,
+    /// or raised by the pair's own store to a peripheral (which makes the next tick due, as the
+    /// Soc does, or not, as core 1's bus does). Every call must stop at the same instruction,
+    /// with the same result, and leave the same state.
+    #[cfg(native_jit)]
+    #[test]
+    fn compiled_swapped_pairs_stop_where_the_interpreter_does() {
+        const MMIO: u32 = 0x0100_0000;
+        struct Clocked { ram: Vec<u8>, xip: Vec<u8>, cycles: u64, next_due: u64, irq: bool, due_on_mmio: bool, writes: u32 }
+        impl Clocked {
+            fn r8(&mut self, a: u32) -> u8 {
+                match a {
+                    0x0200_0000.. => *self.xip.get((a - 0x0200_0000) as usize).unwrap_or(&0),
+                    MMIO.. => 0,
+                    _ => *self.ram.get(a as usize).unwrap_or(&0),
+                }
+            }
+            fn w8(&mut self, a: u32, v: u8) {
+                match a {
+                    0x0200_0000.. => {}
+                    MMIO.. => {
+                        // a peripheral: raises (or clears) the interrupt, maybe due at once
+                        self.irq = v & 1 != 0;
+                        self.writes += 1;
+                        if self.due_on_mmio { self.next_due = 0; }
+                    }
+                    _ => if let Some(b) = self.ram.get_mut(a as usize) { *b = v },
+                }
+            }
+        }
+        impl Bus for Clocked {
+            fn read8(&mut self, a: u32) -> u8 { self.r8(a) }
+            fn read16(&mut self, a: u32) -> u16 { u16::from_le_bytes([self.r8(a), self.r8(a + 1)]) }
+            fn read32(&mut self, a: u32) -> u32 { u32::from_le_bytes([self.r8(a), self.r8(a + 1), self.r8(a + 2), self.r8(a + 3)]) }
+            fn write8(&mut self, a: u32, v: u8) { self.w8(a, v) }
+            fn write16(&mut self, a: u32, v: u16) { for (i, b) in v.to_le_bytes().into_iter().enumerate() { self.w8(a + i as u32, b) } }
+            fn write32(&mut self, a: u32, v: u32) { for (i, b) in v.to_le_bytes().into_iter().enumerate() { self.w8(a + i as u32, b) } }
+            fn tick(&mut self) -> bool { self.cycles += 1; self.cycles >= self.next_due }
+            fn irq_pending(&self) -> bool { self.irq }
+            fn tick_room(&self) -> u64 { self.next_due.saturating_sub(self.cycles + 1) }
+            fn add_ticks(&mut self, n: u64) { self.cycles += n; }
+            fn next_tick_due(&self) -> bool { self.cycles + 1 >= self.next_due }
+            fn jit_mem(&mut self) -> Option<JitMem> {
+                Some(JitMem { ram: self.ram.as_mut_ptr(), ram_base: 0, ram_len: self.ram.len() as u32, ram_code: std::ptr::null(),
+                    xip: self.xip.as_ptr(), xip_base: 0x0200_0000, xip_len: self.xip.len() as u32 })
+            }
+        }
+        // `00 d7` r0 = r0.b0 (u) #  paired with `c8 4b` b[r4+11] = r0, `80 07` r0 += 1, five
+        // nops, `f7 97` goto back to the pair
+        let mut xip = vec![0u8; 0x1000];
+        xip[..6].copy_from_slice(&[0x00, 0xd7, 0xc8, 0x4b, 0x80, 0x07]);
+        xip[0x10..0x12].copy_from_slice(&[0xf7, 0x97]);
+        // (irq pending from the start, the store's target: RAM or a peripheral, the peripheral
+        // makes the next tick due)
+        for (irq, r4, due_on_mmio) in [(false, 0x100, false), (true, 0x100, false), (false, MMIO - 11, true), (false, MMIO - 11, false), (true, MMIO - 11, false)] {
+            for seed in 1..=4u64 {
+                let run = |jit: bool| {
+                    let mut bus = Clocked { ram: vec![0; 0x1000], xip: xip.clone(), cycles: 0, next_due: 5, irq, due_on_mmio, writes: 0 };
+                    let mut cpu = Cpu::new(0x0200_0000);
+                    (cpu.jit_on, cpu.profile) = (jit, true);
+                    cpu.regs[4] = r4;
+                    let mut rng = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+                    let mut rnd = move || { rng ^= rng << 13; rng ^= rng >> 7; rng ^= rng << 17; rng };
+                    let (mut trace, mut ticked) = (vec![], false);
+                    for round in 0..3000u32 {
+                        if ticked || bus.tick() {
+                            // (the SoC serviced: the next deadline)
+                            bus.next_due = bus.cycles + 1 + rnd() % 24;
+                        }
+                        // (the pair's store raises the interrupt with an odd r0, clears it with
+                        // an even one: each time round the loop, or as the rounds go)
+                        if cpu.pair_pending.is_none() && round % 7 == 0 {
+                            cpu.regs[0] = round & 0x3ff;
+                        }
+                        let budget = 1 + (rnd() % 24) as u32;
+                        let (k, due) = match cpu.run_fast(&mut bus, budget).unwrap() {
+                            (0, _) => { cpu.step(&mut bus).unwrap(); (1, false) }
+                            r => r,
+                        };
+                        ticked = due;
+                        trace.push((k, due, cpu.pc, bus.cycles, cpu.regs[0], bus.irq));
+                    }
+                    (trace, cpu.insn_count, bus.ram, bus.writes, cpu.jit_insns)
+                };
+                let (want, got) = (run(false), run(true));
+                assert!(got.4 > 1000, "compiled code ran {} instructions", got.4);
+                for (i, (w, g)) in want.0.iter().zip(&got.0).enumerate() {
+                    assert_eq!(w, g, "call {i} (irq {irq}, r4 {r4:#x}, due_on_mmio {due_on_mmio}, seed {seed})");
+                }
+                assert_eq!((want.1, &want.2, want.3), (got.1, &got.2, got.3));
+            }
+        }
     }
 }
 

@@ -14,7 +14,7 @@
 //! host (the interpreter); conversions to integers saturate as Rust's `as` does (cvttss2si alone
 //! gives 0x8000_0000 for NaN and out of range); min / max through the interpreter's executor.
 
-use super::{h_ram_ok, h_read, h_write, off_hold, off_pc, off_reg, off_rets, off_sp, op_helper, JitMem, RamGuard, ITAB_BITS, OFF_BRK, OFF_SLOT};
+use super::{h_pair, h_ram_ok, h_read, h_write, insns, off_hold, off_pc, off_reg, off_rets, off_sp, op_helper, JitMem, RamGuard, ITAB_BITS, OFF_BRK, OFF_SLOT};
 use crate::jit_x64::{m, mx, Alu, Asm, Cc, Fop, Label, Mem, Reg, Sh, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP, R10, R11, R12, R13, R14, R15, R8, R9};
 use crate::{Base, Bus, Cond, Fast, Op, RmwOp};
 
@@ -36,6 +36,7 @@ struct Gen<'a> {
     exit: Label,
     h_read: u64,
     h_write: u64,
+    h_pair: u64,
     /// `Jit::itab`'s address
     itab: u64,
 }
@@ -337,6 +338,21 @@ impl Gen<'_> {
         if hold {
             self.a.st_imm(m(CPU, off_hold() as i32), 1);
         }
+        self.exit_imm(next_pc, count);
+        self.a.bind(go);
+    }
+    /// After a swapped pair: leave if the next tick is due (or a code word was written), or an
+    /// interrupt is pending (then `run_fast` stops: `Ctx::stop`). Nothing to call while neither
+    /// brk is set nor `Ctx::irq` (none pending, known since the last helper).
+    fn check_pair(&mut self, next_pc: u32, count: u32) {
+        let go = self.a.label();
+        self.a.ld64(R11, m(CTX, OFF_BRK as i32)); // brk | irq << 32
+        self.a.test_rr64(R11, R11);
+        self.a.jcc(Cc::E, go);
+        self.a.mov_rr64(RDI, CTX);
+        self.call(self.h_pair);
+        self.a.test_rr(RAX, RAX);
+        self.a.jcc(Cc::E, go);
         self.exit_imm(next_pc, count);
         self.a.bind(go);
     }
@@ -808,7 +824,7 @@ fn emit_op<B: Bus>(g: &mut Gen, fast: Fast, idx: u32, next_pc: u32, profile: boo
 }
 
 /// Native code for a block prefix of plain micro-ops (none careful), and its body's offset.
-pub(super) fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<Box<RamGuard>>, profile: bool, itab: u64) -> Option<(Vec<u8>, usize)> {
+pub(super) fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], pc0: u32, mem: &JitMem, guards: &mut Vec<Box<RamGuard>>, profile: bool, itab: u64) -> Option<(Vec<u8>, usize)> {
     let mut a = Asm::new();
     let exit = a.label();
     let mut g = Gen {
@@ -817,6 +833,7 @@ pub(super) fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards
         exit,
         h_read: h_read::<B> as *const () as u64,
         h_write: h_write::<B> as *const () as u64,
+        h_pair: h_pair::<B> as *const () as u64,
         itab,
     };
     // prologue (entry from Rust: rdi cpu, rsi ctx, rdx ram, rcx xip, r8d limit, r9 code flags);
@@ -837,7 +854,7 @@ pub(super) fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards
     // the whole prefix must fit the call's limit, else back to Rust before running any of it
     {
         let fits = g.a.label();
-        g.a.lea(R11, m(DONE, ops.len() as i32));
+        g.a.lea(R11, m(DONE, insns(ops) as i32));
         g.a.cmp_rm(R11, m(RSP, LIMIT));
         g.a.jcc(Cc::Be, fits);
         g.exit_imm(pc0, 0);
@@ -863,22 +880,38 @@ pub(super) fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards
     }
 
     let mut pc = pc0;
-    for (i, op) in ops.iter().enumerate() {
+    // instructions so far (a swapped pair is two)
+    let mut ins = 0u32;
+    for op in ops {
         let next_pc = pc + op.len as u32;
-        let bus_used = emit_op::<B>(&mut g, op.fast, i as u32, next_pc, profile);
+        if let Fast::Swap { idx: s } = op.fast {
+            // a dual-issue pair run second instruction first (the pair rule's result, as
+            // `exec_careful_op` runs it whole): the second with both ticks taken, then the head
+            // (registers only); then leave if the next tick is due or an interrupt is pending,
+            // as the careful path stops after a pair
+            let (head, tail, hlen) = swaps[s as usize];
+            let mid = pc + hlen as u32;
+            emit_op::<B>(&mut g, tail, ins + 1, next_pc, profile);
+            emit_op::<B>(&mut g, head, ins, mid, profile);
+            g.check_pair(next_pc, ins + 2);
+            ins += 2;
+            pc = next_pc;
+            continue;
+        }
+        let bus_used = emit_op::<B>(&mut g, op.fast, ins, next_pc, profile);
         if bus_used && !op.fast.may_jump() {
             // leaving between a glued pair's two instructions: interrupts wait for the second
-            g.check_brk(next_pc, i as u32 + 1, op.glue);
+            g.check_brk(next_pc, ins + 1, op.glue);
         }
+        ins += 1;
         pc = next_pc;
         if op.fast.may_jump() {
             break; // (the block's last op)
         }
     }
     // fell off the end of the prefix
-    let n = ops.len() as u32;
     if !ops.last().map_or(false, |o| o.fast.may_jump()) {
-        g.chain(pc, n);
+        g.chain(pc, ins);
     }
     g.a.bind(exit);
     g.a.alu_ri64(Alu::Add, RSP, FRAME as i8);

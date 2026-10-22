@@ -62,14 +62,21 @@ pub struct Ctx {
     synced: u32,
     /// the next tick is due: leave after this instruction
     brk: u32,
-    _pad: u32,
+    /// `Bus::irq_pending` as last seen: 0 no, 1 yes, 2 not known (at entry, and after any
+    /// helper: only the bus changes it). A swapped pair stops after itself while one is pending,
+    /// as the careful path does after a pair (`h_pair`). (After brk: one 64-bit load sees both.)
+    irq: u32,
     /// the chain slot of the exit taken back to Rust (null: not a chainable exit)
     slot: *mut u64,
+    /// it left after a swapped pair with an interrupt pending: `run_fast` stops there too
+    stop: u32,
+    _pad: u32,
     code_version: Option<u64>,
 }
 const OFF_BRK: u32 = 24;
 const OFF_SLOT: u32 = 32;
 const _: () = assert!(std::mem::offset_of!(Ctx, brk) == OFF_BRK as usize);
+const _: () = assert!(std::mem::offset_of!(Ctx, irq) == OFF_BRK as usize + 4);
 const _: () = assert!(std::mem::offset_of!(Ctx, slot) == OFF_SLOT as usize);
 
 // ------------------------------------------------------------------ executable memory
@@ -240,10 +247,11 @@ impl Jit {
         Some(Jit { cache: CodeCache::new(64 << 20)?, state: Vec::new(), guards: Vec::new(), profile, itab })
     }
 
-    /// The compiled code of block `id` (prefix length), compiling it once it is hot. `table`:
-    /// a body over RAM may go in the computed jumps' table (what `Cpu::jit_body_at` asks of a
-    /// chain target: the bus counts code writes and compiled stores see the code flags).
-    pub(crate) fn entry<B: Bus>(&mut self, id: usize, ops: &[crate::BOp], pc0: u32, mem: &JitMem, table: bool) -> Option<(*const u8, u32)> {
+    /// The compiled code of block `id` (prefix length), compiling it once it is hot. `swaps`:
+    /// `Cpu::swaps`, the pairs of its `Fast::Swap` ops. `table`: a body over RAM may go in the
+    /// computed jumps' table (what `Cpu::jit_body_at` asks of a chain target: the bus counts
+    /// code writes and compiled stores see the code flags).
+    pub(crate) fn entry<B: Bus>(&mut self, id: usize, ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], pc0: u32, mem: &JitMem, table: bool) -> Option<(*const u8, u32)> {
         if self.state.len() <= id {
             self.state.resize(id + 1, Entry::Cold(0));
         }
@@ -255,12 +263,19 @@ impl Jit {
                 None
             }
             Entry::Cold(_) => {
-                let plen = ops.iter().take_while(|o| !o.careful).count();
+                // the plain prefix; a swapped pair joins it unless its second instruction jumps
+                let plen = ops
+                    .iter()
+                    .take_while(|o| match o.fast {
+                        Fast::Swap { idx } => !swaps[idx as usize].1.may_jump(),
+                        _ => !o.careful,
+                    })
+                    .count();
                 let e = if plen == 0 {
                     Entry::No
                 } else {
                     let itab = self.itab.as_ptr() as u64;
-                    match compile::<B>(&ops[..plen], pc0, mem, &mut self.guards, self.profile, itab) {
+                    match compile::<B>(&ops[..plen], swaps, pc0, mem, &mut self.guards, self.profile, itab) {
                         Some((code, body)) => match self.cache.write(&code) {
                             Some(p) => {
                                 // SAFETY: body is a byte offset inside the code just written
@@ -301,14 +316,27 @@ impl Jit {
     }
 }
 
-/// Run compiled code: returns the instructions executed; cpu.pc is set.
+/// Run compiled code: returns the instructions executed, the chain slot of the exit taken (or
+/// null), and whether it stopped after a swapped pair with an interrupt pending (where
+/// `run_fast` stops too); cpu.pc is set.
 ///
 /// # Safety
 /// `code` must come from `Jit::entry` for this bus type and the memory `mem` describes.
-pub(crate) unsafe fn run<B: Bus>(code: *const u8, cpu: &mut Cpu, bus: &mut B, mem: &JitMem, extra: u32, cap: u32) -> (u32, *mut u64) {
+pub(crate) unsafe fn run<B: Bus>(code: *const u8, cpu: &mut Cpu, bus: &mut B, mem: &JitMem, extra: u32, cap: u32) -> (u32, *mut u64, bool) {
     // instructions this call may run: their ticks ((k - 1) + extra) must all fit tick_room
     let limit = (bus.tick_room() + 1).saturating_sub(extra as u64).min(1 << 30).min(cap as u64) as u32;
-    let mut ctx = Ctx { cpu: cpu as *mut Cpu, bus: bus as *mut B as *mut (), extra, synced: 0, brk: 0, _pad: 0, slot: std::ptr::null_mut(), code_version: bus.code_writes() };
+    let mut ctx = Ctx {
+        cpu: cpu as *mut Cpu,
+        bus: bus as *mut B as *mut (),
+        extra,
+        synced: 0,
+        brk: 0,
+        irq: 2,
+        slot: std::ptr::null_mut(),
+        stop: 0,
+        _pad: 0,
+        code_version: bus.code_writes(),
+    };
     let f: CodeFn = unsafe { std::mem::transmute(code) };
     let k = f(cpu as *mut Cpu, &mut ctx, mem.ram, mem.xip, limit, mem.ram_code);
     if k > 0 {
@@ -318,7 +346,7 @@ pub(crate) unsafe fn run<B: Bus>(code: *const u8, cpu: &mut Cpu, bus: &mut B, me
             bus.add_ticks((need - ctx.synced) as u64);
         }
     }
-    (k, ctx.slot)
+    (k, ctx.slot, ctx.stop != 0)
 }
 
 // ------------------------------------------------------------------ helpers called from generated code
@@ -361,6 +389,7 @@ fn h_read<B: Bus>(ctx: *mut Ctx, addr: u32, idx: u32, w: u32) -> u32 {
     if bus.next_tick_due() || bus.code_writes() != ctx.code_version {
         ctx.brk = 1;
     }
+    ctx.irq = 2;
     v
 }
 }
@@ -379,6 +408,7 @@ fn h_write<B: Bus>(ctx: *mut Ctx, addr: u32, v: u32, idx: u32, w: u32) {
     if bus.next_tick_due() || bus.code_writes() != ctx.code_version {
         ctx.brk = 1;
     }
+    ctx.irq = 2;
 }
 }
 
@@ -399,6 +429,7 @@ fn h_op<B: Bus, const PROF: bool>(ctx: *mut Ctx, op: *const Fast, idx: u32, next
     if bus.next_tick_due() || bus.code_writes() != ctx.code_version {
         ctx.brk = 1;
     }
+    ctx.irq = 2;
     match j {
         Some(t) => (1u64 << 32) | t as u64,
         None => 0,
@@ -419,6 +450,25 @@ fn h_op_quiet<const PROF: bool>(ctx: *mut Ctx, op: *const Fast, _idx: u32, _next
     cpu.exec_quiet(unsafe { *op });
     0
 }
+}
+
+code_abi! {
+/// After a swapped pair whose brk or `Ctx::irq` is set: leave (1) if the next tick is due (or
+/// code was written) or an interrupt is pending; the latter also stops `run_fast` there.
+fn h_pair<B: Bus>(ctx: *mut Ctx) -> u32 {
+    // SAFETY: as h_read.
+    let ctx = unsafe { &mut *ctx };
+    let bus = unsafe { &mut *(ctx.bus as *mut B) };
+    let p = bus.irq_pending();
+    ctx.irq = p as u32;
+    ctx.stop = p as u32;
+    (ctx.brk != 0 || p) as u32
+}
+}
+
+/// Instructions in a compiled prefix (a swapped pair is two).
+fn insns(ops: &[crate::BOp]) -> u32 {
+    ops.iter().map(|o| if matches!(o.fast, Fast::Swap { .. }) { 2 } else { 1 }).sum()
 }
 
 /// The helper compiled code calls for an op it has no code of its own for: `h_op`, or for a
@@ -484,6 +534,7 @@ struct Gen<'a> {
     exit: Label,
     h_read: u64,
     h_write: u64,
+    h_pair: u64,
     /// `Jit::itab`'s address
     itab: u64,
 }
@@ -742,6 +793,19 @@ impl Gen<'_> {
         let go = self.a.label();
         self.a.ldr(9, CTX, OFF_BRK);
         self.a.cbz(9, go);
+        self.exit_imm(next_pc, count);
+        self.a.bind(go);
+    }
+    /// After a swapped pair: leave if the next tick is due (or a code word was written), or an
+    /// interrupt is pending (then `run_fast` stops: `Ctx::stop`). Nothing to call while neither
+    /// brk is set nor `Ctx::irq` (none pending, known since the last helper).
+    fn check_pair(&mut self, next_pc: u32, count: u32) {
+        let go = self.a.label();
+        self.a.ldr_x(9, CTX, OFF_BRK); // brk | irq << 32
+        self.a.cbz_x(9, go);
+        self.a.mov_x(0, CTX);
+        self.call(self.h_pair);
+        self.a.cbz(0, go);
         self.exit_imm(next_pc, count);
         self.a.bind(go);
     }
@@ -1172,7 +1236,7 @@ fn emit_op<B: Bus>(g: &mut Gen, fast: Fast, idx: u32, next_pc: u32, profile: boo
 
 /// Native code for a block prefix of plain micro-ops (none careful), and its body's offset.
 #[cfg(target_arch = "aarch64")]
-fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<Box<RamGuard>>, profile: bool, itab: u64) -> Option<(Vec<u8>, usize)> {
+fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], pc0: u32, mem: &JitMem, guards: &mut Vec<Box<RamGuard>>, profile: bool, itab: u64) -> Option<(Vec<u8>, usize)> {
     for o in [off_reg(15), off_sp(), off_rets(), off_pc(), off_hold()] {
         if o >= 16384 {
             return None;
@@ -1186,6 +1250,7 @@ fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<
         exit,
         h_read: h_read::<B> as *const () as u64,
         h_write: h_write::<B> as *const () as u64,
+        h_pair: h_pair::<B> as *const () as u64,
         itab,
     };
     // prologue (entry from Rust); chained blocks enter at the body
@@ -1206,7 +1271,7 @@ fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<
     // the whole prefix must fit the call's limit, else back to Rust before running any of it
     {
         let fits = g.a.label();
-        g.a.add_imm(9, DONE, ops.len() as u32);
+        g.a.add_imm(9, DONE, insns(ops));
         g.a.cmp(9, LIMIT);
         g.a.b_cond(AC::Ls, fits);
         g.exit_imm(pc0, 0);
@@ -1231,26 +1296,42 @@ fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<
     }
 
     let mut pc = pc0;
-    for (i, op) in ops.iter().enumerate() {
+    // instructions so far (a swapped pair is two)
+    let mut ins = 0u32;
+    for op in ops {
         let next_pc = pc + op.len as u32;
-        let bus_used = emit_op::<B>(&mut g, op.fast, i as u32, next_pc, profile);
+        if let Fast::Swap { idx: s } = op.fast {
+            // a dual-issue pair run second instruction first (the pair rule's result, as
+            // `exec_careful_op` runs it whole): the second with both ticks taken, then the head
+            // (registers only); then leave if the next tick is due or an interrupt is pending,
+            // as the careful path stops after a pair
+            let (head, tail, hlen) = swaps[s as usize];
+            let mid = pc + hlen as u32;
+            emit_op::<B>(&mut g, tail, ins + 1, next_pc, profile);
+            emit_op::<B>(&mut g, head, ins, mid, profile);
+            g.check_pair(next_pc, ins + 2);
+            ins += 2;
+            pc = next_pc;
+            continue;
+        }
+        let bus_used = emit_op::<B>(&mut g, op.fast, ins, next_pc, profile);
         if bus_used && !op.fast.may_jump() {
             if op.glue {
                 // leaving between a glued pair's two instructions: interrupts wait for the second
-                g.check_brk_hold(next_pc, i as u32 + 1);
+                g.check_brk_hold(next_pc, ins + 1);
             } else {
-                g.check_brk(next_pc, i as u32 + 1);
+                g.check_brk(next_pc, ins + 1);
             }
         }
+        ins += 1;
         pc = next_pc;
         if op.fast.may_jump() {
             break; // (the block's last op)
         }
     }
     // fell off the end of the prefix
-    let n = ops.len() as u32;
     if !ops.last().map_or(false, |o| o.fast.may_jump()) {
-        g.chain(pc, n);
+        g.chain(pc, ins);
     }
     g.a.bind(exit);
     g.a.ldp(LIMIT, 28, SP, 80);
@@ -1299,8 +1380,8 @@ mod tests {
     }
     fn op(fast: Fast) -> BOp { BOp { fast, len: 2, careful: false, pair_head: false, glue: false } }
     fn hot(j: &mut Jit, id: usize, pc: u32, ops: &[BOp], mem: &JitMem) -> *const u8 {
-        for _ in 0..HOT { j.entry::<Memory>(id, ops, pc, mem, true); }
-        j.entry::<Memory>(id, ops, pc, mem, true).unwrap().0
+        for _ in 0..HOT { j.entry::<Memory>(id, ops, &[], pc, mem, true); }
+        j.entry::<Memory>(id, ops, &[], pc, mem, true).unwrap().0
     }
     #[test]
     fn ram_chain_rejects_changed_target_and_respects_budget() {
@@ -1308,7 +1389,7 @@ mod tests {
         let mut cpu = Cpu::new(0); let mut j = Jit::new(false).unwrap();
         let from = hot(&mut j, 0, 0, &[op(Fast::Goto { target: 32 })], &mem);
         hot(&mut j, 1, 32, &[op(Fast::MovI { d: 0, v: 42 })], &mem);
-        let (_, slot) = unsafe { run(from, &mut cpu, &mut bus, &mem, 0, 10) };
+        let (_, slot, _) = unsafe { run(from, &mut cpu, &mut bus, &mem, 0, 10) };
         assert!(!slot.is_null());
         unsafe { *slot = j.body(1).unwrap() as u64; }
         assert_eq!(unsafe { run(from, &mut cpu, &mut bus, &mem, 0, 1) }.0, 1);
@@ -1368,6 +1449,91 @@ mod tests {
         // a reset forgets the table
         j.reset();
         assert!(j.itab.iter().all(|e| e.pc == u32::MAX));
+    }
+
+    /// A swapped pair (`Fast::Swap`) compiled: its second instruction, then the head. Random
+    /// register-only heads and random second instructions (no jumps: those end the prefix before
+    /// the pair) that `swappable_with` takes must leave what the pair rule (`exec_fast_paired`,
+    /// as `step` runs a pair) leaves: registers, sp, rets, pc, memory; and the two count as two
+    /// instructions (the limit, the count returned).
+    #[test]
+    fn compiled_swapped_pairs_match_the_pair_rule() {
+        use crate::{Op, RmwOp};
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed as u32 };
+        let ops = [Op::Add, Op::Sub, Op::RSub, Op::Or, Op::Xor, Op::And, Op::AndNot, Op::Mul, Op::Shl, Op::Shr, Op::Sar];
+        let mut jit = Jit::new(false).unwrap();
+        let (mut id, mut n) = (0, 0);
+        while n < 3000 {
+            let (x, y) = (rnd(), rnd());
+            // registers 0..7 for data, 8..11 hold addresses in the test RAM (as below)
+            let mut rr = { let mut z = rnd(); move || { z = z.rotate_right(3); (z % 8) as u8 } };
+            let op = ops[x as usize / 32 % ops.len()];
+            let head = match x % 17 {
+                0 => Fast::Mov { d: rr(), s: rr() },
+                1 => Fast::MovI { d: rr(), v: x },
+                2 => Fast::Alu3 { d: rr(), a: rr(), b: rr(), op },
+                3 => Fast::Alu3I { d: rr(), a: rr(), v: x >> 7, op },
+                4 => Fast::Alu2 { d: rr(), b: rr(), op },
+                5 => Fast::Alu2I { d: rr(), v: x >> 9, op },
+                6 => Fast::A4 { d: rr(), s: rr(), op, rk: (x >> 5) as u8 % 3, rv: if (x >> 5) % 3 == 1 { x >> 3 } else { rr() as u32 } },
+                7 => Fast::AddRI { d: rr(), s: rr(), v: x >> 4 },
+                8 => Fast::ShlI { d: rr(), s: rr(), n: (x >> 8) as u8 % 32 },
+                9 => Fast::SarI { d: rr(), s: rr(), n: (x >> 8) as u8 % 32 },
+                10 => Fast::Ext { d: rr(), s: rr(), part: (x >> 8) as u8 % 3, signed: x & 0x100 != 0 },
+                11 => Fast::BitExt { d: rr(), s: rr(), p: (x >> 8) as u8 % 32, l: (x >> 16) as u8 % 32, signed: x & 0x80 != 0 },
+                12 => Fast::BitIns { d: rr(), s: rr(), p: (x >> 8) as u8 % 32, l: (x >> 16) as u8 % 32 },
+                13 => Fast::Mov2 { dh: rr(), dl: rr(), sh: rr(), sl: rr() },
+                14 => Fast::Mov2I { dh: rr(), dl: rr(), v: x },
+                15 => Fast::Un { d: rr(), s: rr(), k: (x >> 8) as u8 % 7 },
+                _ => Fast::MinMax { d: rr(), a: rr(), b: rr(), kind: (x >> 8) as u8 % 4 },
+            };
+            let w = [1u8, 2, 4][y as usize % 3];
+            let b = 8 + (y >> 4) as u8 % 3;
+            let tail = match y % 13 {
+                0 => Fast::Ld { d: rr(), b: Base::Reg(b), off: (y >> 8) % 4, w, signed: y & 0x80 != 0 },
+                1 => Fast::St { s: rr(), b: Base::Reg(b), off: (y >> 8) % 4, w },
+                2 => Fast::LdPost { d: rr(), b, w, signed: y & 0x80 != 0, inc: 4 },
+                3 => Fast::StPost { s: rr(), b, w, inc: 0xffff_fffc },
+                4 => Fast::LdIdx { d: rr(), b, i: 11, sh: (y >> 8) as u8 % 3, w, signed: y & 0x80 != 0 },
+                5 => Fast::StIdx { s: rr(), b, i: 11, sh: (y >> 8) as u8 % 3, w },
+                6 => Fast::Rmw { b, w, op: RmwOp::Xor, off: 1, v: y },
+                7 => Fast::MemA4 { b: 8, off: 4, op: Op::Add, rk: 0, rv: rr() as u32 },
+                8 => Fast::LdW { d: rr(), b: 8, off: 4 },
+                9 => Fast::StW { s: rr(), b: 8, off: 4 },
+                10 => Fast::Alu3 { d: rr(), a: rr(), b: rr(), op },
+                11 => Fast::Mov { d: rr(), s: rr() },
+                _ => Fast::MovI { d: rr(), v: y },
+            };
+            if !head.swappable_with(tail) {
+                continue;
+            }
+            n += 1;
+            let mut bus = Memory::new(); let mut reference = Memory::new();
+            for i in 32..256 { let v = rnd() as u8; bus.data[i] = v; reference.data[i] = v; }
+            bus.flags.iter_mut().for_each(|f| *f = 0);
+            let mem = bus.jit_mem().unwrap();
+            let mut cpu = Cpu::new(0);
+            for r in 0..8 { cpu.regs[r] = if rnd() % 3 == 0 { rnd() % 40 } else { rnd() }; }
+            cpu.regs[8] = 64 + (rnd() % 32) * 4; cpu.regs[9] = 65 + (rnd() % 32) * 2; cpu.regs[10] = 129 + rnd() % 64;
+            cpu.regs[11] = rnd() % 16;
+            let mut e = Cpu::new(0);
+            e.regs = cpu.regs;
+            let _ = e.exec_fast_paired(&mut reference, head, true, 2);
+            let pc = e.exec_fast_paired(&mut reference, tail, false, 4).unwrap_or(4);
+            // the pair alone: it fits a limit of 2, not 1
+            let swap = BOp { fast: Fast::Swap { idx: 0 }, len: 4, careful: true, pair_head: true, glue: false };
+            for _ in 0..HOT { jit.entry::<Memory>(id, &[swap], &[(head, tail, 2)], 0, &mem, true); }
+            let code = jit.entry::<Memory>(id, &[swap], &[(head, tail, 2)], 0, &mem, true).unwrap().0;
+            id += 1;
+            let regs0 = cpu.regs;
+            assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 1) }.0, 0, "{head:?} {tail:?}");
+            assert_eq!(cpu.regs, regs0);
+            assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 2) }.0, 2, "{head:?} {tail:?}");
+            let regs = |c: &Cpu| c.regs.map(|r| format!("{r:08x}"));
+            assert_eq!((regs(&cpu), cpu.pc), (regs(&e), pc), "{head:?} then {tail:?}");
+            assert_eq!(bus.data, reference.data, "{head:?} then {tail:?}");
+        }
     }
 
     #[test]
