@@ -14,8 +14,8 @@
 //! host (the interpreter); conversions to integers saturate as Rust's `as` does (cvttss2si alone
 //! gives 0x8000_0000 for NaN and out of range); min / max through the interpreter's executor.
 
-use super::{h_ram_ok, h_read, h_write, off_hold, off_pc, off_reg, off_rets, off_sp, op_helper, JitMem, RamGuard, OFF_BRK, OFF_SLOT};
-use crate::jit_x64::{m, mx, Alu, Asm, Cc, Fop, Label, Reg, Sh, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP, R10, R11, R12, R13, R14, R15, R8, R9};
+use super::{h_ram_ok, h_read, h_write, off_hold, off_pc, off_reg, off_rets, off_sp, op_helper, JitMem, RamGuard, ITAB_BITS, OFF_BRK, OFF_SLOT};
+use crate::jit_x64::{m, mx, Alu, Asm, Cc, Fop, Label, Mem, Reg, Sh, RAX, RBP, RBX, RCX, RDI, RDX, RSI, RSP, R10, R11, R12, R13, R14, R15, R8, R9};
 use crate::{Base, Bus, Cond, Fast, Op, RmwOp};
 
 const CPU: Reg = RBX;
@@ -36,6 +36,8 @@ struct Gen<'a> {
     exit: Label,
     h_read: u64,
     h_write: u64,
+    /// `Jit::itab`'s address
+    itab: u64,
 }
 
 fn icond(c: Cond) -> Cc {
@@ -124,10 +126,34 @@ impl Gen<'_> {
         self.a.st_imm(m(CPU, off_pc() as i32), pc);
         self.leave(count);
     }
-    /// Leave with pc = reg.
-    fn exit_reg(&mut self, reg: Reg, count: u32) {
-        self.a.st(m(CPU, off_pc() as i32), reg);
-        self.leave(count);
+    /// Continue at pc = eax, a computed target: straight into its compiled body when the table
+    /// holds one for that pc, else back to Rust.
+    fn ind(&mut self, count: u32) {
+        self.ind_brk(count, false);
+    }
+    /// `ind` after an instruction that may have used the bus (`brk`): first leave if the next
+    /// tick is due (or a code word was written), as `check_brk` does.
+    fn ind_brk(&mut self, count: u32, brk: bool) {
+        let back = self.a.label();
+        self.add_imm(DONE, count);
+        if brk {
+            self.a.cmp_m_i8(m(CTX, OFF_BRK as i32), 0);
+            self.a.jcc(Cc::Ne, back);
+        }
+        // the entry's byte offset: ((pc >> 1) & mask) * 16
+        self.a.mov_rr(RCX, RAX);
+        self.a.sh_i(Sh::Shr, RCX, 1);
+        self.a.alu_ri(Alu::And, RCX, (1 << ITAB_BITS) - 1);
+        self.a.sh_i(Sh::Shl, RCX, 4);
+        self.a.mov_ri64(R10, self.itab);
+        self.a.cmp_rm(RAX, mx(R10, RCX));
+        self.a.jcc(Cc::Ne, back);
+        self.a.ld64(R11, Mem { base: R10, index: Some((RCX, 1)), disp: 8 });
+        self.a.jmp_r(R11);
+        self.a.bind(back);
+        self.a.st(m(CPU, off_pc() as i32), RAX);
+        self.a.mov_rr(RAX, DONE);
+        self.a.jmp(self.exit);
     }
     /// Continue at a fixed pc: straight into its compiled body when the slot holds one,
     /// else back to Rust, which fills the slot once that block is compiled.
@@ -317,7 +343,7 @@ impl Gen<'_> {
 }
 
 /// Native code for a block prefix of plain micro-ops (none careful), and its body's offset.
-pub(super) fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<Box<RamGuard>>, profile: bool) -> Option<(Vec<u8>, usize)> {
+pub(super) fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<Box<RamGuard>>, profile: bool, itab: u64) -> Option<(Vec<u8>, usize)> {
     let mut a = Asm::new();
     let exit = a.label();
     let mut g = Gen {
@@ -326,6 +352,7 @@ pub(super) fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards
         exit,
         h_read: h_read::<B> as *const () as u64,
         h_write: h_write::<B> as *const () as u64,
+        itab,
     };
     // prologue (entry from Rust: rdi cpu, rsi ctx, rdx ram, rcx xip, r8d limit, r9 code flags);
     // chained blocks enter at the body. Six pushes and the frame keep rsp 16-byte aligned for
@@ -553,7 +580,16 @@ pub(super) fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards
             }
             Fast::Rts => {
                 g.a.ld(RAX, m(CPU, off_rets() as i32));
-                g.exit_reg(RAX, count);
+                g.ind(count);
+            }
+            Fast::CallR { r } => {
+                g.a.st_imm(m(CPU, off_rets() as i32), next_pc);
+                g.ld_reg(RAX, r);
+                g.ind(count);
+            }
+            Fast::GotoR { r } => {
+                g.ld_reg(RAX, r);
+                g.ind(count);
             }
             // ---- memory
             Fast::Ld { d, b, off, w, signed } => {
@@ -767,7 +803,7 @@ pub(super) fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards
                 g.ld_sp(RDX);
                 g.a.alu_ri(Alu::Add, RDX, 4);
                 g.st_sp(RDX);
-                g.exit_reg(RAX, count);
+                g.ind_brk(count, true);
             }
             Fast::PopRets => {
                 g.ld_sp(RAX);
@@ -784,7 +820,7 @@ pub(super) fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards
                 g.load(if half { 2 } else { 1 }, false, idx);
                 g.a.sh_i(Sh::Shl, RAX, 1);
                 g.add_imm(RAX, next_pc);
-                g.exit_reg(RAX, count);
+                g.ind_brk(count, true);
             }
             Fast::PushRet => {
                 g.ld_sp(RAX);
@@ -800,7 +836,7 @@ pub(super) fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards
                 g.ld_sp(RDX);
                 g.a.alu_ri(Alu::Add, RDX, 4);
                 g.st_sp(RDX);
-                g.exit_reg(RAX, count);
+                g.ind_brk(count, true);
             }
             // ---- everything else: the interpreter's executor for this one op
             other => {
@@ -813,11 +849,13 @@ pub(super) fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards
                 let fall = g.a.label();
                 g.a.bt64(RAX, 32); // bit 32: jumped (target in eax)
                 g.a.jcc(Cc::Ae, fall);
-                g.exit_reg(RAX, count);
+                g.ind_brk(count, true);
                 g.a.bind(fall);
                 bus_used = true;
                 if other.may_jump() {
-                    // a branch through the interpreter (the float compares) that fell through
+                    // a jump through the interpreter (`pop` with pc in its mask) that fell
+                    // through: leave first if the next tick is due, as after any bus access
+                    g.check_brk(next_pc, count, false);
                     g.chain(next_pc, count);
                 }
             }

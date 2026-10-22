@@ -11,9 +11,11 @@
 //!
 //! Blocks chain: an exit to a fixed pc jumps through a slot straight into the next block's
 //! compiled body once that block is compiled (Rust fills the slot the first time the exit
-//! returns there). Every body first checks that its instructions still fit the call's tick
-//! limit, so the chain never runs past a due tick; the helpers sync the clock with the running
-//! instruction count, so timing stays exact across the chain.
+//! returns there). An exit to a computed pc (a return, `call R` / `goto R`, a table jump, a pop
+//! into pc) looks the pc up in a direct-mapped table of compiled bodies (`Jit::itab`) and jumps
+//! there when it is found. Every body first checks that its instructions still fit the call's
+//! tick limit, so the chain never runs past a due tick; the helpers sync the clock with the
+//! running instruction count, so timing stays exact across the chain.
 //!
 //! AArch64 register plan (AAPCS64 callee-saved, so helpers may be called freely):
 //!   x19 = &Cpu, x20 = &Ctx, x21 = RAM host base, x22 = XIP host base,
@@ -188,6 +190,27 @@ pub struct Jit {
     guards: Vec<Box<RamGuard>>,
     /// compile helper calls that count themselves (`Cpu::profile` when the JIT was made)
     profile: bool,
+    /// computed jumps' targets: pc -> compiled body, direct-mapped by pc (`Gen::ind`); a body
+    /// is entered from it as from a chain slot (it checks the limit and its RAM snapshot)
+    itab: Box<[ITab]>,
+}
+
+/// An `itab` entry (generated code reads it: pc at 0, body at 8).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ITab {
+    pc: u32,
+    _pad: u32,
+    body: u64,
+}
+const ITAB_BITS: u32 = 14;
+/// (no instruction starts at an odd pc that is all ones)
+const ITAB_EMPTY: ITab = ITab { pc: u32::MAX, _pad: 0, body: 0 };
+const _: () = assert!(std::mem::size_of::<ITab>() == 16);
+
+/// The `itab` entry of pc (generated code computes the same: `Gen::ind`).
+fn itab_slot(pc: u32) -> usize {
+    ((pc >> 1) & ((1 << ITAB_BITS) - 1)) as usize
 }
 
 #[derive(Clone, Copy)]
@@ -213,11 +236,14 @@ const HOT: u32 = 32;
 
 impl Jit {
     pub fn new(profile: bool) -> Option<Jit> {
-        Some(Jit { cache: CodeCache::new(64 << 20)?, state: Vec::new(), guards: Vec::new(), profile })
+        let itab = vec![ITAB_EMPTY; 1 << ITAB_BITS].into_boxed_slice();
+        Some(Jit { cache: CodeCache::new(64 << 20)?, state: Vec::new(), guards: Vec::new(), profile, itab })
     }
 
-    /// The compiled code of block `id` (prefix length), compiling it once it is hot.
-    pub(crate) fn entry<B: Bus>(&mut self, id: usize, ops: &[crate::BOp], pc0: u32, mem: &JitMem) -> Option<(*const u8, u32)> {
+    /// The compiled code of block `id` (prefix length), compiling it once it is hot. `table`:
+    /// a body over RAM may go in the computed jumps' table (what `Cpu::jit_body_at` asks of a
+    /// chain target: the bus counts code writes and compiled stores see the code flags).
+    pub(crate) fn entry<B: Bus>(&mut self, id: usize, ops: &[crate::BOp], pc0: u32, mem: &JitMem, table: bool) -> Option<(*const u8, u32)> {
         if self.state.len() <= id {
             self.state.resize(id + 1, Entry::Cold(0));
         }
@@ -233,10 +259,17 @@ impl Jit {
                 let e = if plen == 0 {
                     Entry::No
                 } else {
-                    match compile::<B>(&ops[..plen], pc0, mem, &mut self.guards, self.profile) {
+                    let itab = self.itab.as_ptr() as u64;
+                    match compile::<B>(&ops[..plen], pc0, mem, &mut self.guards, self.profile, itab) {
                         Some((code, body)) => match self.cache.write(&code) {
-                            // SAFETY: body is a byte offset inside the code just written
-                            Some(p) => Entry::Code(p, unsafe { p.add(body) }, plen as u32),
+                            Some(p) => {
+                                // SAFETY: body is a byte offset inside the code just written
+                                let body = unsafe { p.add(body) };
+                                if table || (0x0200_0000..0x0400_0000).contains(&pc0) {
+                                    self.itab[itab_slot(pc0)] = ITab { pc: pc0, _pad: 0, body: body as u64 };
+                                }
+                                Entry::Code(p, body, plen as u32)
+                            }
                             None => Entry::No,
                         },
                         None => Entry::No,
@@ -264,6 +297,7 @@ impl Jit {
         self.state.clear();
         self.cache.used = 0;
         self.guards.clear();
+        self.itab.fill(ITAB_EMPTY);
     }
 }
 
@@ -450,6 +484,8 @@ struct Gen<'a> {
     exit: Label,
     h_read: u64,
     h_write: u64,
+    /// `Jit::itab`'s address
+    itab: u64,
 }
 
 fn off_reg(r: u8) -> u32 {
@@ -568,12 +604,6 @@ impl Gen<'_> {
         self.a.add_imm(0, DONE, count);
         self.a.b(self.exit);
     }
-    /// Leave with pc = w(reg).
-    fn exit_reg(&mut self, reg: Reg, count: u32) {
-        self.a.str(reg, CPU, off_pc());
-        self.a.add_imm(0, DONE, count);
-        self.a.b(self.exit);
-    }
     /// Continue at a fixed pc: straight into its compiled body when the slot holds one,
     /// else back to Rust, which fills the slot once that block is compiled.
     fn chain(&mut self, pc: u32, count: u32) {
@@ -588,6 +618,34 @@ impl Gen<'_> {
         self.a.mov32(9, pc);
         self.a.str(9, CPU, off_pc());
         self.a.str_x(10, CTX, OFF_SLOT);
+        self.a.mov(0, DONE);
+        self.a.b(self.exit);
+    }
+    /// Continue at pc = w(reg), a computed target: straight into its compiled body when the
+    /// table holds one for that pc, else back to Rust.
+    fn ind(&mut self, reg: Reg, count: u32) {
+        self.ind_brk(reg, count, false);
+    }
+    /// `ind` after an instruction that may have used the bus (`brk`): first leave if the next
+    /// tick is due (or a code word was written), as `check_brk` does.
+    fn ind_brk(&mut self, reg: Reg, count: u32, brk: bool) {
+        let back = self.a.label();
+        self.a.mov(12, reg);
+        self.a.add_imm(DONE, DONE, count);
+        if brk {
+            self.a.ldr(9, CTX, OFF_BRK);
+            self.a.cbnz(9, back);
+        }
+        self.a.ubfx(10, 12, 1, ITAB_BITS);
+        self.a.mov64(11, self.itab);
+        self.a.add_x_lsl(11, 11, 10, 4);
+        self.a.ldr(13, 11, 0);
+        self.a.cmp(13, 12);
+        self.a.b_cond(AC::Ne, back);
+        self.a.ldr_x(9, 11, 8);
+        self.a.br(9);
+        self.a.bind(back);
+        self.a.str(12, CPU, off_pc());
         self.a.mov(0, DONE);
         self.a.b(self.exit);
     }
@@ -691,7 +749,7 @@ impl Gen<'_> {
 
 /// Native code for a block prefix of plain micro-ops (none careful), and its body's offset.
 #[cfg(target_arch = "aarch64")]
-fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<Box<RamGuard>>, profile: bool) -> Option<(Vec<u8>, usize)> {
+fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<Box<RamGuard>>, profile: bool, itab: u64) -> Option<(Vec<u8>, usize)> {
     for o in [off_reg(15), off_sp(), off_rets(), off_pc(), off_hold()] {
         if o >= 16384 {
             return None;
@@ -705,6 +763,7 @@ fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<
         exit,
         h_read: h_read::<B> as *const () as u64,
         h_write: h_write::<B> as *const () as u64,
+        itab,
     };
     // prologue (entry from Rust); chained blocks enter at the body
     g.a.stp_pre(29, 30, SP, -FRAME);
@@ -930,7 +989,17 @@ fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<
             }
             Fast::Rts => {
                 g.a.ldr(9, CPU, off_rets());
-                g.exit_reg(9, count);
+                g.ind(9, count);
+            }
+            Fast::CallR { r } => {
+                g.a.mov32(0, next_pc);
+                g.a.str(0, CPU, off_rets());
+                g.ld_reg(9, r);
+                g.ind(9, count);
+            }
+            Fast::GotoR { r } => {
+                g.ld_reg(9, r);
+                g.ind(9, count);
             }
             // ---- memory
             Fast::Ld { d, b, off, w, signed } => {
@@ -1107,7 +1176,7 @@ fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<
                 }
                 g.a.ldr(0, CPU, off_sp()); g.load(4, false, idx); g.a.mov(KEEP, 0);
                 g.a.ldr(0, CPU, off_sp()); g.a.add_imm(0, 0, 4); g.a.str(0, CPU, off_sp());
-                g.exit_reg(KEEP, count);
+                g.ind_brk(KEEP, count, true);
             }
             Fast::PopRets => {
                 g.a.ldr(0, CPU, off_sp()); g.load(4, false, idx); g.a.str(0, CPU, off_rets());
@@ -1118,7 +1187,7 @@ fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<
                 g.ld_reg(0, r); g.add_imm(0, 0, next_pc);
                 g.load(if half { 2 } else { 1 }, false, idx);
                 g.a.lsl_imm(0, 0, 1); g.add_imm(0, 0, next_pc);
-                g.exit_reg(0, count);
+                g.ind_brk(0, count, true);
             }
             Fast::PushRet => {
                 g.a.ldr(0, CPU, off_sp());
@@ -1135,7 +1204,7 @@ fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<
                 g.a.ldr(0, CPU, off_sp());
                 g.a.add_imm(0, 0, 4);
                 g.a.str(0, CPU, off_sp());
-                g.exit_reg(KEEP, count);
+                g.ind_brk(KEEP, count, true);
             }
             // ---- everything else: the interpreter's executor for this one op
             other => {
@@ -1147,11 +1216,13 @@ fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<
                 g.call(op_helper::<B>(&other, profile));
                 let fall = g.a.label();
                 g.a.tbz(0, 32, fall); // bit 32: jumped (x0)
-                g.exit_reg(0, count);
+                g.ind_brk(0, count, true);
                 g.a.bind(fall);
                 bus_used = true;
                 if other.may_jump() {
-                    // a branch through the interpreter (the float compares) that fell through
+                    // a jump through the interpreter (`pop` with pc in its mask) that fell
+                    // through: leave first if the next tick is due, as after any bus access
+                    g.check_brk(next_pc, count);
                     g.chain(next_pc, count);
                 }
             }
@@ -1189,20 +1260,29 @@ fn compile<B: Bus>(ops: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<
 mod tests {
     use super::*;
     use crate::{Base, BOp};
-    struct Memory { data: Vec<u8>, flags: Vec<u8>, version: u64 }
+    /// 256 bytes of RAM at 0 (no XIP); a word read at `MMIO` and up gives `mmio`, and makes the
+    /// next tick due when `due_on_mmio` (a peripheral touched, as the Soc does).
+    struct Memory { data: Vec<u8>, flags: Vec<u8>, version: u64, mmio: u32, due_on_mmio: bool, due: bool }
+    const MMIO: u32 = 0x1000;
     impl Memory {
-        fn new() -> Self { Self { data: vec![0; 256], flags: vec![1; 65], version: 0 } }
+        fn new() -> Self { Self { data: vec![0; 256], flags: vec![1; 65], version: 0, mmio: 0, due_on_mmio: false, due: false } }
     }
     impl Bus for Memory {
         fn read8(&mut self, a: u32) -> u8 { self.data[a as usize] }
         // (the halfword at a & !1, as the Soc reads one)
         fn read16(&mut self, a: u32) -> u16 { let a = (a & !1) as usize; u16::from_le_bytes(self.data[a..a + 2].try_into().unwrap()) }
-        fn read32(&mut self, a: u32) -> u32 { u32::from_le_bytes(self.data[a as usize..a as usize+4].try_into().unwrap()) }
+        fn read32(&mut self, a: u32) -> u32 {
+            if a >= MMIO {
+                self.due |= self.due_on_mmio;
+                return self.mmio;
+            }
+            u32::from_le_bytes(self.data[a as usize..a as usize+4].try_into().unwrap())
+        }
         fn write8(&mut self, a: u32, v: u8) { self.data[a as usize] = v; self.version += 1; }
         fn write16(&mut self, a: u32, v: u16) { self.data[a as usize..a as usize+2].copy_from_slice(&v.to_le_bytes()); self.version += 1; }
         fn write32(&mut self, a: u32, v: u32) { self.data[a as usize..a as usize+4].copy_from_slice(&v.to_le_bytes()); self.version += 1; }
         fn tick_room(&self) -> u64 { 1000 }
-        fn next_tick_due(&self) -> bool { false }
+        fn next_tick_due(&self) -> bool { self.due }
         fn add_ticks(&mut self, _: u64) {}
         fn code_writes(&self) -> Option<u64> { Some(self.version) }
         fn jit_mem(&mut self) -> Option<JitMem> {
@@ -1212,8 +1292,8 @@ mod tests {
     }
     fn op(fast: Fast) -> BOp { BOp { fast, len: 2, careful: false, pair_head: false, glue: false } }
     fn hot(j: &mut Jit, id: usize, pc: u32, ops: &[BOp], mem: &JitMem) -> *const u8 {
-        for _ in 0..HOT { j.entry::<Memory>(id, ops, pc, mem); }
-        j.entry::<Memory>(id, ops, pc, mem).unwrap().0
+        for _ in 0..HOT { j.entry::<Memory>(id, ops, pc, mem, true); }
+        j.entry::<Memory>(id, ops, pc, mem, true).unwrap().0
     }
     #[test]
     fn ram_chain_rejects_changed_target_and_respects_budget() {
@@ -1232,6 +1312,57 @@ mod tests {
         assert_eq!(unsafe { run(from, &mut cpu, &mut bus, &mem, 0, 10) }.0, 1);
         assert_eq!(cpu.pc, 32); assert_eq!(cpu.regs[0], 0);
     }
+    /// Returns and computed jumps go straight on into the compiled body of their target through
+    /// `Jit::itab`: only when the target's whole prefix fits the limit, its RAM snapshot is
+    /// current, and (after a bus access) the next tick is not due; else back to Rust at the target.
+    #[test]
+    fn computed_jumps_continue_through_the_table() {
+        let mut bus = Memory::new(); let mem = bus.jit_mem().unwrap();
+        let mut j = Jit::new(false).unwrap();
+        let rts = hot(&mut j, 0, 0, &[op(Fast::Rts)], &mem);
+        let goto = hot(&mut j, 1, 2, &[op(Fast::GotoR { r: 3 })], &mem);
+        let callr = hot(&mut j, 2, 4, &[op(Fast::CallR { r: 3 })], &mem);
+        let pop = hot(&mut j, 3, 6, &[op(Fast::PopRet)], &mem);
+        hot(&mut j, 4, 32, &[op(Fast::MovI { d: 0, v: 42 }), op(Fast::MovI { d: 1, v: 7 })], &mem);
+        let fresh = |pc: u32| { let mut c = Cpu::new(0); c.rets = pc; c.regs[3] = pc; c.sp = MMIO; c };
+        for (code, what) in [(rts, "rts"), (goto, "goto R"), (callr, "call R"), (pop, "pop pc")] {
+            // into the body at 32, which runs to its end (then exits there: nothing compiled at 36)
+            bus.mmio = 32;
+            let mut cpu = fresh(32);
+            assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10) }.0, 3, "{what}");
+            assert_eq!((cpu.regs[0], cpu.regs[1], cpu.pc), (42, 7, 36), "{what}");
+            // the limit: the target's prefix does not fit, so back to Rust before it
+            let mut cpu = fresh(32);
+            assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 2) }.0, 1, "{what}");
+            assert_eq!((cpu.regs[0], cpu.pc), (0, 32), "{what}");
+            // nothing compiled there (and an odd pc that maps to the same entry)
+            for to in [64, 33, 32 + (2 << ITAB_BITS)] {
+                bus.mmio = to;
+                let mut cpu = fresh(to);
+                assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10) }.0, 1, "{what}");
+                assert_eq!((cpu.regs[0], cpu.pc), (0, to), "{what}");
+            }
+        }
+        // call R leaves its return address
+        let mut cpu = fresh(32);
+        unsafe { run(callr, &mut cpu, &mut bus, &mem, 0, 10) };
+        assert_eq!(cpu.rets, 6);
+        // a pop from a peripheral that makes the next tick due: leave at the target
+        (bus.mmio, bus.due_on_mmio) = (32, true);
+        let mut cpu = fresh(32);
+        assert_eq!(unsafe { run(pop, &mut cpu, &mut bus, &mem, 0, 10) }.0, 1);
+        assert_eq!((cpu.regs[0], cpu.pc, cpu.sp), (0, 32, MMIO + 4));
+        (bus.due, bus.due_on_mmio) = (false, false);
+        // the target's code changed (a write the bus counts): its guard sends it back to Rust
+        bus.write8(33, 0xff);
+        let mut cpu = fresh(32);
+        assert_eq!(unsafe { run(rts, &mut cpu, &mut bus, &mem, 0, 10) }.0, 1);
+        assert_eq!((cpu.regs[0], cpu.pc), (0, 32));
+        // a reset forgets the table
+        j.reset();
+        assert!(j.itab.iter().all(|e| e.pc == u32::MAX));
+    }
+
     #[test]
     fn code_store_exits_before_following_instruction() {
         let mut bus = Memory::new(); let mem = bus.jit_mem().unwrap();

@@ -539,7 +539,10 @@ impl Cpu {
                         self.jit = jit::Jit::new(self.profile).map(Box::new);
                     }
                     let code = match self.jit.as_mut() {
-                        Some(j) => j.entry::<B>(id, &self.bops[start as usize..(start + len) as usize], pc, &mem),
+                        Some(j) => {
+                            let table = bus.code_writes().is_some() && !mem.ram_code.is_null();
+                            j.entry::<B>(id, &self.bops[start as usize..(start + len) as usize], pc, &mem, table)
+                        }
                         None => None,
                     };
                     if let Some((code, _)) = code {
