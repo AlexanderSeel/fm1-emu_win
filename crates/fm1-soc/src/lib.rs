@@ -221,6 +221,8 @@ pub struct Soc {
     pub flaky_core1: Option<flaky::FlakyCore1>,
     /// The power domain's analog registers.
     pub p33: p33::P33,
+    /// Exact skipping of cpu0's polling loops (`machine::run_blocks`).
+    pub loop_skip: machine::LoopSkip,
 }
 
 fn dbg_line(addr: u32) -> &'static str {
@@ -293,6 +295,39 @@ impl Soc {
             unknown_log: Vec::new(),
             flaky_core1: None,
             p33: Default::default(),
+            // (FM1_TRACE: a trace shows every instruction as it runs, not a probe's)
+            loop_skip: machine::LoopSkip::new(std::env::var_os("FM1_NO_LOOPSKIP").is_none() && std::env::var_os("FM1_TRACE").is_none()),
+        }
+    }
+
+    /// Does a 32-bit load from `addr` only look (no side effect, nothing that depends on the
+    /// clock)? `read32_slow` region by region; byte and halfword loads outside RAM read the
+    /// aligned word. What a polling loop may read and still go round unchanged.
+    pub(crate) fn pure_read(&self, addr: u32) -> bool {
+        let fm1 = self.board == Board::Fm1;
+        match self.region(addr) {
+            Region::Xip | Region::XipFlash | Region::Ram | Region::Ovl | Region::Sram2 => true,
+            Region::Irqc | Region::Iomap | Region::Usb | Region::Clk | Region::Ana | Region::Bt | Region::Dbg => true,
+            Region::Spi2 | Region::Crc | Region::P33 | Region::Alnk | Region::Uart1 => true,
+            // the tick counter's word counts the clock
+            Region::Irqc2 => addr != 0x1eef0f0,
+            // the timers' control and period words; the counters count the clock, and other
+            // words tick `Soc::ticks`
+            Region::Timer => matches!(addr, 0x10800 | 0x10900 | 0x10908) || matches!(addr & !0x300, 0x10400 | 0x10408),
+            // the SMK-37's matrix rows and SPI1 busy follow the clock; its ADC is left alone too
+            Region::Gpio | Region::Adc | Region::Spi1 => fm1,
+            Region::Spi0 | Region::Rand | Region::Unknown => false,
+        }
+    }
+
+    /// May a polling loop's round store to `addr` (a 32-bit store; byte and halfword stores
+    /// outside RAM write the aligned word)? Only where the round's effect is compared after it:
+    /// the P33 port, and the FM-1's SARADC (its conversions are instant).
+    pub(crate) fn loop_write_ok(&self, addr: u32) -> bool {
+        match self.region(addr) {
+            Region::P33 => true,
+            Region::Adc => self.board == Board::Fm1 && matches!(addr, 0x13100 | 0x13104),
+            _ => false,
         }
     }
 

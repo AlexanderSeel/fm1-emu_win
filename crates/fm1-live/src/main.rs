@@ -341,6 +341,10 @@ fn bench(o: &Opts, ms: u64) {
     if let Some(c1) = &m.cpu1 {
         println!("cpu1: {} instructions ({:.1} M per emulated s)", c1.insn_count, c1.insn_count as f64 / 1e3 / ms as f64);
     }
+    let ls = &m.soc.loop_skip;
+    if ls.enabled {
+        println!("loop skip: {:.1}% of cycles ({} probes, {} found a loop)", 100.0 * ls.skipped as f64 / m.soc.periph.cycles.max(1) as f64, ls.probes, ls.hits);
+    }
     if let Some(f) = &m.soc.flaky_core1 {
         println!("flaky core 1: {} misreads in {} RAM loads", f.misreads, f.loads);
     }
@@ -711,6 +715,7 @@ env: FM1_BENCH_KEYS='T[-T2]:PLAY,T:n7,T:enc0:+3,T:pot:512,T:ms:mHEX'  scripted i
      FM1_BENCH_ROUTES      --bench: no default keys, the steady-speed start, a thread, checkpoints, profiles
      FM1_KEY_AT, FM1_KEY_UP, FM1_NO_PLAY, FM1_NO_SKIP, FM1_SKIP_FROM, FM1_DUMP=ADDR  --shot
      FM1_NO_JIT            the interpreter (byte-identical, slower); FM1_NO_BLOCKS: a step at a time
+     FM1_NO_LOOPSKIP       run polling loops round by round instead of skipping them (byte-identical, slower)
      FM1_FLASH_CUT=N       cut the power half way through the Nth flash erase / program (--flash keeps what is left)";
 
 fn main() {

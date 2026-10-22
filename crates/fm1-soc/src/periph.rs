@@ -566,6 +566,15 @@ impl Periph {
         self.uart.dropped
     }
 
+    /// The SARADC's state as a polling loop can change it (`machine`'s loop skip).
+    pub(crate) fn adc_state(&self) -> (u32, bool, bool) {
+        (self.adc_con, self.adc_done, self.adc_irq)
+    }
+
+    pub(crate) fn set_adc_state(&mut self, (con, done, irq): (u32, bool, bool)) {
+        (self.adc_con, self.adc_done, self.adc_irq) = (con, done, irq);
+    }
+
     /// One cycle; true when something timed is due (call `advance(0)`).
     #[inline(always)]
     pub fn tick(&mut self) -> bool {
@@ -761,7 +770,14 @@ impl Periph {
         // next instruction (leaving compiled code). Not for the FM-1's ADC: its conversions are
         // instant, so a write there changes only whether IRQ 24 is raised (then it does).
         // OberVave converts ~1 M times a second, 5 writes each: every one left the JIT.
-        if !(matches!(addr, 0x13100 | 0x13104) && self.board != crate::Board::Smk37) {
+        // Nor for the port pins (the key matrix's shift registers, the LED lines: nothing timed;
+        // Felucca and its forks scan the matrix with ~0.5 M writes a second) but PD0, the flash
+        // chip select, nor for the counters' words that ignore writes (the stock firmware's core
+        // 1 writes TIMER5's ~1.3 M times a second).
+        let untimed = matches!(addr, 0x13100 | 0x13104) && self.board != crate::Board::Smk37
+            || matches!(addr, 0x50000..=0x501ff) && addr != 0x500c0
+            || matches!(addr, 0x10808 | 0x10904);
+        if !untimed {
             self.next_due = 0;
         }
         match addr {

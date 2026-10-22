@@ -899,6 +899,51 @@ in a block cut by the budget, and the JIT random-state test with call R, goto R,
 icfg moves (interrupt state compared). Speed (this Mac, loaded; one run per firmware): JIT
 geomean +16%, interpreted +4%.
 
+## 5.31 Polling loops skipped to the cycle (2026-10-22)
+
+The rest of 5.27's SoC review, now that budgets hold to the instruction (5.28). FM1-DOOM, ZP-12,
+OberVave, Etch, Beetle and fmini spend much of their time in a main loop with nothing to do: a
+watchdog kick through the P33 port and a look at flags their interrupts set, round after round
+until the next interrupt. Such a round leaves the machine as it found it, and until the next
+timed event nothing it reads can change, so every round runs the same. `machine::probe_loop`
+runs cpu0 on in the interpreter through `ProbeBus` (at a block boundary, outside interrupts,
+with nothing pending, room before the next event and enough budget left). Loads must only look
+(`Soc::pure_read`, region by region from `read32_slow`: no clock, no counter, no log); stores go
+to RAM (logged with the word they replace; not into code words) or to the P33 port and the FM-1's
+instant ADC, whose state is compared. Back at the pc it began at with the same core
+(`Cpu::plain_state`), the same port and ADC, and every RAM word the round stored to as it was when
+the round began, the rounds whose ticks all fall before `next_due`, and within the budget, are
+added as k * L cycles: the machine as running them would leave it, at the same cycle. A probe
+that finds nothing (an impure access, refused rather than made; an event; 2048 steps without a
+round) undoes all it ran, core, RAM, port, ADC and clock, so the run goes on exactly as without
+it. Probes run a step at a time, so they back off after one that failed and spend a credit (one
+per step, earned back at 1/16 of a skipped instruction with the JIT, 1/4 interpreted, and
+1/2048 a cycle): without it Ctl and Polly, whose ~640-instruction rounds alternate with real
+work, ran 10% slower with the JIT. `FM1_NO_LOOPSKIP` turns it off (A/B; FM1_TRACE does too).
+
+Two smaller ones with it. Port-pin writes (but PD0, the flash chip select) and the counters'
+write-ignored words (0x10808, 0x10904) no longer force a service: nothing timed hangs on them,
+and Felucca's matrix scan wrote the port half a million times a second (+9%). And cpu0 alone
+runs in one stretch instead of 4096-instruction ones (a skip was cut at 4096): the block loop
+stops at the release of cpu1 and says how far it got, and the rest of the 4096-chunk the
+release fell in is still not run, so cpu1 starts where it did. (That forfeit is master's
+accounting kept for the same output; dropping it would move every dual-core firmware's timeline
+by up to 4095 instructions, once.) No probe while a release is latched (`Soc::cpu1_release`):
+the block loop then breaks after every `run_fast` return, and a skip would carry cpu0 past where
+it stops without one. Master latches it again on any later 0 -> 1 of 0x10008 bit 3, with cpu1
+already running, and nothing takes it (cpu0 then runs one instruction a slice); no firmware
+tested does that, and the latch is for a change of its own.
+
+All 82 catalog firmwares, the stock one and FM1 Open, JIT and interpreted, --bench 8000 with
+keys: the same audio as before, byte for byte, JIT = interpreter, also with FM1_NO_LOOPSKIP;
+cpu1's instruction counts unchanged. Unit tests drive a key-polling loop against the same
+machine without the skip, a skip one cycle late fails them. Speed, best of 3 against master on a
+shared machine (JIT / interpreted): FM1-DOOM 2.21 -> 5.26x / 1.34 -> 2.94x (a 3 s run, its menu
+only: ~20x), ZP-12 3.42 -> 7.68x / 1.28 -> 2.01x, OberVave 2.87 -> 4.35x / 1.28 -> 1.59x, Felucca
+4.92 -> 5.34x, stock +3%, Grimm, Melodee, Jiant +4-5% (JIT); over all 84 a geomean of +12.5%
+JIT, +11.6% interpreted, none below 0.98x. The dual-core firmwares (stock, Open, X0X, Jiant, ...)
+skip nothing: within cpu0's 1024-instruction slices their probes find no round worth it.
+
 ## 6. Phase 5 — Boot & integration
 
 - Boot stock firmware to a stable idle/main-loop state.

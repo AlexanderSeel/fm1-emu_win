@@ -223,7 +223,7 @@ pub struct Cpu {
     /// current (`ram_block_ok`: the same count, no compare).
     bver: Vec<u64>,
     /// FM1_NO_RAM_BLOCKS: RAM code a step at a time (the reference)
-    no_ram_blocks: bool,
+    pub no_ram_blocks: bool,
     /// Instructions per execute route (index 31 = the micro-op fast path),
     /// and per class name on the slow path — for tuning the dispatcher.
     pub route_hist: [u64; 32],
@@ -256,7 +256,95 @@ pub struct Cpu {
     pub hold_irq: u32,
 }
 
+/// What instructions can see of a core between instructions, outside any pair, predicated
+/// block, repeat loop or interrupt (`Cpu::plain_state`): two equal ones at the same pc, with
+/// memory and peripherals unchanged, run on identically. (fm1_soc's polling-loop skip compares
+/// them, and puts one back after a probe that found no loop.)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct PlainState {
+    pc: u32,
+    regs: [u32; 16],
+    sp: u32,
+    ssp: u32,
+    usp: u32,
+    user: bool,
+    user_irq: u32,
+    rets: u32,
+    rep_start: u32,
+    rep_reg: Option<usize>,
+    rep_count: u32,
+    cc: bool,
+    flags: u32,
+    sreg_store: [u32; 7],
+    ie: bool,
+    nest_ok: bool,
+    unknown_const_count: u64,
+    stuck_on: Option<&'static str>,
+}
+
+impl PlainState {
+    pub fn pc(&self) -> u32 {
+        self.pc
+    }
+}
+
 impl Cpu {
+    /// The core's state when it is plain: no pair in flight, no predicated block, no repeat
+    /// loop, no interrupt in progress, no glued pair cut (None otherwise).
+    pub fn plain_state(&self) -> Option<PlainState> {
+        if self.pair_pending.is_some() || !self.pred_skips.is_empty() || self.rep_end != 0 || self.hold_irq != 0 || !self.irq_levels.is_empty() {
+            return None;
+        }
+        Some(PlainState {
+            pc: self.pc,
+            regs: self.regs,
+            sp: self.sp,
+            ssp: self.ssp,
+            usp: self.usp,
+            user: self.user,
+            user_irq: self.user_irq,
+            rets: self.rets,
+            rep_start: self.rep_start,
+            rep_reg: self.rep_reg,
+            rep_count: self.rep_count,
+            cc: self.cc,
+            flags: self.flags,
+            sreg_store: self.sreg_store,
+            ie: self.ie,
+            nest_ok: self.nest_ok,
+            unknown_const_count: self.unknown_const_count,
+            stuck_on: self.stuck_on,
+        })
+    }
+
+    /// Back to a plain state taken earlier (`plain_state`): whatever ran since is undone in the
+    /// core (not the retired count, nor memory).
+    pub fn set_plain_state(&mut self, s: &PlainState) {
+        self.pc = s.pc;
+        self.regs = s.regs;
+        self.sp = s.sp;
+        self.ssp = s.ssp;
+        self.usp = s.usp;
+        self.user = s.user;
+        self.user_irq = s.user_irq;
+        self.rets = s.rets;
+        self.rep_start = s.rep_start;
+        self.rep_end = 0;
+        self.rep_reg = s.rep_reg;
+        self.rep_count = s.rep_count;
+        self.pred_skips.clear();
+        self.cc = s.cc;
+        self.flags = s.flags;
+        self.sreg_store = s.sreg_store;
+        self.pair_pending = None;
+        self.stuck_on = s.stuck_on;
+        self.unknown_const_count = s.unknown_const_count;
+        self.ie = s.ie;
+        self.irq_levels.clear();
+        self.nest_ok = s.nest_ok;
+        self.hold_irq = 0;
+    }
+
     pub fn jit_profile_json(&self) -> String {
         let helpers = self.jit_helpers.iter().map(|(k, v)| format!("\"{k}\":{v}")).collect::<Vec<_>>().join(",");
         format!("{{\"entries\":{},\"instructions\":{},\"helpers\":{{{helpers}}}}}", self.jit_entries, self.jit_insns)
