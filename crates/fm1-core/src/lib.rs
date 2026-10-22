@@ -3442,6 +3442,22 @@ static BYTE_SET_CRAW: fm1_isa::IsaEntry = fm1_isa::IsaEntry {
 /// d8 form's) never appears. All 3462 corpus samples fit.
 #[derive(Clone, Copy, Debug)]
 struct IdxInc { pre: bool, w: u8, store: bool, signed: bool, high: bool, d: usize, b: usize, i: usize }
+/// Route 32 as micro-ops the compilers have (`fast_raw`): `LdPre` / `StPre` / `LdPostR` /
+/// `StPostR`, except a store or load of the base register itself and a high-half store.
+fn idx_inc_fast(raw: u64) -> Fast {
+    match idx_inc(raw) {
+        Some(m) if !m.high && m.d != m.b => {
+            let (d, b, i, w, signed) = (m.d as u8, m.b as u8, m.i as u8, m.w, m.signed);
+            match (m.pre, m.store) {
+                (true, false) => Fast::LdPre { d, b, i, w, signed, inc: 0 },
+                (true, true) => Fast::StPre { s: d, b, i, w, inc: 0 },
+                (false, false) => Fast::LdPostR { d, b, i, w, signed },
+                (false, true) => Fast::StPostR { s: d, b, i, w },
+            }
+        }
+        _ => Fast::Raw { route: 32, raw: raw as u32 },
+    }
+}
 fn idx_inc(raw: u64) -> Option<IdxInc> {
     let pre = match raw & 0xff { 0xdc => true, 0xde => false, _ => return None };
     let w = match (raw >> 8) & 0xff { 0xec => 4u8, 0xed => 2, 0xee => 1, _ => return None };
@@ -4937,25 +4953,33 @@ mod tests {
         assert_eq!((c.regs[3], c.regs[0]), (0xffff_8001, 0x1000 + 146));
     }
 
-    /// Routes 18 / 19 as micro-ops (`inc_mem_fast`) against exec_raw's arm, from random
-    /// encodings (every width, both routes, base = data register among them) and registers.
+    /// Routes 18 / 19 / 32 as micro-ops (`inc_mem_fast`, `idx_inc_fast`) against exec_raw's
+    /// arm, from random encodings (every width, pre- and post-increments, the base register
+    /// the data one, route 32's increment register the base or the data one) and registers
+    /// (some close together, so the accesses overlap them).
     #[test]
     fn inc_mem_micro_ops_match_the_raw_arm() {
         let mut seed = 0x2545_f491_4f6c_dd1du64;
         let mut rnd = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed as u32 };
-        let mut kinds = std::collections::HashMap::new();
-        for k in 0..20000 {
-            let route = if k & 1 == 0 { 18u8 } else { 19 };
-            let mut raw = rnd() & !0xff00 | [0xec, 0xed, 0xee, 0xef][(k >> 1) % 4] << 8;
-            if k % 7 == 0 {
-                raw = raw & !0x00f0_0000 | (raw >> 28) << 20; // the base register is the data one
+        let mut kinds = std::collections::BTreeMap::new();
+        for k in 0..30000u32 {
+            let route = [18u8, 19, 32][k as usize % 3];
+            let mut raw = rnd() & !0xffff | [0xec, 0xed, 0xee, 0xef][(k / 3) as usize % 4] << 8;
+            raw |= if route == 32 { [0xdc, 0xde][(k / 12) as usize % 2] } else { rnd() & 0xff };
+            let (d, b) = (raw >> 28, (raw >> 20) & 15);
+            match k % 5 {
+                0 => raw = raw & !0x00f0_0000 | d << 20,
+                1 => raw = raw & !0x0f00_0000 | b << 24,
+                2 => raw = raw & !0x0f00_0000 | d << 24,
+                _ => {}
             }
-            let f = inc_mem_fast(route, raw);
-            *kinds.entry(format!("{route} {:?}", std::mem::discriminant(&f))).or_insert(0) += 1;
-            let mut ram = FlatRam::new((0..0x4000).map(|_| rnd() as u8).collect());
+            let f = if route == 32 { idx_inc_fast(raw as u64) } else { inc_mem_fast(route, raw) };
+            let kind = format!("{f:?}").split([' ', '{']).next().unwrap().to_owned();
+            *kinds.entry((route, kind)).or_insert(0) += 1;
+            let mut ram = FlatRam::new((0..0x8000).map(|_| rnd() as u8).collect());
             let mut cpu = Cpu::new(0);
             for r in 0..16 {
-                cpu.regs[r] = 0x1000 + rnd() % 0x2000;
+                cpu.regs[r] = if k % 7 == 0 { 0x2000 + rnd() % 64 * 2 } else { 0x1000 + rnd() % 0x2000 };
             }
             let (mut ref_ram, mut reference) = (FlatRam::new(ram.mem.clone()), Cpu::new(0));
             reference.regs = cpu.regs;
@@ -4964,8 +4988,11 @@ mod tests {
             assert_eq!(cpu.regs, reference.regs, "route {route} raw {raw:08x}: {f:?}");
             assert!(ram.mem == ref_ram.mem, "route {route} raw {raw:08x}: {f:?}");
         }
-        // (each form came up: post-increment loads and stores, word offsets, and the raw rest)
-        assert!(kinds.len() >= 6, "{kinds:?}");
+        // (each form came up, and the raw rest: route 19's post-increment load into its base,
+        // route 32's high halves and accesses of its base; route 18 maps whole)
+        let forms: Vec<_> = kinds.keys().map(|(r, k)| format!("{r} {k}")).collect();
+        assert_eq!(forms, ["18 Ld", "18 LdPre", "18 St", "18 StPre", "19 LdPost", "19 Raw", "19 StPost",
+            "32 LdPostR", "32 LdPre", "32 Raw", "32 StPostR", "32 StPre"], "{kinds:?}");
     }
 
     /// `Fast::Swap`'s rule: for random register-only heads and random second instructions that
@@ -5930,18 +5957,7 @@ fn fast_raw(route: u16, insn: &Instruction, alu4: &Option<Alu4>, bittest: &Optio
         // comes last, the micro-ops' first or from the loaded value), route 32's store of the
         // base or of a high half, and words idx_inc does not take
         18 | 19 => Some(inc_mem_fast(route as u8, raw as u32)),
-        32 => Some(match idx_inc(raw) {
-            Some(m) if !m.high && m.d != m.b => {
-                let (d, b, i, w, signed) = (m.d as u8, m.b as u8, m.i as u8, m.w, m.signed);
-                match (m.pre, m.store) {
-                    (true, false) => Fast::LdPre { d, b, i, w, signed, inc: 0 },
-                    (true, true) => Fast::StPre { s: d, b, i, w, inc: 0 },
-                    (false, false) => Fast::LdPostR { d, b, i, w, signed },
-                    (false, true) => Fast::StPostR { s: d, b, i, w },
-                }
-            }
-            _ => Fast::Raw { route: 32, raw: raw as u32 },
-        }),
+        32 => Some(idx_inc_fast(raw)),
         16 | 21 | 22 | 27 | 39 | 40 | 41 => Some(Fast::Raw { route: route as u8, raw: raw as u32 }),
         26 if insn.entry.len == 4 => Some(Fast::PushMask { mask: ((raw >> 16) & 0xffff) as u16 }),
         28 if insn.entry.len == 4 => Some(Fast::PopMask { mask: ((raw >> 16) & 0xffff) as u16 }),
