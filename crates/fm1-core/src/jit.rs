@@ -263,7 +263,8 @@ pub(crate) struct Prefix {
     /// it may run inside a then-part or rep loop (`Cpu::prefix_inside`): no glued pair whose
     /// head may use the bus (compiled code could leave between the two), no if-else block
     inside_ok: bool,
-    /// it is its block whole: a runner's stretch may run on from it (`Cpu::stop_pc`)
+    /// it is its block whole, no then-part in tow: a runner's stretch may run on from it
+    /// (`Cpu::stop_pc`)
     pub whole: bool,
 }
 
@@ -327,7 +328,7 @@ impl Jit {
                 let then = then.filter(|_| plen + 1 == ops.len() && matches!(ops[plen].fast, Fast::IfBlk { has_else: true, .. }) && !ops[plen].pair_head);
                 let with_if = then.is_some();
                 let plen = plen + with_if as usize;
-                let whole = plen == ops.len();
+                let whole = plen == ops.len() && !with_if;
                 let e = match self.compile_prefix::<B>(&ops[..plen], swaps, then.unwrap_or(&[]), pc0, mem, table, true, whole) {
                     None => Entry::No,
                     Some(p) if !with_if => Entry::Code(p, Some(p).filter(|p| p.inside_ok)),
@@ -967,13 +968,15 @@ impl Gen<'_> {
     /// (or a code word was written), or an interrupt is pending (then `run_fast` stops:
     /// `Ctx::stop`). Nothing to call while neither brk is set nor `Ctx::irq` (none pending,
     /// known since the last helper).
-    fn check_pair(&mut self, next_pc: u32, count: u32) {
+    /// (`rest`: instructions left in the block, as `check_brk`)
+    fn check_pair(&mut self, next_pc: u32, count: u32, rest: u32) {
         let go = self.a.label();
         self.a.ldr_x(9, CTX, OFF_BRK); // brk | irq << 32
         self.a.cbz_x(9, go);
         self.a.mov_x(0, CTX);
         self.call(self.h_pair);
         self.a.cbz(0, go);
+        self.rest(rest);
         self.exit_imm(next_pc, count);
         self.a.bind(go);
     }
@@ -1479,8 +1482,8 @@ fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], then: &[crate
     // a runner's stretch (`Cpu::stop_pc`): entered after the call's first block, from the end
     // of a block compiled whole, this is where one of the runner's calls ends. Back to Rust
     // here when the runner could decide otherwise from here on: the stop lies in this block,
-    // a helper may have reached a peripheral, the stretch is spent (32 short of the limit), or
-    // this block isn't compiled whole (its rest runs interpreted)
+    // a helper may have reached a peripheral, the stretch is spent (`STRETCH_ROOM` short of
+    // the limit), or this block isn't compiled whole (its rest runs interpreted)
     if let Some(whole) = stops {
         let (go, stop) = (g.a.label(), g.a.label());
         g.a.cbz(DONE, go);
@@ -1494,7 +1497,7 @@ fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], then: &[crate
             g.a.b_cond(AC::Lo, stop);
             g.a.ldr(9, CPU, off_stop_io());
             g.a.cbnz(9, stop);
-            g.a.add_imm(9, DONE, 32);
+            g.a.add_imm(9, DONE, crate::STRETCH_ROOM);
             g.a.cmp(9, LIMIT);
             g.a.b_cond(AC::Lo, go);
         }
@@ -1548,7 +1551,7 @@ fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], then: &[crate
             let mid = pc + hlen as u32;
             emit_op::<B>(&mut g, tail, ins + 1, next_pc, profile);
             emit_op::<B>(&mut g, head, ins, mid, profile);
-            g.check_pair(next_pc, ins + 2);
+            g.check_pair(next_pc, ins + 2, insns(ops) - (ins + 2));
             ins += 2;
             pc = next_pc;
             continue;
@@ -1573,7 +1576,7 @@ fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], then: &[crate
                 (tpc, j) = (tnext, j + 1);
             }
             if !then.is_empty() {
-                g.check_pair(ee, j);
+                g.check_pair(ee, j, 0);
             }
             g.chain(ee, j);
             ins = j;
@@ -1980,13 +1983,14 @@ mod tests {
         assert_eq!(go(from, 0, 0, 100), (3, 36, 42));
         assert_eq!(go(from, 0x40, 0, 100), (3, 36, 42));
         // back before it: the stop starts it or lies in it, a peripheral was reached, or the
-        // stretch is spent (32 short of the limit)
+        // stretch is spent (`STRETCH_ROOM` short of the limit)
         assert_eq!(go(from, 32, 0, 100), (1, 32, 0));
         assert_eq!(go(from, 34, 0, 100), (1, 32, 0));
         assert_eq!(go(from, 36, 0, 100), (3, 36, 42));
         assert_eq!(go(from, 0x40, 1, 100), (1, 32, 0));
-        assert_eq!(go(from, 0x40, 0, 33), (1, 32, 0));
-        assert_eq!(go(from, 0x40, 0, 34), (3, 36, 42));
+        let room = crate::STRETCH_ROOM;
+        assert_eq!(go(from, 0x40, 0, 1 + room), (1, 32, 0));
+        assert_eq!(go(from, 0x40, 0, 2 + room), (3, 36, 42));
         // a block not compiled whole: only outside a stretch
         assert_eq!(go(from2, 0, 0, 100).0, 2);
         assert_eq!(go(from2, 0x1000, 0, 100), (1, 64, 0));

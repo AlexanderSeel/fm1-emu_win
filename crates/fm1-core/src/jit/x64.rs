@@ -373,7 +373,8 @@ impl Gen<'_> {
     /// (or a code word was written), or an interrupt is pending (then `run_fast` stops:
     /// `Ctx::stop`). Nothing to call while neither brk is set nor `Ctx::irq` (none pending,
     /// known since the last helper).
-    fn check_pair(&mut self, next_pc: u32, count: u32) {
+    /// (`rest`: instructions left in the block, as `check_brk`)
+    fn check_pair(&mut self, next_pc: u32, count: u32, rest: u32) {
         let go = self.a.label();
         self.a.ld64(R11, m(CTX, OFF_BRK as i32)); // brk | irq << 32
         self.a.test_rr64(R11, R11);
@@ -382,6 +383,9 @@ impl Gen<'_> {
         self.call(self.h_pair);
         self.a.test_rr(RAX, RAX);
         self.a.jcc(Cc::E, go);
+        if self.stops && rest > 0 {
+            self.a.st_imm(m(CPU, off_stop_rest() as i32), rest);
+        }
         self.exit_imm(next_pc, count);
         self.a.bind(go);
     }
@@ -940,7 +944,7 @@ pub(super) fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], th
             g.a.jcc(Cc::B, stop);
             g.a.cmp_m_i8(m(CPU, off_stop_io() as i32), 0);
             g.a.jcc(Cc::Ne, stop);
-            g.a.lea(R11, m(DONE, 32));
+            g.a.lea(R11, m(DONE, crate::STRETCH_ROOM as i32));
             g.a.cmp_rm(R11, m(RSP, LIMIT));
             g.a.jcc(Cc::B, go);
         }
@@ -994,7 +998,7 @@ pub(super) fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], th
             let mid = pc + hlen as u32;
             emit_op::<B>(&mut g, tail, ins + 1, next_pc, profile);
             emit_op::<B>(&mut g, head, ins, mid, profile);
-            g.check_pair(next_pc, ins + 2);
+            g.check_pair(next_pc, ins + 2, insns(ops) - (ins + 2));
             ins += 2;
             pc = next_pc;
             continue;
@@ -1019,7 +1023,7 @@ pub(super) fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], th
                 (tpc, j) = (tnext, j + 1);
             }
             if !then.is_empty() {
-                g.check_pair(ee, j);
+                g.check_pair(ee, j, 0);
             }
             g.chain(ee, j);
             ins = j;

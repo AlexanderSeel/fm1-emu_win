@@ -115,18 +115,32 @@ fn ram_code<B: Bus>(bus: &mut B, pc: u32) -> Option<&'static [u8]> {
     Some(unsafe { std::slice::from_raw_parts(m.ram.add(off as usize), (m.ram_len - off) as usize) })
 }
 
-/// How many of a block's ops (the first at pc) come before `stop`, if an instruction of it after
-/// the first begins there; else all of them.
-fn len_to(ops: &[BOp], pc: u32, stop: u32) -> u32 {
+/// How many instructions of a block (its ops, the first at pc; a swapped pair is two) come before
+/// `stop`, if an instruction of it after the first begins there (the second of a swapped pair
+/// too: then its head runs alone), and whether that is all of them.
+fn len_to(ops: &[BOp], swaps: &[(Fast, Fast, u8)], pc: u32, stop: u32) -> (u32, bool) {
     let mut at = pc;
-    for (k, op) in ops.iter().enumerate() {
+    let mut k = 0;
+    for op in ops {
         if k > 0 && at == stop {
-            return k as u32;
+            return (k, false);
+        }
+        k += 1;
+        if let Fast::Swap { idx } = op.fast {
+            if at.wrapping_add(swaps[idx as usize].2 as u32) == stop {
+                return (k, false);
+            }
+            k += 1;
         }
         at = at.wrapping_add(op.len as u32);
     }
-    ops.len() as u32
+    (k, true)
 }
+
+/// A stretch (`Cpu::stop_pc`) returns once its budget less this is spent: room for the call
+/// begun before then to end where it would (a block holds at most 64 instructions: 32 ops, each
+/// at most a swapped pair).
+pub const STRETCH_ROOM: u32 = 64;
 
 /// a == b (equal lengths). RAM blocks are checked against memory on every entry: in wasm,
 /// 8 bytes at a time, since its `memcmp` (compiler_builtins) goes a byte at a time (a fifth of
@@ -272,7 +286,7 @@ pub struct Cpu {
     /// the block at pc up to this pc if it lies inside (`block_len_to`), run back to back, and
     /// it returns only where one of them ends and the runner could decide otherwise: back here,
     /// once `stop_io` is set or code ran interpreted (either may have touched a peripheral, and
-    /// so made an interrupt pending), or with the budget less 32 spent (the last 32: room for
+    /// so made an interrupt pending), or with the budget less `STRETCH_ROOM` spent (room for
     /// the call begun before then to end where it would).
     pub stop_pc: u32,
     /// Set (while `stop_pc` is) by compiled code's helpers: a bus access off its inline paths,
@@ -557,7 +571,7 @@ impl Cpu {
                 sync!();
                 return Ok((n, false));
             }
-            if stretch && n == bound && n > 0 && (pc == self.stop_pc || self.stop_io != 0 || interpreted || n >= budget - 32) {
+            if stretch && n == bound && n > 0 && (pc == self.stop_pc || self.stop_io != 0 || interpreted || n >= budget.saturating_sub(STRETCH_ROOM)) {
                 sync!();
                 return Ok((n, false));
             }
@@ -577,9 +591,9 @@ impl Cpu {
             // to its end
             let mut whole = false;
             if stretch && n == bound {
-                let to = len_to(&self.bops[start as usize..(start + len) as usize], pc, self.stop_pc);
+                let (to, all) = len_to(&self.bops[start as usize..(start + len) as usize], &self.swaps, pc, self.stop_pc);
                 bound = n + to;
-                whole = to == len;
+                whole = all;
             }
             let limit = if stretch { bound } else { budget };
             // (careful: inside a then-part or a rep loop with nothing else in progress, where a
@@ -614,8 +628,8 @@ impl Cpu {
                         // (the code checks itself that its ticks fall before anything is due)
                         let extra = if n == 0 { 0 } else { 1 };
                         sync!();
-                        // a stretch's call of a block compiled whole runs on to wherever the code
-                        // leaves (`stop_rest`: how far inside a block it did)
+                        // a stretch's call of a block compiled whole (no then-part in tow) runs on
+                        // to wherever the code leaves (`stop_rest`: how far inside a block it did)
                         let open = whole && !inside && compiled_whole && self.jit.as_ref().is_some_and(|j| j.stops);
                         if open {
                             self.stop_rest = 0;
@@ -871,24 +885,7 @@ impl Cpu {
     /// looks for the way back to where it began, which may lie inside a block.)
     pub fn block_len_to<B: Bus>(&mut self, bus: &mut B, stop: u32) -> u32 {
         let Ok(Some((_, start, len))) = self.block_at(bus, self.pc) else { return 0 };
-        let mut at = self.pc;
-        let mut k = 0;
-        for j in start..start + len {
-            if k > 0 && at == stop {
-                return k;
-            }
-            let op = self.bops[j as usize];
-            k += 1;
-            if let Fast::Swap { idx } = op.fast {
-                // two instructions; stopping at the second one runs the head alone
-                if at.wrapping_add(self.swaps[idx as usize].2 as u32) == stop {
-                    return k;
-                }
-                k += 1;
-            }
-            at = at.wrapping_add(op.len as u32);
-        }
-        k
+        len_to(&self.bops[start as usize..(start + len) as usize], &self.swaps, self.pc, stop).0
     }
 
     /// The block of micro-ops starting at pc (XIP code only): built on first

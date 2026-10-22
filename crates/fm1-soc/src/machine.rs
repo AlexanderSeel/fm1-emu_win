@@ -558,10 +558,11 @@ pub fn run_cpu1(c1: &mut Cpu, soc: &mut Soc, cycles: u64) -> Result<(), String> 
         // while core 1 runs), or with `probing` or `left` spent. The same calls, checked at the
         // same points. (Melodee 1.4.5's core 1 polls in most slices, about 22 blocks a pass; a
         // call each was 12% of a Pixel 7 Pro's time.)
-        let stretch = probing > 0 && irq.is_none() && c1.jit_on;
+        let stretch = probing > 0 && irq.is_none() && c1.jit_on && c1.stop_checks;
         let busy = if probing > 0 { 0 } else { left.min(256) };
-        // (a stretch: its last call may end up to 32 past what is left, and its ticks never run out)
-        let span = if stretch { probing.min(left) + 32 } else { busy };
+        // (a stretch: its last call may end up to `STRETCH_ROOM` past what is left, and its ticks
+        // never run out)
+        let span = if stretch { probing.min(left) + fm1_core::STRETCH_ROOM as u64 } else { busy };
         let mut bus = Core1Bus { soc: &mut *soc, budget: span.max(64) + 1 };
         // (probing: the block at pc, to its last instruction or to where the probe began if that
         // lies inside it, whether it runs compiled or not)
