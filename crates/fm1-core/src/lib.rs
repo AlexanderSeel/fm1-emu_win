@@ -532,12 +532,11 @@ impl Cpu {
                 sync!();
                 return Ok((n, false));
             };
-            // inside a then-part or a rep loop, nothing else in progress: a compiled prefix that
-            // cannot reach the construct's end still runs (`prefix_inside`)
+            // (careful: inside a then-part or a rep loop with nothing else in progress, where a
+            // compiled prefix that cannot reach the construct's end still runs: `prefix_inside`)
             #[cfg(native_jit)]
-            let inside = careful && self.pair_pending.is_none() && self.hold_irq == 0 && ((self.rep_end != 0) != !self.pred_skips.is_empty());
-            #[cfg(native_jit)]
-            if self.jit_on && (!careful || inside) {
+            if self.jit_on && (!careful || self.only_construct()) {
+                let inside = careful;
                 if let Some(mem) = jit_mem {
                     if self.jit.is_none() {
                         self.jit = jit::Jit::new(self.profile).map(Box::new);
@@ -712,6 +711,13 @@ impl Cpu {
     #[inline]
     fn prefix_inside(&self, pc: u32, end: u32) -> bool {
         !(self.rep_end > pc && self.rep_end <= end) && self.pred_skips.iter().all(|&(te, _)| te >= end)
+    }
+
+    /// Is a then-part or a rep loop (one of them) all that is in progress?
+    #[cfg(native_jit)]
+    #[inline(never)]
+    fn only_construct(&self) -> bool {
+        self.pair_pending.is_none() && self.hold_irq == 0 && ((self.rep_end != 0) != !self.pred_skips.is_empty())
     }
 
     /// After a compiled prefix inside a then-part (`prefix_inside`): `finish`'s skip rule for
