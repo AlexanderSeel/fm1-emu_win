@@ -4654,6 +4654,37 @@ mod tests {
         let (c, _) = run1(&[0xd4, 0xed, 0x02, 0x39], &[(0x1000, 0x8001)]);
         assert_eq!((c.regs[3], c.regs[0]), (0xffff_8001, 0x1000 + 146));
     }
+
+    /// Routes 18 / 19 as micro-ops (`inc_mem_fast`) against exec_raw's arm, from random
+    /// encodings (every width, both routes, base = data register among them) and registers.
+    #[test]
+    fn inc_mem_micro_ops_match_the_raw_arm() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed as u32 };
+        let mut kinds = std::collections::HashMap::new();
+        for k in 0..20000 {
+            let route = if k & 1 == 0 { 18u8 } else { 19 };
+            let mut raw = rnd() & !0xff00 | [0xec, 0xed, 0xee, 0xef][(k >> 1) % 4] << 8;
+            if k % 7 == 0 {
+                raw = raw & !0x00f0_0000 | (raw >> 28) << 20; // the base register is the data one
+            }
+            let f = inc_mem_fast(route, raw);
+            *kinds.entry(format!("{route} {:?}", std::mem::discriminant(&f))).or_insert(0) += 1;
+            let mut ram = FlatRam::new((0..0x4000).map(|_| rnd() as u8).collect());
+            let mut cpu = Cpu::new(0);
+            for r in 0..16 {
+                cpu.regs[r] = 0x1000 + rnd() % 0x2000;
+            }
+            let (mut ref_ram, mut reference) = (FlatRam::new(ram.mem.clone()), Cpu::new(0));
+            reference.regs = cpu.regs;
+            assert_eq!(cpu.exec_fast(&mut ram, f, 4), None);
+            assert_eq!(reference.exec_fast(&mut ref_ram, Fast::Raw { route, raw }, 4), None);
+            assert_eq!(cpu.regs, reference.regs, "route {route} raw {raw:08x}: {f:?}");
+            assert!(ram.mem == ref_ram.mem, "route {route} raw {raw:08x}: {f:?}");
+        }
+        // (each form came up: post-increment loads and stores, word offsets, and the raw rest)
+        assert!(kinds.len() >= 6, "{kinds:?}");
+    }
 }
 
 /// Substring test for the short syntax/class strings: a plain window scan
@@ -5200,7 +5231,8 @@ fn fast_raw(route: u16, insn: &Instruction, alu4: &Option<Alu4>, bittest: &Optio
         2 => Some(Fast::Nop),
         // (the arms read bits below 32 only; route 21's table-less form carries the whole window)
         27 if insn.entry.len == 4 => Some(Fast::Raw { route: RAW_POP_RETS_MASK, raw: raw as u32 }),
-        16 | 18 | 19 | 21 | 22 | 27 | 32 | 39 | 40 | 41 => Some(Fast::Raw { route: route as u8, raw: raw as u32 }),
+        18 | 19 => Some(inc_mem_fast(route as u8, raw as u32)),
+        16 | 21 | 22 | 27 | 32 | 39 | 40 | 41 => Some(Fast::Raw { route: route as u8, raw: raw as u32 }),
         26 if insn.entry.len == 4 => Some(Fast::PushMask { mask: ((raw >> 16) & 0xffff) as u16 }),
         28 if insn.entry.len == 4 => Some(Fast::PopMask { mask: ((raw >> 16) & 0xffff) as u16 }),
         35 => {
@@ -5444,6 +5476,22 @@ fn sp_mem_raw(raw: u64) -> Option<SpMem> {
 ///     `b[r4+-163]` = 93-256)
 #[derive(Clone, Copy, Debug)]
 struct IncMem { d: usize, b: usize, w: u8, store: bool, signed: bool, inc: i32, pre: bool, post: bool }
+/// Routes 18 / 19 as micro-ops the compilers have (exec_raw's arm, its rules kept): a
+/// post-increment is `LdPost` / `StPost`, a word at an offset `Ld` / `St`. A load into the base
+/// register itself leaves the incremented base (exec_raw updates the base after the load,
+/// `LdPost` adds to what was loaded), and a pre-increment, stay raw.
+fn inc_mem_fast(route: u8, raw: u32) -> Fast {
+    let m = decode_inc_mem(route, raw as u64);
+    let (d, b, inc) = (m.d as u8, m.b as u8, m.inc as u32);
+    match (m.store, m.pre, m.post) {
+        (true, false, true) => Fast::StPost { s: d, b, w: m.w, inc },
+        (false, false, true) if d != b => Fast::LdPost { d, b, w: m.w, signed: m.signed, inc },
+        (true, false, false) => Fast::St { s: d, b: Base::Reg(b), off: inc, w: m.w },
+        (false, false, false) => Fast::Ld { d, b: Base::Reg(b), off: inc, w: m.w, signed: m.signed },
+        _ => Fast::Raw { route, raw },
+    }
+}
+
 fn decode_inc_mem(route: u8, raw: u64) -> IncMem {
     let w = match (raw >> 8) & 0xff { 0xec => 4u8, 0xed => 2, _ => 1 };
     let d = ((raw >> 28) & 0xf) as usize;
