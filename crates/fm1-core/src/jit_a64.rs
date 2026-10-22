@@ -110,6 +110,7 @@ impl Asm {
     pub fn sub_lsl(&mut self, rd: Reg, rn: Reg, rm: Reg, sh: u32) { self.e(0x4b00_0000 | rm << 16 | sh << 10 | rn << 5 | rd); }
     pub fn subs(&mut self, rd: Reg, rn: Reg, rm: Reg) { self.e(0x6b00_0000 | rm << 16 | rn << 5 | rd); }
     pub fn cmp(&mut self, rn: Reg, rm: Reg) { self.subs(ZR, rn, rm); }
+    pub fn cmp_x(&mut self, rn: Reg, rm: Reg) { self.e(0xeb00_0000 | rm << 16 | rn << 5 | ZR); }
     pub fn neg(&mut self, rd: Reg, rm: Reg) { self.sub(rd, ZR, rm); }
     pub fn and(&mut self, rd: Reg, rn: Reg, rm: Reg) { self.e(0x0a00_0000 | rm << 16 | rn << 5 | rd); }
     pub fn orr(&mut self, rd: Reg, rn: Reg, rm: Reg) { self.e(0x2a00_0000 | rm << 16 | rn << 5 | rd); }
@@ -184,6 +185,7 @@ impl Asm {
     pub fn b_cond(&mut self, c: Cond, l: Label) { self.fixups.push((self.code.len(), l.0, Fix::B19)); self.e(0x5400_0000 | c as u32); }
     pub fn cbz(&mut self, rt: Reg, l: Label) { self.fixups.push((self.code.len(), l.0, Fix::B19)); self.e(0x3400_0000 | rt); }
     pub fn cbnz(&mut self, rt: Reg, l: Label) { self.fixups.push((self.code.len(), l.0, Fix::B19)); self.e(0x3500_0000 | rt); }
+    pub fn cbz_x(&mut self, rt: Reg, l: Label) { self.fixups.push((self.code.len(), l.0, Fix::B19)); self.e(0xb400_0000 | rt); }
     pub fn cbnz_x(&mut self, rt: Reg, l: Label) { self.fixups.push((self.code.len(), l.0, Fix::B19)); self.e(0xb500_0000 | rt); }
     /// `tbz xt, #bit, label` (bit may be up to 63 — the test is on the 64-bit register)
     pub fn tbz(&mut self, rt: Reg, bit: u32, l: Label) { let at = self.code.len(); self.e(0x3600_0000 | (bit >> 5) << 31 | (bit & 31) << 19 | rt); self.tb_fix(at, l); }
