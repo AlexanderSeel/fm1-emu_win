@@ -944,6 +944,72 @@ only: ~20x), ZP-12 3.42 -> 7.68x / 1.28 -> 2.01x, OberVave 2.87 -> 4.35x / 1.28 
 JIT, +11.6% interpreted, none below 0.98x. The dual-core firmwares (stock, Open, X0X, Jiant, ...)
 skip nothing: within cpu0's 1024-instruction slices their probes find no round worth it.
 
+## 5.32 Generated code that stays in generated code: returns through a pc table, swapped pairs, RAM guards inline, then-parts (2026-10-23)
+
+The generated-code items of 5.27's JIT review, on top of 5.30, in both native backends (AArch64
+and x86-64, op for op):
+
+- Returns and computed jumps (rts, `call R`, `goto R`, a pop into pc, a table jump, a jump
+  through the executor) look their target up in a direct-mapped table of compiled bodies
+  (`Jit::itab`, 16 K entries by pc >> 1) and jump straight in, instead of always leaving for
+  Rust. The body checks what a chain target checks (its whole prefix fits the call's limit, its
+  RAM snapshot); after a bus access brk is checked first. `call R` / `goto R` are compiled
+  inline. A pop with pc in its mask that falls through the executor now checks brk before it
+  chains on. FM1-DOOM +15%, Felucca +19%.
+  - A body goes in when it compiles, and again when an exit to it comes back to Rust after a
+    later body on the same entry took its place (markterm's #47 fills its dynamic-jump table
+    that way, `set_dyn`). Without the refill an evicted hot return target stayed out for good:
+    58% of GhoulBox's entries from Rust, 35% of Felucca's. GhoulBox +7-12%, Felucca +4-6%.
+  - An empty entry's tag is the pc of another entry (`(i ^ 1) << 1`), so no target matches it.
+    It was all ones, and a computed jump to 0xffff_ffff (an erased-flash function pointer, a
+    trashed rets) branched the host to address 0 (SIGSEGV) where the interpreter goes on.
+- `Fast::Swap` compiled: the second instruction (both ticks taken), then the head, then one
+  check. After the pair the careful path stops for a pending interrupt; compiled code does too
+  (`h_pair`, called only when brk is set or `Ctx::irq` is not known to be clear: helpers mark it
+  unknown, since only the bus changes it; asking the bus in every helper cost ZP-12 10%).
+  FM1-DOOM +18%.
+- RAM bodies compare the bus's code-write count (`Ctx::ver`, `RamGuard::ver`) inline and call
+  `h_ram_ok` only when it changed: a code write sets brk, so the count cannot change while
+  compiled code runs. Melodee +23%.
+- Compiled prefixes inside an if-else then-part or a rep loop (one of the two in progress,
+  nothing else), when no instruction but the last can end it: then-part ends at or past the
+  prefix's end, the rep end not in it or at its end. Capped at that prefix; run_fast applies
+  `finish`'s rule for the last instruction and the careful path's stop; the chain slot is
+  linked before the skip. Pairs inside: no stop after a swapped pair there (`Ctx::inside`), no
+  glued head that may use the bus. GhoulBox +27%.
+- If-else blocks compiled with their then-part (plain ops), as the wasm JIT does: not taken, on
+  at the else part; taken, the then-part and past the else part, stopping for a pending
+  interrupt there; an exit inside the then-part leaves the skip for `pred_skips` (`Ctx::pred`).
+  Inside another construct the ops before the if run instead (a second compiled variant).
+  FM1-DOOM +21%, ZP-12 +16%.
+- markterm's #46: the rest of routes 18 / 19 / 32 (loads and stores that update their base) as
+  micro-ops: route 18's pre-increments as `LdPre` / `StPre`, route 32 as `LdPre` / `StPre` /
+  `LdPostR` / `StPostR` (raw: a high-half store, an access of the base register itself), with
+  inline lowerings in both native backends (the wasm JIT reaches them through `h_op`, as it did
+  the raw route). 5.30's rule stays: a post-increment load into its own base is raw. The random
+  test against exec_raw's arm now covers all three routes and requires each form to come up.
+  Melodee and Felucca about +2%.
+
+Exactness: all 82 catalog firmwares, the stock one and FM1 Open, JIT and interpreted, 8 s with
+keys: byte-identical to master before 5.30, and JIT == interpreter on all 84, with every change
+above; after the rebase onto 5.31, FM1-DOOM, ZP-12, Felucca, Melodee, GhoulBox and the stock one
+again. x86-64: the fm1-core / fm1-soc / fm1-isa tests in an amd64 Linux container (the encoder
+test with the new encodings checked against llvm-mc), and before the refill and #46 an audio
+comparison under qemu-x86_64 on twelve firmwares (x86 JIT == x86 interpreter == AArch64);
+`cargo check` for wasm32.
+New tests: the table (rts, goto R, call R, a pop: into the body, not past the limit, nothing
+there, a due tick, changed code, a jump to all ones, an evicted body listed again), compiled
+swapped pairs against the pair rule, run_fast differential tests with a clock and interrupts
+(swapped pairs; prefixes inside then-parts and rep loops), the inline RAM guard, if-else blocks
+against the careful path, routes 18 / 19 / 32 against the raw arm; each fails with the rule it
+checks removed. Speed (this Mac, shared with other benchmarks): the whole catalog, one
+interleaved run each, against master before 5.30: JIT geomean +36% (5.30 and this together),
+interpreted +5%. Against master with 5.31, best of 2 (JIT / interpreted): FM1-DOOM 6.19 -> 9.20x
+/ 2.97 -> 2.98x, GhoulBox 3.58 -> 5.71x / 1.35 -> 1.39x, Felucca 5.52 -> 7.55x / 1.40 -> 1.42x,
+Melodee 4.23 -> 5.76x / 1.43 -> 1.32x, ZP-12 8.72 -> 10.23x / 1.95 -> 2.00x, stock 6.42 -> 7.25x
+/ 4.44 -> 4.49x. Melodee interpreted moves between 1.23x and 1.46x from one commit of this
+branch to the next (it is at master's speed on some), a code layout effect in run_fast.
+
 ## 6. Phase 5 — Boot & integration
 
 - Boot stock firmware to a stable idle/main-loop state.
