@@ -69,6 +69,8 @@ pub struct Unpacked {
     pub xip: Vec<u8>,
     /// Where the app area starts in flash (XIP 0x02000000 maps here).
     pub area: usize,
+    /// The app area's size (its head's), from `area`.
+    pub size: usize,
     /// The app area's directory: app.bin (offset in the area), the reserved areas VM, PRCT,
     /// BTIF, USR (flash offsets).
     pub dir: Vec<Head>,
@@ -232,7 +234,7 @@ fn unpack_n(file: &[u8], blocks: usize) -> Result<Unpacked, String> {
     if !dir.iter().any(|h| h.name == "app.bin") {
         return Err("no app.bin in the app area".into());
     }
-    Ok(Unpacked { identity: String::new(), raw, xip: flash[area..].to_vec(), area, dir, key })
+    Ok(Unpacked { identity: String::new(), raw, xip: flash[area..].to_vec(), area, size, dir, key })
 }
 
 /// The SMK-37's factory calibration record (USRTRIM, flash 0xC1000; fm1-to-smk37 docs/01, 2.1):
