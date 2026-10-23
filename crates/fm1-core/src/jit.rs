@@ -26,7 +26,7 @@
 //!   pc is stored at exit.
 
 #[cfg(target_arch = "aarch64")]
-use crate::jit_a64::{Asm, Cond as AC, Label, Reg, SP};
+use crate::jit_a64::{Asm, Cond as AC, Label, Reg, SP, ZR};
 #[cfg(target_arch = "aarch64")]
 use crate::{Base, Cond, Op, RmwOp};
 use crate::{Bus, Cpu, Fast};
@@ -213,6 +213,8 @@ pub struct Jit {
     /// computed jumps' targets: pc -> compiled body, direct-mapped by pc (`Gen::ind`); a body
     /// is entered from it as from a chain slot (it checks the limit and its RAM snapshot)
     itab: Box<[ITab]>,
+    /// compile the checks for `Cpu::stop_pc` / `stop_io` at each body's entry (`Cpu::stop_checks`)
+    pub(crate) stops: bool,
 }
 
 /// An `itab` entry (generated code reads it: pc at 0, body at 8).
@@ -261,6 +263,9 @@ pub(crate) struct Prefix {
     /// it may run inside a then-part or rep loop (`Cpu::prefix_inside`): no glued pair whose
     /// head may use the bus (compiled code could leave between the two), no if-else block
     inside_ok: bool,
+    /// it is its block whole, no then-part in tow: a runner's stretch may run on from it
+    /// (`Cpu::stop_pc`)
+    pub whole: bool,
 }
 
 // SAFETY: the code cache and the compiled entries are owned by one Cpu and only used by the
@@ -279,7 +284,7 @@ const HOT: u32 = 32;
 impl Jit {
     pub fn new(profile: bool) -> Option<Jit> {
         let itab = (0..1 << ITAB_BITS).map(itab_empty).collect();
-        Some(Jit { cache: CodeCache::new(64 << 20)?, state: Vec::new(), guards: Vec::new(), profile, itab })
+        Some(Jit { cache: CodeCache::new(64 << 20)?, state: Vec::new(), guards: Vec::new(), profile, itab, stops: false })
     }
 
     /// Will `entry` compile block `id` on its next call? (Then `Cpu::then_of` looks for the
@@ -323,11 +328,12 @@ impl Jit {
                 let then = then.filter(|_| plen + 1 == ops.len() && matches!(ops[plen].fast, Fast::IfBlk { has_else: true, .. }) && !ops[plen].pair_head);
                 let with_if = then.is_some();
                 let plen = plen + with_if as usize;
-                let e = match self.compile_prefix::<B>(&ops[..plen], swaps, then.unwrap_or(&[]), pc0, mem, table, true) {
+                let whole = plen == ops.len() && !with_if;
+                let e = match self.compile_prefix::<B>(&ops[..plen], swaps, then.unwrap_or(&[]), pc0, mem, table, true, whole) {
                     None => Entry::No,
                     Some(p) if !with_if => Entry::Code(p, Some(p).filter(|p| p.inside_ok)),
                     // (the ops before the if-else block, for runs inside a construct)
-                    Some(p) => Entry::Code(p, self.compile_prefix::<B>(&ops[..plen - 1], swaps, &[], pc0, mem, false, false).filter(|q| q.inside_ok)),
+                    Some(p) => Entry::Code(p, self.compile_prefix::<B>(&ops[..plen - 1], swaps, &[], pc0, mem, false, false, false).filter(|q| q.inside_ok)),
                 };
                 self.state[id] = e;
                 match e {
@@ -342,12 +348,13 @@ impl Jit {
     /// over RAM may go in the computed jumps' table; `listed`: it goes there at all (the block's
     /// own prefix: a pc has one body there).
     #[allow(clippy::too_many_arguments)]
-    fn compile_prefix<B: Bus>(&mut self, ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], then: &[crate::BOp], pc0: u32, mem: &JitMem, table: bool, listed: bool) -> Option<Prefix> {
+    fn compile_prefix<B: Bus>(&mut self, ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], then: &[crate::BOp], pc0: u32, mem: &JitMem, table: bool, listed: bool, whole: bool) -> Option<Prefix> {
         if ops.is_empty() {
             return None;
         }
         let itab = self.itab.as_ptr() as u64;
-        let (code, body) = compile::<B>(ops, swaps, then, pc0, mem, &mut self.guards, self.profile, itab)?;
+        let stops = self.stops.then_some(whole);
+        let (code, body) = compile::<B>(ops, swaps, then, pc0, mem, &mut self.guards, self.profile, itab, stops)?;
         let p = self.cache.write(&code)?;
         // SAFETY: body is a byte offset inside the code just written
         let body = unsafe { p.add(body) };
@@ -360,6 +367,7 @@ impl Jit {
             insns: insns(ops) + then.len() as u32,
             end: pc0 + ops.iter().map(|o| o.len as u32).sum::<u32>(),
             inside_ok: !ops.iter().any(|o| (o.glue && !o.fast.reg_only()) || (o.careful && !matches!(o.fast, Fast::Swap { .. }))),
+            whole,
         })
     }
 
@@ -462,6 +470,7 @@ fn h_read<B: Bus>(ctx: *mut Ctx, addr: u32, idx: u32, w: u32) -> u32 {
     let ctx = unsafe { &mut *ctx };
     let bus = unsafe { &mut *(ctx.bus as *mut B) };
     unsafe { sync(ctx, bus, idx) };
+    stop_io(ctx);
     let v = match w {
         1 => bus.read8(addr) as u32,
         2 => bus.read16(addr) as u32,
@@ -481,6 +490,7 @@ fn h_write<B: Bus>(ctx: *mut Ctx, addr: u32, v: u32, idx: u32, w: u32) {
     let ctx = unsafe { &mut *ctx };
     let bus = unsafe { &mut *(ctx.bus as *mut B) };
     unsafe { sync(ctx, bus, idx) };
+    stop_io(ctx);
     match w {
         1 => bus.write8(addr, v as u8),
         2 => bus.write16(addr, v as u16),
@@ -503,6 +513,9 @@ fn h_op<B: Bus, const PROF: bool>(ctx: *mut Ctx, op: *const Fast, idx: u32, next
     let bus = unsafe { &mut *(ctx.bus as *mut B) };
     let cpu = unsafe { &mut *ctx.cpu };
     unsafe { sync(ctx, bus, idx) };
+    if cpu.stop_pc != 0 {
+        cpu.stop_io = 1;
+    }
     if PROF {
         cpu.profile_helper(unsafe { &*op });
     }
@@ -636,6 +649,30 @@ struct Gen<'a> {
     h_pair: u64,
     /// `Jit::itab`'s address
     itab: u64,
+    /// the runner's stop checks are compiled (`Jit::stops`)
+    stops: bool,
+    rc: RegCache,
+}
+
+/// Guest registers kept in host registers within a block. `ld_reg` loads one into its host
+/// register at its first use and `st_reg` only marks it changed; whatever leaves the block's
+/// straight line writes the changed ones back first: an exit or a chain (`flush`), and a helper
+/// call, which reloads them afterwards (`call`: the helper may read or set any of them, and the
+/// pool is caller-saved). An op's lowering branches only to leave, so every path through a block
+/// sees the same assignment. (Each operand was a load and each result a store, and audio code
+/// feeds one op's result straight into the next: the store-to-load wait was most of its time.)
+#[cfg(target_arch = "aarch64")]
+const POOL: [Reg; 8] = [5, 6, 7, 8, 14, 15, 16, 17];
+#[cfg(target_arch = "aarch64")]
+#[derive(Default)]
+struct RegCache {
+    /// the guest register each pool register holds
+    guest: [Option<u8>; 8],
+    /// changed since it was loaded (memory is behind)
+    dirty: [bool; 8],
+    /// last use, for choosing which to give up when all are taken
+    used: [u32; 8],
+    clock: u32,
 }
 
 fn off_reg(r: u8) -> u32 {
@@ -646,6 +683,27 @@ fn off_sp() -> u32 {
 }
 fn off_rets() -> u32 {
     std::mem::offset_of!(Cpu, rets) as u32
+}
+/// A runner's stop is set (`Cpu::stop_pc`): this access may reach a peripheral.
+fn stop_io(ctx: &mut Ctx) {
+    // SAFETY: ctx.cpu is the live Cpu `run` was given.
+    let cpu = unsafe { &mut *ctx.cpu };
+    if cpu.stop_pc != 0 {
+        cpu.stop_io = 1;
+    }
+}
+#[cfg(target_arch = "aarch64")]
+fn off_ie() -> u32 {
+    std::mem::offset_of!(Cpu, ie) as u32
+}
+fn off_stop_pc() -> u32 {
+    std::mem::offset_of!(Cpu, stop_pc) as u32
+}
+fn off_stop_io() -> u32 {
+    std::mem::offset_of!(Cpu, stop_io) as u32
+}
+fn off_stop_rest() -> u32 {
+    std::mem::offset_of!(Cpu, stop_rest) as u32
 }
 fn off_hold() -> u32 {
     std::mem::offset_of!(Cpu, hold_irq) as u32
@@ -693,11 +751,70 @@ impl Gen<'_> {
             self.a.cmp(x, y);
         }
     }
+    /// w = guest register r (see `RegCache`)
     fn ld_reg(&mut self, w: Reg, r: u8) {
-        self.a.ldr(w, CPU, off_reg(r));
+        let r = r & 15;
+        let i = match self.slot(r) {
+            Some(i) => i,
+            None => {
+                let i = self.take_slot(r);
+                self.a.ldr(POOL[i], CPU, off_reg(r));
+                i
+            }
+        };
+        self.a.mov(w, POOL[i]);
     }
+    /// guest register r = w (see `RegCache`)
     fn st_reg(&mut self, w: Reg, r: u8) {
-        self.a.str(w, CPU, off_reg(r));
+        let r = r & 15;
+        let i = match self.slot(r) {
+            Some(i) => i,
+            None => self.take_slot(r),
+        };
+        self.a.mov(POOL[i], w);
+        self.rc.dirty[i] = true;
+    }
+    /// The pool register holding r, if one does (counted as a use).
+    fn slot(&mut self, r: u8) -> Option<usize> {
+        let i = self.rc.guest.iter().position(|&g| g == Some(r))?;
+        self.rc.clock += 1;
+        self.rc.used[i] = self.rc.clock;
+        Some(i)
+    }
+    /// A pool register for r: a free one, else the least recently used, written back if changed.
+    fn take_slot(&mut self, r: u8) -> usize {
+        let i = match self.rc.guest.iter().position(|g| g.is_none()) {
+            Some(i) => i,
+            None => {
+                let i = (0..POOL.len()).min_by_key(|&i| self.rc.used[i]).unwrap();
+                if self.rc.dirty[i] {
+                    self.a.str(POOL[i], CPU, off_reg(self.rc.guest[i].unwrap()));
+                }
+                i
+            }
+        };
+        self.rc.clock += 1;
+        self.rc.guest[i] = Some(r);
+        self.rc.dirty[i] = false;
+        self.rc.used[i] = self.rc.clock;
+        i
+    }
+    /// Write the changed guest registers back. The assignment stays as it is: after a side exit
+    /// the straight line goes on with them still in their host registers.
+    fn flush(&mut self) {
+        for i in 0..POOL.len() {
+            if let (Some(r), true) = (self.rc.guest[i], self.rc.dirty[i]) {
+                self.a.str(POOL[i], CPU, off_reg(r));
+            }
+        }
+    }
+    /// Load the held guest registers again (after a call: the pool is caller-saved).
+    fn reload(&mut self) {
+        for i in 0..POOL.len() {
+            if let Some(r) = self.rc.guest[i] {
+                self.a.ldr(POOL[i], CPU, off_reg(r));
+            }
+        }
     }
     /// w(dst) = w(src) + imm (any 32-bit immediate)
     fn add_imm(&mut self, dst: Reg, src: Reg, imm: u32) {
@@ -743,12 +860,16 @@ impl Gen<'_> {
             }
         }
     }
+    /// Call a helper with the guest registers in memory, where it reads and sets them.
     fn call(&mut self, f: u64) {
+        self.flush();
         self.a.mov64(9, f);
         self.a.blr(9);
+        self.reload();
     }
     /// Leave with pc = imm, `count` instructions of this block done.
     fn exit_imm(&mut self, pc: u32, count: u32) {
+        self.flush();
         self.a.mov32(9, pc);
         self.a.str(9, CPU, off_pc());
         self.a.add_imm(0, DONE, count);
@@ -757,6 +878,7 @@ impl Gen<'_> {
     /// Continue at a fixed pc: straight into its compiled body when the slot holds one,
     /// else back to Rust, which fills the slot once that block is compiled.
     fn chain(&mut self, pc: u32, count: u32) {
+        self.flush();
         let slot: &'static mut u64 = Box::leak(Box::new(0u64));
         let back = self.a.label();
         self.a.add_imm(DONE, DONE, count);
@@ -779,6 +901,8 @@ impl Gen<'_> {
     /// `ind` after an instruction that may have used the bus (`brk`): first leave if the next
     /// tick is due (or a code word was written), as `check_brk` does.
     fn ind_brk(&mut self, reg: Reg, count: u32, brk: bool) {
+        // (either way out: the target's body, or Rust, finds the registers in memory)
+        self.flush();
         let back = self.a.label();
         self.a.mov(12, reg);
         self.a.add_imm(DONE, DONE, count);
@@ -878,22 +1002,33 @@ impl Gen<'_> {
         self.a.bind(done);
     }
 
-    /// After an instruction that may have called the bus: leave if the next tick is due.
-    fn check_brk_hold(&mut self, next_pc: u32, count: u32) {
+    /// After an instruction that may have called the bus: leave if the next tick is due (or
+    /// code was written), `rest` instructions before the block's end (`Cpu::stop_rest`).
+    fn check_brk_hold(&mut self, next_pc: u32, count: u32, rest: u32) {
         let go = self.a.label();
         self.a.ldr(9, CTX, OFF_BRK);
         self.a.cbz(9, go);
         self.a.mov32(9, 1);
         self.a.str(9, CPU, off_hold());
+        self.rest(rest);
         self.exit_imm(next_pc, count);
         self.a.bind(go);
     }
-    fn check_brk(&mut self, next_pc: u32, count: u32) {
+    fn check_brk(&mut self, next_pc: u32, count: u32, rest: u32) {
         let go = self.a.label();
         self.a.ldr(9, CTX, OFF_BRK);
         self.a.cbz(9, go);
+        self.rest(rest);
         self.exit_imm(next_pc, count);
         self.a.bind(go);
+    }
+    /// Leaving `rest` instructions before the block's end: a runner's stretch learns where the
+    /// block's call ends (`Cpu::stop_rest`).
+    fn rest(&mut self, rest: u32) {
+        if self.stops && rest > 0 {
+            self.a.mov32(9, rest);
+            self.a.str(9, CPU, off_stop_rest());
+        }
     }
     /// Inside an if-else block's then-part, after an op that may have used the bus: leave if
     /// the next tick is due, with the skip (te, ee) for `Cpu::pred_skips` (`Ctx::pred`).
@@ -925,13 +1060,15 @@ impl Gen<'_> {
     /// (or a code word was written), or an interrupt is pending (then `run_fast` stops:
     /// `Ctx::stop`). Nothing to call while neither brk is set nor `Ctx::irq` (none pending,
     /// known since the last helper).
-    fn check_pair(&mut self, next_pc: u32, count: u32) {
+    /// (`rest`: instructions left in the block, as `check_brk`)
+    fn check_pair(&mut self, next_pc: u32, count: u32, rest: u32) {
         let go = self.a.label();
         self.a.ldr_x(9, CTX, OFF_BRK); // brk | irq << 32
         self.a.cbz_x(9, go);
         self.a.mov_x(0, CTX);
         self.call(self.h_pair);
         self.a.cbz(0, go);
+        self.rest(rest);
         self.exit_imm(next_pc, count);
         self.a.bind(go);
     }
@@ -1374,6 +1511,84 @@ fn emit_op<B: Bus>(g: &mut Gen, fast: Fast, idx: u32, next_pc: u32, profile: boo
             g.a.str(0, CPU, off_sp());
             g.ind_brk(KEEP, count, true);
         }
+        Fast::Un { d, s, k } => {
+            g.ld_reg(0, s);
+            match k {
+                0 => g.a.mvn(0, 0),
+                1 => g.a.neg(0, 0),
+                // (i32::MIN stays i32::MIN, as wrapping_abs)
+                2 => {
+                    g.a.cmp_imm(0, 0);
+                    g.a.cneg(0, 0, AC::Lt);
+                }
+                3 => g.a.rev(0, 0),
+                4 => g.a.clz(0, 0),
+                5 => {
+                    g.a.mov32(1, 32767);
+                    g.a.cmp(0, 1);
+                    g.a.csel(0, 1, 0, AC::Gt);
+                    g.a.mov32(1, (-32768i32) as u32);
+                    g.a.cmp(0, 1);
+                    g.a.csel(0, 1, 0, AC::Lt);
+                }
+                _ => {
+                    g.a.cmp_imm(0, 0);
+                    g.a.csel(0, ZR, 0, AC::Lt);
+                    g.a.mov32(1, 65535);
+                    g.a.cmp(0, 1);
+                    g.a.csel(0, 1, 0, AC::Gt);
+                }
+            }
+            g.st_reg(0, d);
+        }
+        Fast::Div { d, a, b, k } => {
+            // sdiv / udiv give 0 for a divisor of 0 and i32::MIN for i32::MIN / -1, as the
+            // interpreter; a remainder is a - q * b, and 0 for a divisor of 0
+            g.ld_reg(0, a);
+            g.ld_reg(1, b);
+            if k == 0 || k == 2 {
+                g.a.sdiv(2, 0, 1);
+            } else {
+                g.a.udiv(2, 0, 1);
+            }
+            if k >= 2 {
+                g.a.msub(2, 2, 1, 0);
+                g.a.cmp_imm(1, 0);
+                g.a.csel(2, ZR, 2, AC::Eq);
+            }
+            g.st_reg(2, d);
+        }
+        // (`sti` stays with the executor: it opens the bus's interrupt window)
+        Fast::SetIe { on: false } if off_ie() < 4096 => g.a.strb(ZR, CPU, off_ie()),
+        Fast::LdPair { p, b, off } => {
+            match b {
+                Base::Reg(r) => g.ld_reg(0, r),
+                Base::Sp => g.a.ldr(0, CPU, off_sp()),
+            }
+            // (the address kept across both loads, as the interpreter takes it before either)
+            g.add_imm(KEEP, 0, off);
+            g.a.mov(0, KEEP);
+            g.load(4, false, idx);
+            g.st_reg(0, 2 * (p & 7));
+            g.add_imm(0, KEEP, 4);
+            g.load(4, false, idx);
+            g.st_reg(0, 2 * (p & 7) + 1);
+            bus_used = true;
+        }
+        Fast::StPair { p, b, off } => {
+            match b {
+                Base::Reg(r) => g.ld_reg(0, r),
+                Base::Sp => g.a.ldr(0, CPU, off_sp()),
+            }
+            g.add_imm(KEEP, 0, off);
+            g.a.mov(0, KEEP);
+            g.ld_reg(1, 2 * (p & 7));
+            g.store(4, idx);
+            g.add_imm(0, KEEP, 4);
+            g.ld_reg(1, 2 * (p & 7) + 1);
+            g.store(4, idx);
+            bus_used = true;
+        }
         // ---- everything else: the interpreter's executor for this one op
         other => {
             let p: &'static Fast = Box::leak(Box::new(other));
@@ -1390,7 +1605,7 @@ fn emit_op<B: Bus>(g: &mut Gen, fast: Fast, idx: u32, next_pc: u32, profile: boo
             if other.may_jump() {
                 // a jump through the interpreter (`pop` with pc in its mask) that fell
                 // through: leave first if the next tick is due, as after any bus access
-                g.check_brk(next_pc, count);
+                g.check_brk(next_pc, count, 0);
                 g.chain(next_pc, count);
             }
         }
@@ -1401,8 +1616,8 @@ fn emit_op<B: Bus>(g: &mut Gen, fast: Fast, idx: u32, next_pc: u32, profile: boo
 /// Native code for a block prefix of plain micro-ops (none careful), and its body's offset.
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_arguments)]
-fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], then: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<Box<RamGuard>>, profile: bool, itab: u64) -> Option<(Vec<u8>, usize)> {
-    for o in [off_reg(15), off_sp(), off_rets(), off_pc(), off_hold()] {
+fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], then: &[crate::BOp], pc0: u32, mem: &JitMem, guards: &mut Vec<Box<RamGuard>>, profile: bool, itab: u64, stops: Option<bool>) -> Option<(Vec<u8>, usize)> {
+    for o in [off_reg(15), off_sp(), off_rets(), off_pc(), off_hold(), off_stop_pc(), off_stop_io(), off_stop_rest()] {
         if o >= 16384 {
             return None;
         }
@@ -1417,6 +1632,8 @@ fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], then: &[crate
         h_write: h_write::<B> as *const () as u64,
         h_pair: h_pair::<B> as *const () as u64,
         itab,
+        stops: stops.is_some(),
+        rc: RegCache::default(),
     };
     // prologue (entry from Rust); chained blocks enter at the body
     g.a.stp_pre(29, 30, SP, -FRAME);
@@ -1433,6 +1650,32 @@ fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], then: &[crate
     g.a.mov_x(FLAGS, 5);
     g.a.movz(DONE, 0, 0);
     let body = g.a.here();
+    // a runner's stretch (`Cpu::stop_pc`): entered after the call's first block, from the end
+    // of a block compiled whole, this is where one of the runner's calls ends. Back to Rust
+    // here when the runner could decide otherwise from here on: the stop lies in this block,
+    // a helper may have reached a peripheral, the stretch is spent (`STRETCH_ROOM` short of
+    // the limit), or this block isn't compiled whole (its rest runs interpreted)
+    if let Some(whole) = stops {
+        let (go, stop) = (g.a.label(), g.a.label());
+        g.a.cbz(DONE, go);
+        g.a.ldr(9, CPU, off_stop_pc());
+        g.a.cbz(9, go);
+        if whole {
+            let bytes: u32 = ops.iter().map(|o| o.len as u32).sum();
+            g.a.mov32(10, pc0);
+            g.a.sub(9, 9, 10);
+            g.a.cmp_imm(9, bytes);
+            g.a.b_cond(AC::Lo, stop);
+            g.a.ldr(9, CPU, off_stop_io());
+            g.a.cbnz(9, stop);
+            g.a.add_imm(9, DONE, crate::STRETCH_ROOM);
+            g.a.cmp(9, LIMIT);
+            g.a.b_cond(AC::Lo, go);
+        }
+        g.a.bind(stop);
+        g.exit_imm(pc0, 0);
+        g.a.bind(go);
+    }
     // the whole prefix must fit the call's limit, else back to Rust before running any of it
     {
         let fits = g.a.label();
@@ -1479,7 +1722,7 @@ fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], then: &[crate
             let mid = pc + hlen as u32;
             emit_op::<B>(&mut g, tail, ins + 1, next_pc, profile);
             emit_op::<B>(&mut g, head, ins, mid, profile);
-            g.check_pair(next_pc, ins + 2);
+            g.check_pair(next_pc, ins + 2, insns(ops) - (ins + 2));
             ins += 2;
             pc = next_pc;
             continue;
@@ -1504,7 +1747,7 @@ fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], then: &[crate
                 (tpc, j) = (tnext, j + 1);
             }
             if !then.is_empty() {
-                g.check_pair(ee, j);
+                g.check_pair(ee, j, 0);
             }
             g.chain(ee, j);
             ins = j;
@@ -1512,11 +1755,12 @@ fn compile<B: Bus>(ops: &[crate::BOp], swaps: &[(Fast, Fast, u8)], then: &[crate
         }
         let bus_used = emit_op::<B>(&mut g, op.fast, ins, next_pc, profile);
         if bus_used && !op.fast.may_jump() {
+            let rest = insns(ops) - (ins + 1);
             if op.glue {
                 // leaving between a glued pair's two instructions: interrupts wait for the second
-                g.check_brk_hold(next_pc, ins + 1);
+                g.check_brk_hold(next_pc, ins + 1, rest);
             } else {
-                g.check_brk(next_pc, ins + 1);
+                g.check_brk(next_pc, ins + 1, rest);
             }
         }
         ins += 1;
@@ -1547,10 +1791,12 @@ mod tests {
     /// 256 bytes of RAM at 0 (no XIP); a word read at `MMIO` and up gives `mmio`, and makes the
     /// next tick due when `due_on_mmio` (a peripheral touched, as the Soc does).
     /// (`irq`: an interrupt pending; a write at `MMIO` and up sets it from the value's bit 0)
-    struct Memory { data: Vec<u8>, flags: Vec<u8>, version: u64, mmio: u32, due_on_mmio: bool, due: bool, irq: bool }
+    /// (`quiet`: writes don't count as code writes, which would end a block after each)
+    struct Memory { data: Vec<u8>, flags: Vec<u8>, version: u64, mmio: u32, due_on_mmio: bool, due: bool, irq: bool, quiet: bool }
     const MMIO: u32 = 0x1000;
     impl Memory {
-        fn new() -> Self { Self { data: vec![0; 256], flags: vec![1; 65], version: 0, mmio: 0, due_on_mmio: false, due: false, irq: false } }
+        fn new() -> Self { Self { data: vec![0; 256], flags: vec![1; 65], version: 0, mmio: 0, due_on_mmio: false, due: false, irq: false, quiet: false } }
+        fn wrote(&mut self) { if !self.quiet { self.version += 1; } }
     }
     impl Bus for Memory {
         fn read8(&mut self, a: u32) -> u8 { self.data[a as usize] }
@@ -1568,10 +1814,10 @@ mod tests {
                 (self.irq, self.due) = (v & 1 != 0, self.due || self.due_on_mmio);
                 return;
             }
-            self.data[a as usize] = v; self.version += 1;
+            self.data[a as usize] = v; self.wrote();
         }
-        fn write16(&mut self, a: u32, v: u16) { self.data[a as usize..a as usize+2].copy_from_slice(&v.to_le_bytes()); self.version += 1; }
-        fn write32(&mut self, a: u32, v: u32) { self.data[a as usize..a as usize+4].copy_from_slice(&v.to_le_bytes()); self.version += 1; }
+        fn write16(&mut self, a: u32, v: u16) { self.data[a as usize..a as usize+2].copy_from_slice(&v.to_le_bytes()); self.wrote(); }
+        fn write32(&mut self, a: u32, v: u32) { self.data[a as usize..a as usize+4].copy_from_slice(&v.to_le_bytes()); self.wrote(); }
         fn tick_room(&self) -> u64 { 1000 }
         fn next_tick_due(&self) -> bool { self.due }
         fn irq_pending(&self) -> bool { self.irq }
@@ -1860,7 +2106,7 @@ mod tests {
             (cpu.regs[8], cpu.regs[9], cpu.regs[2]) = (64 + 4 * (rnd() % 16), MMIO, rnd());
             let mut e = Cpu::new(0);
             e.regs = cpu.regs;
-            let mut reference = Memory { data: bus.data.clone(), flags: bus.flags.clone(), version: 0, mmio: 0, due_on_mmio: bus.due_on_mmio, due: false, irq: bus.irq };
+            let mut reference = Memory { data: bus.data.clone(), flags: bus.flags.clone(), version: 0, mmio: 0, due_on_mmio: bus.due_on_mmio, due: false, irq: bus.irq, quiet: false };
             // the careful path: the if (nothing in progress), then its then-part while one is
             let (mut k, mut stop) = (1, false);
             let (mut still, _) = e.exec_careful(&mut reference, block[0].fast, false, false, 2);
@@ -1886,17 +2132,123 @@ mod tests {
         }
     }
 
+    /// Blocks of several ops over all 16 registers (more than the AArch64 code keeps in host
+    /// registers, so some are given up and taken again mid-block), loads and stores among them,
+    /// against the interpreter running the same ops one after another.
+    #[test]
+    fn compiled_blocks_match_interpreter() {
+        use crate::Op;
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = move || { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; seed as u32 };
+        let ops = [Op::Add, Op::Sub, Op::RSub, Op::Or, Op::Xor, Op::And, Op::AndNot, Op::Mul, Op::Shl, Op::Shr, Op::Sar];
+        let mut jit = Jit::new(false).unwrap();
+        for case in 0..3000usize {
+            // results go to 0..7 and 12..15: 8..11 keep pointing into the test RAM (8..10 bases, 11 an index)
+            let dst = |x: u32| { let d = (x % 12) as u8; if d < 8 { d } else { d + 4 } };
+            let mut block = vec![];
+            for _ in 0..(2 + rnd() % 14) {
+                let (a, b, c) = (rnd(), rnd(), rnd());
+                let d = dst(a);
+                let s1 = (b % 16) as u8;
+                let s2 = (c % 16) as u8;
+                let base = 8 + (b % 3) as u8;
+                let w = [1u8, 2, 4][(c % 3) as usize];
+                let p = [0u8, 1, 2, 3, 6, 7][(b % 6) as usize];
+                block.push(match rnd() % 16 {
+                    12 => Fast::Un { d, s: s1, k: (c % 7) as u8 },
+                    13 => Fast::Div { d, a: s1, b: s2, k: (c % 4) as u8 },
+                    14 => Fast::LdPair { p, b: Base::Reg(base), off: 4 * (c % 4) },
+                    15 => Fast::StPair { p, b: if a & 1 != 0 { Base::Sp } else { Base::Reg(base) }, off: 4 * (c % 4) },
+                    0 => Fast::Alu3 { d, a: s1, b: s2, op: ops[(a >> 8) as usize % ops.len()] },
+                    1 => Fast::Alu3I { d, a: s1, v: c, op: ops[(a >> 8) as usize % ops.len()] },
+                    2 => Fast::Alu2 { d, b: s2, op: ops[(a >> 8) as usize % ops.len()] },
+                    3 => Fast::Mov { d, s: s1 },
+                    4 => Fast::MovI { d, v: c },
+                    5 => Fast::AddRI { d, s: s1, v: c },
+                    6 => Fast::Ld { d, b: Base::Reg(base), off: c % 8, w, signed: a & 1 != 0 },
+                    7 => Fast::St { s: s1, b: Base::Reg(base), off: c % 8, w },
+                    8 => Fast::LdW { d, b: 8, off: 4 * (c % 4) },
+                    9 => Fast::StW { s: s1, b: 8, off: 4 * (c % 4) },
+                    10 => Fast::LdPost { d, b: base, w, signed: false, inc: 2 },
+                    _ => Fast::Ext { d, s: s1, part: (c % 3) as u8, signed: a & 1 != 0 },
+                });
+            }
+            let ops_b: Vec<BOp> = block.iter().map(|&f| op(f)).collect();
+            let mut bus = Memory::new(); let mut reference = Memory::new();
+            bus.quiet = true;
+            for i in 32..256 { let v = rnd() as u8; bus.data[i] = v; reference.data[i] = v; }
+            bus.flags.iter_mut().for_each(|f| *f = 0);
+            let mem = bus.jit_mem().unwrap();
+            let mut cpu = Cpu::new(0);
+            for r in 0..16 { cpu.regs[r] = rnd(); }
+            cpu.regs[8] = 64 + (rnd() % 16) * 4; cpu.regs[9] = 65 + (rnd() % 16) * 2; cpu.regs[10] = 129 + rnd() % 32;
+            cpu.regs[11] = rnd() % 16;
+            cpu.sp = 192; cpu.rets = 0x0200_1234;
+            let mut expected = Cpu::new(0);
+            expected.regs = cpu.regs; expected.sp = cpu.sp; expected.rets = cpu.rets;
+            let mut pc = 0;
+            for &f in &block { pc = expected.exec_fast(&mut reference, f, pc + 2).unwrap_or(pc + 2); }
+            expected.pc = pc;
+            let code = hot(&mut jit, case, 0, &ops_b, &mem);
+            assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, block.len() as u32, false) }.0, block.len() as u32, "{block:?}");
+            let regs = |c: &Cpu| c.regs.map(|r| format!("{r:08x}"));
+            assert_eq!((regs(&cpu), cpu.pc), (regs(&expected), expected.pc), "case {case}: {block:?}");
+            assert_eq!(bus.data, reference.data, "case {case}: {block:?}");
+        }
+    }
+    #[test]
+    fn a_runners_stretch_leaves_where_a_call_would_end() {
+        let mut bus = Memory::new(); let mem = bus.jit_mem().unwrap();
+        let mut cpu = Cpu::new(0); let mut j = Jit::new(false).unwrap();
+        j.stops = true;
+        // 0: goto 32; 32: two ops (bytes 32..36); 64: an op, then one that runs interpreted
+        let from = hot(&mut j, 0, 0, &[op(Fast::Goto { target: 32 })], &mem);
+        let to = hot(&mut j, 1, 32, &[op(Fast::MovI { d: 0, v: 42 }), op(Fast::MovI { d: 1, v: 7 })], &mem);
+        let from2 = hot(&mut j, 2, 96, &[op(Fast::Goto { target: 64 })], &mem);
+        let careful = BOp { careful: true, ..op(Fast::Nop) };
+        hot(&mut j, 3, 64, &[op(Fast::MovI { d: 2, v: 5 }), careful], &mem);
+        for (code, id) in [(from, 1), (from2, 3)] {
+            let (_, slot, _) = unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 100, false) };
+            unsafe { *slot = j.body(id).unwrap() as u64; }
+        }
+        let mut go = |code, stop_pc, stop_io, cap| {
+            cpu.regs = [0; 16]; cpu.stop_pc = stop_pc; cpu.stop_io = stop_io;
+            let k = unsafe { run(code, &mut cpu, &mut bus, &mem, 0, cap, false) }.0;
+            (k, cpu.pc, cpu.regs[0])
+        };
+        // no stretch, or nothing to stop for: on into the next block
+        assert_eq!(go(from, 0, 0, 100), (3, 36, 42));
+        assert_eq!(go(from, 0x40, 0, 100), (3, 36, 42));
+        // back before it: the stop starts it or lies in it, a peripheral was reached, or the
+        // stretch is spent (`STRETCH_ROOM` short of the limit)
+        assert_eq!(go(from, 32, 0, 100), (1, 32, 0));
+        assert_eq!(go(from, 34, 0, 100), (1, 32, 0));
+        assert_eq!(go(from, 36, 0, 100), (3, 36, 42));
+        assert_eq!(go(from, 0x40, 1, 100), (1, 32, 0));
+        let room = crate::STRETCH_ROOM;
+        assert_eq!(go(from, 0x40, 0, 1 + room), (1, 32, 0));
+        assert_eq!(go(from, 0x40, 0, 2 + room), (3, 36, 42));
+        // a block not compiled whole: only outside a stretch
+        assert_eq!(go(from2, 0, 0, 100).0, 2);
+        assert_eq!(go(from2, 0x1000, 0, 100), (1, 64, 0));
+        // never at the call's first block
+        assert_eq!(go(to, 32, 1, 100), (2, 36, 42));
+        cpu.stop_pc = 0; cpu.stop_io = 0;
+    }
     #[test]
     fn code_store_exits_before_following_instruction() {
         let mut bus = Memory::new(); let mem = bus.jit_mem().unwrap();
         let mut cpu = Cpu::new(0); let mut j = Jit::new(false).unwrap();
         cpu.regs[0] = 123; cpu.regs[1] = 2;
+        j.stops = true;
         let code = hot(&mut j, 0, 0, &[
             op(Fast::St { s: 0, b: Base::Reg(1), off: 0, w: 4 }),
-            op(Fast::MovI { d: 2, v: 99 })], &mem);
+            op(Fast::MovI { d: 2, v: 99 }), op(Fast::MovI { d: 3, v: 98 })], &mem);
         assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 10, false) }.0, 1);
         assert_eq!(cpu.pc, 2); assert_eq!(cpu.regs[2], 0);
         assert_eq!(bus.read32(2), 123); assert_eq!(bus.version, 1);
+        // (a runner's stretch learns where the block would have ended)
+        assert_eq!(cpu.stop_rest, 2);
     }
     #[test]
     fn direct_ops_match_interpreter_with_aliases_and_edge_fields() {
@@ -1967,6 +2319,15 @@ mod tests {
             cases.push(Fast::FOp { d: 0, a: 1, b: 1, op: fop });
         }
         for kind in 0..4 { cases.push(Fast::MinMax { d: 0, a: 1, b: 2, kind }); }
+        for k in 0..7 { cases.push(Fast::Un { d: 0, s: 1, k }); cases.push(Fast::Un { d: 1, s: 1, k }); }
+        for k in 0..4 { cases.push(Fast::Div { d: 0, a: 1, b: 2, k }); cases.push(Fast::Div { d: 2, a: 2, b: 2, k }); }
+        for on in [false, true] { cases.push(Fast::SetIe { on }); }
+        for (p, b) in [(0, Base::Reg(8)), (1, Base::Reg(9)), (3, Base::Reg(10)), (2, Base::Sp)] {
+            for off in [0u32, 4, 6, 0xffff_fffc] { cases.push(Fast::LdPair { p, b, off }); cases.push(Fast::StPair { p, b, off }); }
+        }
+        // (a pair that holds its own base: the address is taken before the first load)
+        cases.push(Fast::LdPair { p: 4, b: Base::Reg(8), off: 4 });
+        cases.push(Fast::StPair { p: 4, b: Base::Reg(9), off: 0 });
         for part in 0..3 { for signed in [false, true] { cases.push(Fast::Ext { d: 0, s: 1, part, signed }); } }
         for n in [0, 1, 31] { cases.push(Fast::ShlI { d: 0, s: 1, n }); cases.push(Fast::SarI { d: 0, s: 1, n }); }
         for mk in 0..3 { for ne in [false, true] { cases.push(Fast::BitBr { r: 1, mk, ne, mv: if mk == 1 { 0x10 } else { 2 }, target: 0x40 }); } }
@@ -2026,6 +2387,10 @@ mod tests {
                 // (the interrupt state `cli`, `sti` and icfg read and write)
                 cpu.ie = rnd() & 1 != 0; cpu.sreg_store[0] = rnd(); cpu.irq_levels = (0..rnd() % 3).map(|_| (rnd() % 8) as u8).collect();
                 if let Fast::DecBr { ref mut v, .. } = fast { *v = cpu.regs[3].wrapping_sub(1); }
+                // (a divisor of 0 and i32::MIN for the divisions and abs now and then)
+                if round % 6 == 1 { cpu.regs[2] = 0; }
+                if round % 6 == 2 { cpu.regs[1] = 0x8000_0000; cpu.regs[2] = u32::MAX; }
+                cpu.ie = round % 2 == 0;
                 let mut expected = Cpu::new(0);
                 expected.regs = cpu.regs; expected.sp = cpu.sp; expected.rets = cpu.rets;
                 (expected.ie, expected.sreg_store, expected.irq_levels) = (cpu.ie, cpu.sreg_store, cpu.irq_levels.clone());
@@ -2033,7 +2398,7 @@ mod tests {
                 let code = hot(&mut jit, j * 24 + round, 0, &[op(fast)], &mem);
                 assert_eq!(unsafe { run(code, &mut cpu, &mut bus, &mem, 0, 1, false) }.0, 1, "{fast:?}");
                 let regs = |c: &Cpu| c.regs.map(|r| format!("{r:08x}"));
-                assert_eq!((regs(&cpu), cpu.sp, cpu.rets, cpu.pc), (regs(&expected), expected.sp, expected.rets, expected.pc),
+                assert_eq!((regs(&cpu), cpu.sp, cpu.rets, cpu.pc, cpu.ie), (regs(&expected), expected.sp, expected.rets, expected.pc, expected.ie),
                     "case {j} round {round}: {fast:?}");
                 assert_eq!((cpu.ie, cpu.sreg_store), (expected.ie, expected.sreg_store), "case {j} round {round}: {fast:?}");
                 assert_eq!(bus.data, reference.data, "case {j} round {round}: {fast:?}");

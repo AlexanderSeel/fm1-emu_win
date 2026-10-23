@@ -115,6 +115,33 @@ fn ram_code<B: Bus>(bus: &mut B, pc: u32) -> Option<&'static [u8]> {
     Some(unsafe { std::slice::from_raw_parts(m.ram.add(off as usize), (m.ram_len - off) as usize) })
 }
 
+/// How many instructions of a block (its ops, the first at pc; a swapped pair is two) come before
+/// `stop`, if an instruction of it after the first begins there (the second of a swapped pair
+/// too: then its head runs alone), and whether that is all of them.
+fn len_to(ops: &[BOp], swaps: &[(Fast, Fast, u8)], pc: u32, stop: u32) -> (u32, bool) {
+    let mut at = pc;
+    let mut k = 0;
+    for op in ops {
+        if k > 0 && at == stop {
+            return (k, false);
+        }
+        k += 1;
+        if let Fast::Swap { idx } = op.fast {
+            if at.wrapping_add(swaps[idx as usize].2 as u32) == stop {
+                return (k, false);
+            }
+            k += 1;
+        }
+        at = at.wrapping_add(op.len as u32);
+    }
+    (k, true)
+}
+
+/// A stretch (`Cpu::stop_pc`) returns once its budget less this is spent: room for the call
+/// begun before then to end where it would (a block holds at most 64 instructions: 32 ops, each
+/// at most a swapped pair).
+pub const STRETCH_ROOM: u32 = 64;
+
 /// a == b (equal lengths). RAM blocks are checked against memory on every entry: in wasm,
 /// 8 bytes at a time, since its `memcmp` (compiler_builtins) goes a byte at a time (a fifth of
 /// Melodee's time in the browser: its audio code runs from RAM); natively the platform's
@@ -254,6 +281,24 @@ pub struct Cpu {
     /// they would for a pair in flight. Cleared when that instruction retires (`finish`).
     /// (u32: compiled code stores it.)
     pub hold_irq: u32,
+    /// A runner's stop (fm1-soc's `run_cpu1` probing core 1's polling loop), 0 for none. While
+    /// set, a `run_fast` call is a stretch: the calls the runner would make one at a time, each
+    /// the block at pc up to this pc if it lies inside (`block_len_to`), run back to back, and
+    /// it returns only where one of them ends and the runner could decide otherwise: back here,
+    /// once `stop_io` is set or code ran interpreted (either may have touched a peripheral, and
+    /// so made an interrupt pending), or with the budget less `STRETCH_ROOM` spent (room for
+    /// the call begun before then to end where it would).
+    pub stop_pc: u32,
+    /// Set (while `stop_pc` is) by compiled code's helpers: a bus access off its inline paths,
+    /// or an op through the interpreter's executor. (u32: compiled code reads it.)
+    pub stop_io: u32,
+    /// Set by compiled code that leaves inside a block (after a write to code): how many of its
+    /// instructions are left, so a stretch knows where that block's call ends. (u32: compiled
+    /// code stores it.)
+    pub stop_rest: u32,
+    /// Compile the checks for `stop_pc` / `stop_io` into this core's blocks (set before its
+    /// JIT is made; core 1's).
+    pub stop_checks: bool,
 }
 
 /// What instructions can see of a core between instructions, outside any pair, predicated
@@ -495,6 +540,23 @@ impl Cpu {
     /// needs `step`.
     #[inline]
     pub fn run_fast<B: Bus>(&mut self, bus: &mut B, budget: u32) -> Result<(u32, bool), CoreError> {
+        if self.stop_pc != 0 {
+            return self.run_stretch(bus, budget);
+        }
+        self.run_fast_in::<B, false>(bus, budget)
+    }
+
+    /// `run_fast` as a runner's stretch (`stop_pc`): the same loop with the stretch's per-block
+    /// bookkeeping, out of line, so that the loop every other call runs has none of it (with it
+    /// there, interpreted Melodee ran 15% slower).
+    #[inline(never)]
+    fn run_stretch<B: Bus>(&mut self, bus: &mut B, budget: u32) -> Result<(u32, bool), CoreError> {
+        self.run_fast_in::<B, true>(bus, budget)
+    }
+
+    /// `run_fast`'s loop; `STRETCH`: `stop_pc` is set (`run_stretch`).
+    #[inline(always)]
+    fn run_fast_in<B: Bus, const STRETCH: bool>(&mut self, bus: &mut B, budget: u32) -> Result<(u32, bool), CoreError> {
         if trace_on() {
             return Ok((0, false));
         }
@@ -515,9 +577,18 @@ impl Cpu {
                 synced = n;
             }};
         }
+        // a runner's stretch (see `stop_pc`): `bound` is where the runner's call in progress
+        // ends (n), `interpreted` says code ran other than compiled since the stretch began
+        let stretch = STRETCH;
+        let mut bound = 0u32;
+        let mut interpreted = false;
         loop {
             // (and per op below: the budget holds to the instruction)
             if n >= budget {
+                sync!();
+                return Ok((n, false));
+            }
+            if stretch && n == bound && n > 0 && (pc == self.stop_pc || self.stop_io != 0 || interpreted || n >= budget.saturating_sub(STRETCH_ROOM)) {
                 sync!();
                 return Ok((n, false));
             }
@@ -532,6 +603,16 @@ impl Cpu {
                 sync!();
                 return Ok((n, false));
             };
+            // a stretch: the next call begins here; it may run on in compiled code (which leaves
+            // only where calls end: see jit.rs's `compile`) if it is this block whole, else only
+            // to its end
+            let mut whole = false;
+            if stretch && n == bound {
+                let (to, all) = len_to(&self.bops[start as usize..(start + len) as usize], &self.swaps, pc, self.stop_pc);
+                bound = n + to;
+                whole = all;
+            }
+            let limit = if stretch { bound } else { budget };
             // (careful: inside a then-part or a rep loop with nothing else in progress, where a
             // compiled prefix that cannot reach the construct's end still runs: `prefix_inside`)
             #[cfg(native_jit)]
@@ -539,7 +620,10 @@ impl Cpu {
                 let inside = careful;
                 if let Some(mem) = jit_mem {
                     if self.jit.is_none() {
-                        self.jit = jit::Jit::new(self.profile).map(Box::new);
+                        self.jit = jit::Jit::new(self.profile).map(|mut j| {
+                            j.stops = self.stop_checks;
+                            Box::new(j)
+                        });
                     }
                     // (a block about to be compiled that ends in an if-else block: its then-part)
                     let mut then = None;
@@ -557,17 +641,26 @@ impl Cpu {
                         None => None,
                     };
                     let code = code.filter(|p| !inside || self.prefix_inside(pc, p.end));
-                    if let Some(jit::Prefix { code, insns, .. }) = code {
+                    if let Some(jit::Prefix { code, insns, whole: compiled_whole, .. }) = code {
                         // (the code checks itself that its ticks fall before anything is due)
                         let extra = if n == 0 { 0 } else { 1 };
                         sync!();
+                        // a stretch's call of a block compiled whole (no then-part in tow) runs on
+                        // to wherever the code leaves (`stop_rest`: how far inside a block it did)
+                        let open = whole && !inside && compiled_whole && self.jit.as_ref().is_some_and(|j| j.stops);
+                        if open {
+                            self.stop_rest = 0;
+                        }
                         // (inside a construct: this prefix and no further, so no chaining on)
-                        let cap = if inside { (budget - n).min(insns) } else { budget - n };
+                        let cap = if inside { (limit - n).min(insns) } else if open { budget - n } else { limit - n };
                         // SAFETY: code was compiled for this bus type and memory map
                         let (k, slot, stop) = unsafe { jit::run(code, self, bus, &mem, extra, cap, inside) };
                         if self.profile { self.jit_entries += 1; self.jit_insns += k as u64; }
                         if k > 0 {
                             n += k;
+                            if open {
+                                bound = n + self.stop_rest;
+                            }
                             pc = self.pc;
                             if stop {
                                 // a swapped pair ended with an interrupt pending (`exec_careful_op`)
@@ -631,12 +724,14 @@ impl Cpu {
                         sync!();
                         // (the budget as the interpreter keeps it, to the instruction: each block
                         // of the region runs only while it fits, else the interpreter goes on)
-                        let cap = budget - n;
+                        let cap = limit - n;
                         // SAFETY: code was compiled for this bus type and memory map
                         let k = unsafe { jit_wasm::run(code, at, self, bus, extra, cap) };
                         if self.profile { self.jit_entries += 1; self.jit_insns += k as u64; }
                         if k > 0 {
                             n += k;
+                            // (a stretch: its helpers don't say whether they reached a peripheral)
+                            interpreted = true;
                             pc = self.pc;
                             // (it left between the two instructions of a glued pair, or inside an
                             // if-else block's then-part)
@@ -648,6 +743,10 @@ impl Cpu {
             }
             #[cfg(not(any(native_jit, target_arch = "wasm32")))]
             let _ = (id, &jit_mem);
+            // (only the native JITs run on from a block compiled whole)
+            #[cfg(not(native_jit))]
+            let _ = whole;
+            interpreted = true;
             for i in start..start + len {
                 // SAFETY: build_block pushed start..start+len into bops and
                 // bops is only cleared together with the block table
@@ -655,7 +754,7 @@ impl Cpu {
                 // the budget, to the instruction: where a call stops does not depend on where
                 // blocks begin, so compiled code (which runs a block only while it fits) and
                 // the interpreter stop at the same one, and cores interleave the same
-                if n >= budget {
+                if n >= limit {
                     if i > start && !careful && unsafe { self.bops.get_unchecked(i as usize - 1) }.glue {
                         self.hold_irq = 1;
                     }
@@ -680,7 +779,7 @@ impl Cpu {
                 } else {
                     sync!();
                     // (it counts what it runs in insn_count itself; a swapped pair is two)
-                    let r = self.exec_careful_op(bus, i, careful, next_pc, budget - n);
+                    let r = self.exec_careful_op(bus, i, careful, next_pc, limit - n);
                     n += r & 3;
                     synced = n;
                     pc = self.pc;
@@ -806,24 +905,7 @@ impl Cpu {
     /// looks for the way back to where it began, which may lie inside a block.)
     pub fn block_len_to<B: Bus>(&mut self, bus: &mut B, stop: u32) -> u32 {
         let Ok(Some((_, start, len))) = self.block_at(bus, self.pc) else { return 0 };
-        let mut at = self.pc;
-        let mut k = 0;
-        for j in start..start + len {
-            if k > 0 && at == stop {
-                return k;
-            }
-            let op = self.bops[j as usize];
-            k += 1;
-            if let Fast::Swap { idx } = op.fast {
-                // two instructions; stopping at the second one runs the head alone
-                if at.wrapping_add(self.swaps[idx as usize].2 as u32) == stop {
-                    return k;
-                }
-                k += 1;
-            }
-            at = at.wrapping_add(op.len as u32);
-        }
-        k
+        len_to(&self.bops[start as usize..(start + len) as usize], &self.swaps, self.pc, stop).0
     }
 
     /// The block of micro-ops starting at pc (XIP code only): built on first
@@ -1638,6 +1720,19 @@ impl Cpu {
                 let (a, inc) = (self.regs[b], self.regs[(i & 15) as usize]);
                 st_w(bus, w, a, self.regs[(s & 15) as usize]);
                 self.regs[b] = self.regs[b].wrapping_add(inc);
+            }
+            Fast::LdPair { p, b, off } => {
+                // (the address before either load: a pair that holds the base overwrites it)
+                let a = match b { Base::Reg(r) => self.regs[(r & 15) as usize], Base::Sp => self.sp }.wrapping_add(off);
+                let lo = 2 * (p & 7) as usize;
+                self.regs[lo] = bus.read32(a);
+                self.regs[lo + 1] = bus.read32(a.wrapping_add(4));
+            }
+            Fast::StPair { p, b, off } => {
+                let a = match b { Base::Reg(r) => self.regs[(r & 15) as usize], Base::Sp => self.sp }.wrapping_add(off);
+                let lo = 2 * (p & 7) as usize;
+                bus.write32(a, self.regs[lo]);
+                bus.write32(a.wrapping_add(4), self.regs[lo + 1]);
             }
             _ => unreachable!("exec_rare: a hot op"),
         }
@@ -5497,6 +5592,8 @@ impl Fast {
                 let pb = if post { m(base) } else { 0 };
                 if store { (mask | m(base), pb) } else { (m(base), mask | pb) }
             }
+            Fast::LdPair { p, b, .. } => (base(b), m(2 * (p & 7)) | m(2 * (p & 7) + 1)),
+            Fast::StPair { p, b, .. } => (base(b) | m(2 * (p & 7)) | m(2 * (p & 7) + 1), 0),
             Fast::IfBlk { .. } | Fast::SetIe { .. } | Fast::IcfgWr { .. } | Fast::Raw { .. } | Fast::Swap { .. } => return None,
         })
     }
@@ -5544,7 +5641,7 @@ impl Fast {
             | Fast::BitExt { .. } | Fast::BitIns { .. } | Fast::SetIe { .. } | Fast::IcfgRd { .. } | Fast::IcfgWr { .. }
             | Fast::BlockMove { .. } | Fast::PopRets | Fast::Tb { .. } | Fast::Mov2 { .. } | Fast::Mov2I { .. }
             | Fast::Un { .. } | Fast::Div { .. } | Fast::LdPre { .. } | Fast::StPre { .. } | Fast::LdPostR { .. }
-            | Fast::StPostR { .. } => false,
+            | Fast::StPostR { .. } | Fast::LdPair { .. } | Fast::StPair { .. } => false,
         }
     }
 
@@ -5566,7 +5663,7 @@ impl Fast {
             | Fast::RFromSp { .. } | Fast::BitExt { .. } | Fast::BitIns { .. } | Fast::SetIe { .. } | Fast::IcfgRd { .. }
             | Fast::IcfgWr { .. } | Fast::BlockMove { .. } | Fast::PopRets | Fast::Tb { .. } | Fast::Mov2 { .. }
             | Fast::Mov2I { .. } | Fast::Un { .. } | Fast::Div { .. } | Fast::LdPre { .. } | Fast::StPre { .. }
-            | Fast::LdPostR { .. } | Fast::StPostR { .. } => false,
+            | Fast::LdPostR { .. } | Fast::StPostR { .. } | Fast::LdPair { .. } | Fast::StPair { .. } => false,
         }
     }
 
@@ -5835,6 +5932,10 @@ enum Fast {
     /// execute's routes decoded from the raw word (pair loads / stores, pre / post-increment
     /// accesses, 64-bit ops, rev8, rets pops): `exec_raw`
     Raw { route: u8, raw: u32 },
+    /// `rH_rL = d[B+off]` / `d[B+off] = rH_rL`: route 16 without a base update, the pair's low
+    /// register (2p) at the lower address
+    LdPair { p: u8, b: Base, off: u32 },
+    StPair { p: u8, b: Base, off: u32 },
     /// `{rets} = [sp++]`
     PopRets,
     /// `tbb [R]` / `tbh [R]`: the jump table right after the instruction
@@ -5958,7 +6059,28 @@ fn fast_raw(route: u16, insn: &Instruction, alu4: &Option<Alu4>, bittest: &Optio
         // base or of a high half, and words idx_inc does not take
         18 | 19 => Some(inc_mem_fast(route as u8, raw as u32)),
         32 => Some(idx_inc_fast(raw)),
-        16 | 21 | 22 | 27 | 39 | 40 | 41 => Some(Fast::Raw { route: route as u8, raw: raw as u32 }),
+        // (pair loads and stores without a base update, and the DSP group's min / max, as
+        // micro-ops the JITs compile: in Melodee's and Felucca's audio code, with the others below,
+        // the most frequent ops left for the interpreter's executor. Not a dual-issue pair's head:
+        // as a micro-op it could be glued to the next instruction, which moved interrupts in Skiff
+        // and NMSFM; the raw arm keeps them where they were)
+        16 => Some({
+            let m = decode_pair_mem(raw);
+            if m.pre || m.post || m.index.is_some() || insn.entry.syntax.trim_end().ends_with('#') {
+                Fast::Raw { route: 16, raw: raw as u32 }
+            } else {
+                let (p, b, off) = (m.pair as u8, m.base.map_or(Base::Sp, |b| Base::Reg(b as u8)), m.off as u32);
+                if m.store { Fast::StPair { p, b, off } } else { Fast::LdPair { p, b, off } }
+            }
+        }),
+        41 if !insn.entry.syntax.trim_end().ends_with('#') && matches!(dsp_raw(raw), Some(Dsp::MinMax)) => Some(Fast::MinMax {
+            d: ((raw >> 28) & 0xf) as u8,
+            a: ((raw >> 20) & 0xf) as u8,
+            b: ((raw >> 24) & 0xf) as u8,
+            // (exec_raw's: bit 0 min, bit 16 signed; MinMax's 0 smin, 1 smax, 2 umin, 3 umax)
+            kind: match (raw & 1 != 0, (raw >> 16) & 1 != 0) { (true, true) => 0, (false, true) => 1, (true, false) => 2, (false, false) => 3 },
+        }),
+        21 | 22 | 27 | 39 | 40 | 41 => Some(Fast::Raw { route: route as u8, raw: raw as u32 }),
         26 if insn.entry.len == 4 => Some(Fast::PushMask { mask: ((raw >> 16) & 0xffff) as u16 }),
         28 if insn.entry.len == 4 => Some(Fast::PopMask { mask: ((raw >> 16) & 0xffff) as u16 }),
         35 => {

@@ -1010,6 +1010,67 @@ Melodee 4.23 -> 5.76x / 1.43 -> 1.32x, ZP-12 8.72 -> 10.23x / 1.95 -> 2.00x, sto
 / 4.44 -> 4.49x. Melodee interpreted moves between 1.23x and 1.46x from one commit of this
 branch to the next (it is at master's speed on some), a code layout effect in run_fast.
 
+## 5.33 markterm's core 1 stretches, guest registers in host registers, and more ops compiled (2026-10-23)
+
+Three PRs from markterm (Mark White), #48, #49 and #50, ported onto 5.32 with his authorship kept:
+
+- #48, core 1's idle probe in stretches. While `run_cpu1` probes core 1's polling loop it makes
+  one `run_fast` call per block and decides between them. With nothing pending for core 1 those
+  calls now run back to back in one (`Cpu::stop_pc`). That call returns only where one of them
+  ends and the loop could decide otherwise: back at the probe's pc, after anything that may have
+  touched a peripheral (compiled code's helpers set `stop_io`; interpreted code counts too), or
+  with the probe's or the slice's count spent. Compiled code runs on from block to block only
+  through blocks compiled whole and checks those points at each body's entry. A block left
+  inside (a code write) says how much of it was left (`stop_rest`). Same calls, same points.
+- #49 (AArch64): guest registers kept in eight caller-saved host registers within a block.
+  `ld_reg` loads at first use and `st_reg` marks the register changed; exits, chains and helper
+  calls write the changed ones back, and a call reloads them after. There is a 3000-block random
+  test against the interpreter.
+- #50 (AArch64): register-pair loads and stores without a base update (`LdPair` / `StPair`,
+  route 16), route 41's min / max as `MinMax`, `Un`, `Div` and `cli` compiled inline. A
+  dual-issue pair's head of route 16 or 41 stays raw: glued to the next instruction it moved
+  interrupts in Skiff and NMSFM.
+
+Porting, beyond conflict resolution (itab for his dyn_tab, emit_op, Prefix, ind_brk flushing for
+#49, the flag lists for #50's new ops), #48 needed four changes on this base (their own commit):
+- calls counted in instructions, a swapped pair being two, with a stop at its second running the
+  head alone, as `block_len_to` does;
+- the stretch's room raised from 32 to 64 instructions (`STRETCH_ROOM`, a block's most with
+  swapped pairs);
+- a prefix with an if-else then-part in tow is not "whole";
+- `check_pair`'s exit after a compiled swapped pair stores `stop_rest`.
+
+The stretch's bookkeeping in run_fast's loop cost every interpreted run (Melodee -15%, Felucca
+-6%, stock -4%). run_fast is now generic over STRETCH: the normal copy has none of it, and
+`run_stretch` (not inlined) runs the other copy only while `stop_pc` is set.
+
+Exactness:
+- All 82 catalog firmwares, the stock one and FM1 Open, JIT and interpreted, 8 s with keys:
+  byte-identical to master (db8d472), and JIT == interpreter on all 84.
+- With the stretch on and off (`stop_checks`) on stock, FM1 Open and MC-1: identical.
+- The fm1-core / fm1-soc / fm1-isa tests pass at each commit on AArch64 and x86-64 (amd64
+  container), and `cargo check` passes for wasm32.
+
+Speed against 5.32 (this Mac, shared, best of 3 interleaved; JIT / interpreted):
+
+| Firmware | JIT before | JIT after | Interp. before | Interp. after |
+|---|---|---|---|---|
+| MC-1 | 3.11x | 3.50x | 1.08x | 1.06x |
+| GhoulBox | 5.67x | 6.13x | 1.39x | 1.39x |
+| OberVave | 8.80x | 9.31x | 1.72x | 1.80x |
+| FM1-DOOM | 9.17x | 9.42x | 3.00x | 3.10x |
+| Felucca | 7.53x | 7.72x | 1.43x | 1.42x |
+| Melodee | 5.86x | 5.99x | 1.31x | 1.39x |
+
+- Stock, FM1 Open, ZP-12, Grimm and X0X are within ±2%.
+- Geomean over the 11: JIT +3.1%, interpreted +1.1%.
+- The stretch alone, on and off in the same build (JIT): MC-1 +12%, stock +5%, FM1 Open +3.5%.
+- The #48 measurement that showed FM1 Open +7% was against master, before 5.30-5.32; here
+  FM1 Open gains nothing net against 5.32.
+- On this Mac (Apple cores forward stores cheaply), #49's register cache is about neutral.
+- Melodee's core 1 never starts in fm1-live's 8 s bench, so #48's Melodee gain (measured on a
+  Pixel 7 Pro in Harbor) does not show here.
+
 ## 6. Phase 5 — Boot & integration
 
 - Boot stock firmware to a stable idle/main-loop state.
