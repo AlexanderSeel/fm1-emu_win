@@ -191,6 +191,7 @@ impl Machine {
         cpu.regs[0] = params;
         if let Some(st) = &stock {
             cpu.regs[0] = fm1_soc::stock_boot(&mut soc, &st.flash, params, st.board);
+            soc.sfc_key = Some(st.key);
         }
         if let Some(path) = o.flash.as_ref().filter(|p| std::path::Path::new(p).exists()) {
             let f = std::fs::read(path)?;
@@ -198,6 +199,10 @@ impl Machine {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{path}: not a {} byte flash image", fm1_soc::FLASH_SIZE)));
             }
             soc.restore_flash(&f);
+            if let Some(st) = &stock {
+                // (the window from the chip: what a run before wrote into the app area too)
+                soc.xip_from_flash(st.key, 0x93000);
+            }
         }
         let skip_log = std::env::var("FM1_SKIP_LOG").ok().map(|_| Default::default());
         let blocks = std::env::var("FM1_NO_BLOCKS").is_err();
@@ -458,7 +463,8 @@ fn start_audio(ring: Arc<AudioRing>) -> Result<cpal::Stream, String> {
 /// Headless panel picture: C4-E4-G4 held from 0.8 s, PLAY pressed at 1.2 s,
 /// the panel drawn at `ms` into work/panel.ppm.
 /// FM1_BENCH_KEYS=ms:id[,ms:id^,ms:eN:clicks...]: queue key presses (`^`: release) and
-/// encoder turns, `ms:mHEX` MIDI bytes into the MIDI IN jack. False when the variable is unset.
+/// encoder turns, `ms:mHEX` MIDI bytes into the MIDI IN jack (`@FILE`: the script from FILE).
+/// False when the variable is unset.
 /// --flash: the flash chip back to its file; and how many erases / programs it saw
 fn save_flash(m: &Machine, path: Option<&String>) {
     let f = &m.soc.flash;
@@ -482,8 +488,15 @@ fn halted(e: &str) {
 }
 
 fn script_keys(m: &mut Machine) -> bool {
-    let Ok(keys) = std::env::var("FM1_BENCH_KEYS") else { return false };
-    fm1_soc::script::queue(&mut m.soc, &keys);
+    let Ok(mut keys) = std::env::var("FM1_BENCH_KEYS") else { return false };
+    if let Some(path) = keys.strip_prefix('@') {
+        // (@FILE: the script from a file; a deploy of a whole firmware is megabytes of MIDI)
+        keys = std::fs::read_to_string(path).unwrap_or_else(|e| {
+            eprintln!("FM1_BENCH_KEYS {path}: {e}");
+            String::new()
+        });
+    }
+    fm1_soc::script::queue(&mut m.soc, keys.trim());
     true
 }
 
