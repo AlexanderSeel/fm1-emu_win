@@ -747,6 +747,10 @@ impl Cpu {
             #[cfg(not(native_jit))]
             let _ = whole;
             interpreted = true;
+            // a RAM block: a store into one of its own later instructions (the bus counts writes
+            // to code words) ends it there, and the rest is built again from what memory holds,
+            // as `step` fetches it and compiled code's `h_write` leaves
+            let code_ver = if (0x0200_0000..0x0400_0000).contains(&pc) { None } else { bus.code_writes() };
             for i in start..start + len {
                 // SAFETY: build_block pushed start..start+len into bops and
                 // bops is only cleared together with the block table
@@ -794,6 +798,9 @@ impl Cpu {
                 }
                 if pc != next_pc {
                     break; // taken branch, skip or loop: look up the next block
+                }
+                if code_ver.is_some() && !op.glue && bus.code_writes() != code_ver {
+                    break; // (its code was written: the next instruction from memory)
                 }
             }
         }
@@ -4219,6 +4226,73 @@ mod tests {
                 self.write8(addr.wrapping_add(i as u32), *b);
             }
         }
+    }
+
+    /// A store into a later instruction of the RAM block it runs in: run_fast, interpreted and
+    /// compiled, runs the new instruction, as `step` does. The bus counts writes to code words
+    /// (`code_mark`), as the Soc's RAM does.
+    #[test]
+    fn a_store_into_its_own_block_runs_the_new_instruction() {
+        struct Smc { ram: Vec<u8>, flags: Vec<u8>, writes: u64 }
+        impl Smc {
+            fn w8(&mut self, a: u32, v: u8) {
+                if let Some(b) = self.ram.get_mut(a as usize) {
+                    *b = v;
+                    if self.flags[a as usize / 4] != 0 {
+                        self.writes += 1;
+                    }
+                }
+            }
+        }
+        impl Bus for Smc {
+            fn read8(&mut self, a: u32) -> u8 { *self.ram.get(a as usize).unwrap_or(&0) }
+            fn read16(&mut self, a: u32) -> u16 { u16::from_le_bytes([self.read8(a), self.read8(a.wrapping_add(1))]) }
+            fn read32(&mut self, a: u32) -> u32 { u32::from_le_bytes([0, 1, 2, 3].map(|i| self.read8(a.wrapping_add(i)))) }
+            fn write8(&mut self, a: u32, v: u8) { self.w8(a, v) }
+            fn write16(&mut self, a: u32, v: u16) { for (i, b) in v.to_le_bytes().into_iter().enumerate() { self.w8(a.wrapping_add(i as u32), b) } }
+            fn write32(&mut self, a: u32, v: u32) { for (i, b) in v.to_le_bytes().into_iter().enumerate() { self.w8(a.wrapping_add(i as u32), b) } }
+            fn next_tick_due(&self) -> bool { false }
+            fn jit_mem(&mut self) -> Option<JitMem> {
+                Some(JitMem { ram: self.ram.as_mut_ptr(), ram_base: 0, ram_len: self.ram.len() as u32, ram_code: self.flags.as_ptr(),
+                    xip: std::ptr::null(), xip_base: 0x0200_0000, xip_len: 0 })
+            }
+            fn code_writes(&self) -> Option<u64> { Some(self.writes) }
+            fn code_mark(&mut self, lo: u32, hi: u32) {
+                for w in lo / 4..hi.div_ceil(4) {
+                    if let Some(f) = self.flags.get_mut(w as usize) { *f = 1; }
+                }
+            }
+        }
+        // at 0x10: h[r0+24] = r6 (r0 + 24 = 0x17: it rewrites the `if (r4 == 0) goto` at 0x16 into
+        // `r4 <<= ...`); r4 += -92; r4 = -16; [0x16] if (r4 == 0) goto ...
+        let code = [0x8eu8, 0x6c, 0xec, 0x24, 0x14, 0x30, 0x24, 0x46, 0x46, 0x03, 0x00, 0x46, 0x46, 0x03, 0, 0, 0, 0];
+        let regs = { let mut r = [0u32; 16]; r[0] = 0x17u32.wrapping_sub(24); r[6] = 0x87b2; r[4] = 0x1000; r };
+        let mk = || {
+            let mut ram = vec![0u8; 0x1000];
+            ram[0x10..0x10 + code.len()].copy_from_slice(&code);
+            Smc { flags: vec![0; ram.len() / 4], ram, writes: 0 }
+        };
+        let run = |how: &str| {
+            let (mut cpu, mut bus) = (Cpu::new(0x10), mk());
+            cpu.regs = regs;
+            cpu.jit_on = how == "jit";
+            for round in 0..2 {
+                // (round 0 builds the block from the old bytes; round 1 runs it with them back)
+                if round == 1 {
+                    for (i, &x) in code.iter().enumerate() { bus.write8(0x10 + i as u32, x); }
+                    (cpu.pc, cpu.regs, cpu.insn_count) = (0x10, regs, 0);
+                }
+                if how == "step" {
+                    for _ in 0..4 { cpu.step(&mut bus).unwrap(); }
+                } else {
+                    cpu.run_fast(&mut bus, 4).unwrap();
+                }
+            }
+            (cpu.pc, cpu.regs)
+        };
+        let want = run("step");
+        assert_eq!(run("interpreted"), want, "interpreted");
+        assert_eq!(run("jit"), want, "compiled");
     }
 
     #[test]
