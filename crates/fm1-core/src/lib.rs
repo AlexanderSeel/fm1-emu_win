@@ -4386,6 +4386,26 @@ mod tests {
         assert!(!cpu.icache[slot].careful, "flags replaced before the reader");
     }
 
+    /// An add whose flags a `psr` push reads after a jump: the scan follows the jump (compiled
+    /// code, which does not set the flags, would push stale ones). The fall-through path past the
+    /// jump has another add first, so a scan of that path alone says no reader.
+    #[test]
+    fn flags_read_after_a_jump_keep_the_add_careful() {
+        let mut mem = vec![0u8; 0x100];
+        mem[..0x10].copy_from_slice(&[
+            0xb4, 0xe0, 0x00, 0x00, // 0x00 r0 = r0 + r0
+            0xc0, 0xea, 0x02, 0x00, // 0x04 goto 0x0c
+            0xb4, 0xe0, 0x00, 0x00, // 0x08 r0 = r0 + r0
+            0xf2, 0x04, 0x00, 0x00, // 0x0c [--sp] = {psr, sr4, rete}
+        ]);
+        let mut bus = FlatRam::new(mem);
+        assert!(flags_read_later(&mut bus, 0x04), "the push after the jump reads them");
+        assert!(!flags_read_later(&mut bus, 0x0c + 2), "nothing after the push reads them");
+        let mut cpu = Cpu::new(0);
+        let slot = cpu.fetch(&mut bus).unwrap();
+        assert!(cpu.icache[slot].flags_live && cpu.icache[slot].careful, "the add stays on the careful path");
+    }
+
     #[test]
     fn pair_head_and_not_shifted_runs() {
         // `94 f1 13 13` r1 = r1 & ~(1 << r3) #, then a nop (DUELL 0.2.20, when HOME is pressed):
@@ -5518,27 +5538,62 @@ fn is_flag_producer(s: &str) -> bool {
 /// How far past a flag producer `flags_read_later` looks for a reader.
 const FLAG_SCAN: usize = 8;
 
+/// How many instructions `flags_read_later` looks at in all, over every path it follows.
+const FLAG_VISITS: usize = 4 * FLAG_SCAN;
+
 /// Does an instruction from pc on read the flags (`+ c`, `- !c`, a `psr` read) before another
 /// add / subtract replaces them? A producer whose flags are read stays off the JITs (which do
 /// not model the flags) on the careful path. The reader need not be the next instruction:
 /// clang schedules other work between a 64-bit add's halves (FM-106's chorus interpolation
 /// stores a field between `r4 = r14 + r0` and `r5 = r15 + r1 + c`; compiled, the high half
-/// took a stale carry). The scan follows the fall-through path through anything: a reader
-/// that is never reached costs only speed.
-fn flags_read_later<B: Bus>(bus: &mut B, mut pc: u32) -> bool {
-    for _ in 0..FLAG_SCAN {
-        let win = (bus.fetch32(pc + 4) as u64) << 32 | bus.fetch32(pc) as u64;
-        let Ok(i) = decode_any(win, pc) else { return false };
-        let s = i.entry.syntax;
-        if s.contains("+ c") || s.contains("- !c") || s.contains("= psr") || s.contains("psr,") || s.contains("{psr") {
-            return true;
+/// took a stale carry). Nor on the fall-through path: a direct jump, call or branch on the way is
+/// followed to its target too (a `[--sp] = {psr, ...}` there pushes the flags: compiled, stale
+/// ones), up to FLAG_SCAN instructions a path and FLAG_VISITS in all. Returns and computed jumps
+/// end a path. A reader that is never reached costs only speed.
+fn flags_read_later<B: Bus>(bus: &mut B, pc: u32) -> bool {
+    let (mut todo, mut visits) = (vec![(pc, FLAG_SCAN)], 0);
+    while let Some((mut pc, mut left)) = todo.pop() {
+        while left > 0 && visits < FLAG_VISITS {
+            left -= 1;
+            visits += 1;
+            let win = (bus.fetch32(pc + 4) as u64) << 32 | bus.fetch32(pc) as u64;
+            let Ok(i) = decode_any(win, pc) else { break };
+            let s = i.entry.syntax;
+            if s.contains("+ c") || s.contains("- !c") || s.contains("= psr") || s.contains("psr,") || s.contains("{psr") {
+                return true;
+            }
+            if is_flag_producer(canon_syntax(i.entry)) {
+                break;
+            }
+            let (on, to) = successors(&i);
+            if let Some(t) = to {
+                todo.push((t, left));
+            }
+            if !on {
+                break;
+            }
+            pc = pc.wrapping_add(i.entry.len as u32);
         }
-        if is_flag_producer(canon_syntax(i.entry)) {
-            return false;
-        }
-        pc = pc.wrapping_add(i.entry.len as u32);
     }
     false
+}
+
+/// Where control may go after `insn`, as far as its micro-op says: (on to the next instruction,
+/// a direct target). An if-block falls through (its parts are in line).
+fn successors(insn: &Instruction) -> (bool, Option<u32>) {
+    let alu4 = if insn.entry.len == 4 { decode_alu4(insn.raw) } else { None };
+    let bittest = if insn.entry.name.starts_with("if") { decode_bittest(insn.raw, insn.entry.len) } else { None };
+    let route = route_of(insn, &alu4, &bittest);
+    let fast = if route == ROUTE_SYNTAX { fast_of(insn, canon_syntax(insn.entry)) } else { fast_raw(route, insn, &alu4, &bittest) };
+    match fast.map(Fast::specialise) {
+        Some(Fast::Goto { target }) => (false, Some(target)),
+        Some(Fast::Call { target }) => (true, Some(target)),
+        Some(Fast::BrI { target, .. } | Fast::BrR { target, .. } | Fast::BrIEq { target, .. } | Fast::BrINe { target, .. }
+            | Fast::BitBr { target, .. } | Fast::DecBr { target, .. }) => (true, Some(target)),
+        Some(Fast::IfBlk { .. }) => (true, None),
+        Some(f) if f.may_jump() => (false, None),
+        _ => (true, None),
+    }
 }
 
 fn canon_syntax(e: &'static fm1_isa::IsaEntry) -> &'static str {
