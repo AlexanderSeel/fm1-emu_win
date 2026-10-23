@@ -368,7 +368,7 @@ impl Soc {
         match self.region(addr) {
             Region::Xip | Region::XipFlash | Region::Ram | Region::Ovl | Region::Sram2 => true,
             Region::Irqc | Region::Iomap | Region::Usb | Region::Clk | Region::Ana | Region::Bt | Region::Dbg => true,
-            Region::Spi2 | Region::Crc | Region::P33 | Region::Alnk | Region::Uart1 => true,
+            Region::Spi2 | Region::Crc | Region::P33 | Region::Alnk | Region::Uart1 | Region::Sfcenc => true,
             // the tick counter's word counts the clock
             Region::Irqc2 => addr != 0x1eef0f0,
             // the timers' control and period words; the counters count the clock, and other
