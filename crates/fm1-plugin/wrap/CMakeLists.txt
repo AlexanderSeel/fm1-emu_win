@@ -3,6 +3,12 @@
 # and, for VST3, Steinberg's VST3 SDK (MIT since 3.8). tools/build_plugin.sh drives it:
 #   cmake -B build -DFM1_CLAP=/path/to/FM-1.clap && cmake --build build
 cmake_minimum_required(VERSION 3.21)
+# clap-wrapper defaults to the static MSVC CRT (/MT). Set it before project()
+# so every target (including the VST3 entry object) uses the same runtime.
+if(WIN32)
+    cmake_policy(SET CMP0091 NEW)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>" CACHE STRING "MSVC runtime for all wrapper targets" FORCE)
+endif()
 set(CMAKE_OSX_DEPLOYMENT_TARGET 11.0 CACHE STRING "")
 if(APPLE)
     set(CMAKE_OSX_ARCHITECTURES arm64 CACHE STRING "")
