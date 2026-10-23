@@ -4386,6 +4386,26 @@ mod tests {
         assert!(!cpu.icache[slot].careful, "flags replaced before the reader");
     }
 
+    /// An add whose flags a `psr` push reads after a jump: the scan follows the jump (compiled
+    /// code, which does not set the flags, would push stale ones). The fall-through path past the
+    /// jump has another add first, so a scan of that path alone says no reader.
+    #[test]
+    fn flags_read_after_a_jump_keep_the_add_careful() {
+        let mut mem = vec![0u8; 0x100];
+        mem[..0x10].copy_from_slice(&[
+            0xb4, 0xe0, 0x00, 0x00, // 0x00 r0 = r0 + r0
+            0xc0, 0xea, 0x02, 0x00, // 0x04 goto 0x0c
+            0xb4, 0xe0, 0x00, 0x00, // 0x08 r0 = r0 + r0
+            0xf2, 0x04, 0x00, 0x00, // 0x0c [--sp] = {psr, sr4, rete}
+        ]);
+        let mut bus = FlatRam::new(mem);
+        assert!(flags_read_later(&mut bus, 0x04), "the push after the jump reads them");
+        assert!(!flags_read_later(&mut bus, 0x0c + 2), "nothing after the push reads them");
+        let mut cpu = Cpu::new(0);
+        let slot = cpu.fetch(&mut bus).unwrap();
+        assert!(cpu.icache[slot].flags_live && cpu.icache[slot].careful, "the add stays on the careful path");
+    }
+
     #[test]
     fn pair_head_and_not_shifted_runs() {
         // `94 f1 13 13` r1 = r1 & ~(1 << r3) #, then a nop (DUELL 0.2.20, when HOME is pressed):
@@ -5241,26 +5261,6 @@ mod tests {
             assert_eq!(k, 1);
             check(&cpu, &mut bus, "run_fast");
         }
-    }
-
-    /// An add whose flags a `psr` push reads after a jump: the scan follows the jump (compiled
-    /// code, which does not set the flags, would push stale ones). The fall-through path past the
-    /// jump has another add first, so a scan of that path alone says no reader.
-    #[test]
-    fn flags_read_after_a_jump_keep_the_add_careful() {
-        let mut mem = vec![0u8; 0x100];
-        mem[..0x10].copy_from_slice(&[
-            0xb4, 0xe0, 0x00, 0x00, // 0x00 r0 = r0 + r0
-            0xc0, 0xea, 0x02, 0x00, // 0x04 goto 0x0c
-            0xb4, 0xe0, 0x00, 0x00, // 0x08 r0 = r0 + r0
-            0xf2, 0x04, 0x00, 0x00, // 0x0c [--sp] = {psr, sr4, rete}
-        ]);
-        let mut bus = FlatRam::new(mem);
-        assert!(flags_read_later(&mut bus, 0x04), "the push after the jump reads them");
-        assert!(!flags_read_later(&mut bus, 0x0c + 2), "nothing after the push reads them");
-        let mut cpu = Cpu::new(0);
-        let slot = cpu.fetch(&mut bus).unwrap();
-        assert!(cpu.icache[slot].flags_live && cpu.icache[slot].careful, "the add stays on the careful path");
     }
 
     #[test]
