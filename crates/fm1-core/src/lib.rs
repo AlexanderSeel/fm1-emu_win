@@ -5239,6 +5239,22 @@ mod tests {
             assert_eq!(k, 1);
             check(&cpu, &mut bus, "run_fast");
         }
+        // #64: `41 eb 0a 00`, {r1, r3} = [-r1] (JieLi clang's load of t[i - 1], t[i]): the base,
+        // in the list too, takes its loaded word, as nothing writes the base back
+        for how in ["stepped", "run_fast"] {
+            let mut mem = vec![0u8; 0x10000];
+            mem[..8].copy_from_slice(&[0x41, 0xeb, 0x0a, 0x00, 0, 0, 0, 0]);
+            mem[0x0ff8..0x1000].copy_from_slice(&[1, 0, 0, 0, 2, 0, 0, 0]);
+            let mut cpu = Cpu::new(0x0200_0000);
+            (cpu.regs[1], cpu.regs[3]) = (0x1000, 0x33);
+            let mut bus = Xip(FlatRam::new(mem));
+            if how == "stepped" {
+                cpu.step(&mut bus).unwrap();
+            } else {
+                assert_eq!(cpu.run_fast(&mut bus, 1).unwrap().0, 1);
+            }
+            assert_eq!((cpu.regs[1], cpu.regs[3]), (1, 2), "{how}");
+        }
     }
 
     /// A swappable pair in a block: run_fast runs it as one op of two instructions; cut by the
