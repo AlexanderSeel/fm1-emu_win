@@ -1,0 +1,45 @@
+name: Windows VST3
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'crates/fm1-plugin/**'
+      - 'crates/fm1-core/**'
+      - 'crates/fm1-soc/**'
+      - 'tools/build_plugin_windows.ps1'
+      - '.github/workflows/windows-vst3.yml'
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-vst3:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Build Windows VST3 and CLAP
+        shell: pwsh
+        run: ./tools/build_plugin_windows.ps1 -NoInstall
+      - name: Verify artifacts
+        shell: pwsh
+        run: |
+          $out = 'target/plugin/windows-x64'
+          foreach ($name in @('FM-1.vst3', 'FM-1.clap')) {
+            $file = Join-Path $out $name
+            if (!(Test-Path $file)) { throw "Missing $file" }
+            if ((Get-Item $file).Length -lt 10000) { throw "Unexpectedly small plugin: $file" }
+          }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: FM-1-Windows-x64-VST3
+          path: |
+            target/plugin/windows-x64/FM-1.vst3
+            target/plugin/windows-x64/FM-1.clap
+          if-no-files-found: error
