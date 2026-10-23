@@ -1523,9 +1523,10 @@ impl Cpu {
                 self.sreg_store[0] = self.regs[(s & 15) as usize];
                 bus.irq_window();
             }
-            Fast::BlockMove { base, mask, store, post } => {
+            Fast::BlockMove { base, mask, store, post, down } => {
                 let base = (base & 15) as usize;
-                let mut addr = self.regs[base];
+                let start = if down { self.regs[base].wrapping_sub(4 * mask.count_ones()) } else { self.regs[base] };
+                let mut addr = start;
                 for i in 0..16usize {
                     if mask >> i & 1 != 0 {
                         if store {
@@ -1537,7 +1538,7 @@ impl Cpu {
                     }
                 }
                 if post {
-                    self.regs[base] = addr;
+                    self.regs[base] = if down { start } else { addr };
                 }
             }
             Fast::PushMask { mask } => {
@@ -1944,19 +1945,19 @@ impl Cpu {
         }
 
         // ---- multi-register block moves with a register base -----------
-        // `{rA, rB, ...} = [rN+]` / `[rN+] = {...}` (00 eb / 20 eb): base =
+        // `{rA, rB, ...} = [rN+]` / `[rN+] = {...}` (eb 00 / eb 20): base =
         // bits(0,3), 16-bit register mask at bits(16,31); the lowest register
         // takes the lowest address (same convention as the sp block pops).
-        // `[rN++]` additionally advances the base past the block. Base
-        // update for the plain `[rN+]` form assumed absent (probe item).
-        if insn.entry.len == 4 && (insn.raw >> 8) & 0xff == 0xeb
-            && ((s.starts_with("{") && has(s, "} = [R+")) || (s.starts_with("[R+") && has(s, "] = {")))
-        {
+        // `[rN++]` (eb 10 / 30) additionally advances the base past the block.
+        // `[-rN]` / `[--rN]` (eb 40..70): the block ends at the base, `--` moves
+        // the base down to its start (#59: JIANT's `40 eb 06 00`, {r1, r2} = [-r0]).
+        // Base update for the plain `[rN+]` / `[-rN]` forms assumed absent (probe item).
+        if let (4, 0xeb, Some((store, wb, down))) = (insn.entry.len, (insn.raw >> 8) & 0xff, block_form(s)) {
             let raw = insn.raw;
             let base = (raw & 0xf) as usize;
             let regs: Vec<usize> = (0..16usize).filter(|&i| (raw >> (16 + i)) & 1 != 0).collect();
-            let mut addr = self.regs[base];
-            let store = s.starts_with("[");
+            let start = if down { self.regs[base].wrapping_sub(4 * regs.len() as u32) } else { self.regs[base] };
+            let mut addr = start;
             for &i in &regs {
                 if store {
                     bus.write32(addr, self.regs[i]);
@@ -1965,8 +1966,8 @@ impl Cpu {
                 }
                 addr = addr.wrapping_add(4);
             }
-            if has(s, "[R++]") {
-                self.regs[base] = addr;
+            if wb {
+                self.regs[base] = if down { start } else { addr };
             }
             return Ok(Some(None));
         }
@@ -5097,6 +5098,56 @@ mod tests {
 
     /// A swappable pair in a block: run_fast runs it as one op of two instructions; cut by the
     /// budget after its head, or stepped, it gives the same.
+    /// The eight register-base block moves (`eb 00..70`: bit 4 the base written back, bit 5 a
+    /// store, bit 6 the block below the base), stepped and through the micro-op blocks. #59:
+    /// JIANT halted on `40 eb 06 00`, {r1, r2} = [-r0].
+    #[test]
+    fn block_moves_up_and_down() {
+        struct Xip(FlatRam);
+        impl Bus for Xip {
+            fn read8(&mut self, a: u32) -> u8 { self.0.read8(a & 0xffff) }
+            fn read16(&mut self, a: u32) -> u16 { self.0.read16(a & 0xffff) }
+            fn read32(&mut self, a: u32) -> u32 { self.0.read32(a & 0xffff) }
+            fn write8(&mut self, a: u32, v: u8) { self.0.write8(a & 0xffff, v) }
+            fn write16(&mut self, a: u32, v: u16) { self.0.write16(a & 0xffff, v) }
+            fn write32(&mut self, a: u32, v: u32) { self.0.write32(a & 0xffff, v) }
+            fn next_tick_due(&self) -> bool { false }
+        }
+        // (op, the block's first address, the base afterwards) with r0 = 0x1000 and {r1, r2}
+        let cases = [(0x00u8, 0x1000u32, 0x1000u32), (0x10, 0x1000, 0x1008), (0x20, 0x1000, 0x1000), (0x30, 0x1000, 0x1008),
+                     (0x40, 0x0ff8, 0x1000), (0x50, 0x0ff8, 0x0ff8), (0x60, 0x0ff8, 0x1000), (0x70, 0x0ff8, 0x0ff8)];
+        for (op, at, base) in cases {
+            let store = op & 0x20 != 0;
+            let fresh = || {
+                let mut mem = vec![0u8; 0x10000];
+                mem[..8].copy_from_slice(&[op, 0xeb, 0x06, 0x00, 0, 0, 0, 0]);
+                for (k, w) in [0x0ff8u32, 0x0ffc, 0x1000, 0x1004].iter().enumerate() {
+                    mem[*w as usize..*w as usize + 4].copy_from_slice(&(0xa0 + k as u32).to_le_bytes());
+                }
+                let mut cpu = Cpu::new(0x0200_0000);
+                (cpu.regs[0], cpu.regs[1], cpu.regs[2]) = (0x1000, 0x11, 0x22);
+                (cpu, Xip(FlatRam::new(mem)))
+            };
+            let check = |cpu: &Cpu, bus: &mut Xip, how: &str| {
+                let (lo, hi) = (bus.read32(at), bus.read32(at + 4));
+                if store {
+                    assert_eq!((lo, hi), (0x11, 0x22), "{op:#04x} {how}: stored");
+                } else {
+                    assert_eq!((cpu.regs[1], cpu.regs[2]), (lo, hi), "{op:#04x} {how}: loaded");
+                    assert_ne!(lo, 0, "{op:#04x}: the data was there");
+                }
+                assert_eq!(cpu.regs[0], base, "{op:#04x} {how}: the base");
+            };
+            let (mut cpu, mut bus) = fresh();
+            cpu.step(&mut bus).unwrap();
+            check(&cpu, &mut bus, "stepped");
+            let (mut cpu, mut bus) = fresh();
+            let (k, _) = cpu.run_fast(&mut bus, 1).unwrap();
+            assert_eq!(k, 1);
+            check(&cpu, &mut bus, "run_fast");
+        }
+    }
+
     #[test]
     fn swapped_pair_in_a_block() {
         // a bus with XIP code at 0x02000000 (its low 64 KiB alias), no ticks due
@@ -5493,7 +5544,7 @@ impl Fast {
             Fast::PopPc { n } => (0, range(n)),
             Fast::PushMask { mask } => (mask, 0),
             Fast::PopMask { mask } => (0, mask),
-            Fast::BlockMove { base, mask, store, post } => {
+            Fast::BlockMove { base, mask, store, post, .. } => {
                 let pb = if post { m(base) } else { 0 };
                 if store { (mask | m(base), pb) } else { (m(base), mask | pb) }
             }
@@ -5829,8 +5880,9 @@ enum Fast {
     /// `R = icfg` / `icfg = R`
     IcfgRd { d: u8 },
     IcfgWr { s: u8 },
-    /// `{regs} = [R+]` / `[R+] = {regs}` (and `[R++]`: the base moves past the block)
-    BlockMove { base: u8, mask: u16, store: bool, post: bool },
+    /// `{regs} = [R+]` / `[R+] = {regs}` (and `[R++]`: the base moves past the block); `down`:
+    /// `[-R]` / `[--R]`, the block below the base (`--`: the base moves to its start)
+    BlockMove { base: u8, mask: u16, store: bool, post: bool, down: bool },
     // were slow path: the raw-decoded routes, and the hottest syntax-keyed shapes
     /// execute's routes decoded from the raw word (pair loads / stores, pre / post-increment
     /// accesses, 64-bit ops, rev8, rets pops): `exec_raw`
@@ -5851,6 +5903,26 @@ enum Fast {
     StPre { s: u8, b: u8, i: u8, w: u8, inc: u32 },
     LdPostR { d: u8, b: u8, i: u8, w: u8, signed: bool },
     StPostR { s: u8, b: u8, i: u8, w: u8 },
+}
+
+/// A register-base block move's form, from its syntax: `{regs} = [R+]`, `[R++]`, `[-R]`, `[--R]` and
+/// the stores `[R+] = {regs}` ...: (a store, the base written back, the block below the base). The sp
+/// forms (`[--sp] = {...}`) are not these.
+fn block_form(s: &str) -> Option<(bool, bool, bool)> {
+    let (store, m) = if let Some(rest) = s.strip_prefix('[') {
+        (true, rest.split_once("] = {")?.0)
+    } else if s.starts_with('{') {
+        (false, s.split_once("} = [")?.1.strip_suffix(']')?)
+    } else {
+        return None;
+    };
+    match m {
+        "R+" => Some((store, false, false)),
+        "R++" => Some((store, true, false)),
+        "-R" => Some((store, false, true)),
+        "--R" => Some((store, true, true)),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -6369,16 +6441,10 @@ fn fast_of(insn: &Instruction, s: &'static str) -> Option<Fast> {
         "R = R >>> #i" if insn.entry.len == 4 && v(2).map_or(false, |n| (1..32).contains(&n)) => {
             return Some(Fast::SarI { d: r(0)?, s: r(1)?, n: v(2)? as u8 });
         }
-        _ if insn.entry.len == 4 && (insn.raw >> 8) & 0xff == 0xeb
-            && ((s.starts_with('{') && s.contains("} = [R+")) || (s.starts_with("[R+") && s.contains("] = {"))) =>
-        {
-            // block moves (exec_syntax's `00 eb` / `20 eb` arm): base bits 0-3, mask bits 16-31
-            return Some(Fast::BlockMove {
-                base: (insn.raw & 0xf) as u8,
-                mask: (insn.raw >> 16) as u16,
-                store: s.starts_with('['),
-                post: s.contains("[R++]"),
-            });
+        _ if insn.entry.len == 4 && (insn.raw >> 8) & 0xff == 0xeb && block_form(s).is_some() => {
+            // block moves (exec_syntax's `eb 00..70` arm): base bits 0-3, mask bits 16-31
+            let (store, post, down) = block_form(s)?;
+            return Some(Fast::BlockMove { base: (insn.raw & 0xf) as u8, mask: (insn.raw >> 16) as u16, store, post, down });
         }
         _ => {}
     }
