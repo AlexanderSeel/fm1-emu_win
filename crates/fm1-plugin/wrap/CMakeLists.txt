@@ -4,8 +4,13 @@
 #   cmake -B build -DFM1_CLAP=/path/to/FM-1.clap && cmake --build build
 cmake_minimum_required(VERSION 3.21)
 set(CMAKE_OSX_DEPLOYMENT_TARGET 11.0 CACHE STRING "")
-set(CMAKE_OSX_ARCHITECTURES arm64 CACHE STRING "")
-project(fm1-plugin-wrap VERSION 0.1.0 LANGUAGES C CXX OBJC OBJCXX)
+if(APPLE)
+    set(CMAKE_OSX_ARCHITECTURES arm64 CACHE STRING "")
+endif()
+project(fm1-plugin-wrap VERSION 0.1.0 LANGUAGES C CXX)
+if(APPLE)
+    enable_language(OBJC OBJCXX)
+endif()
 set(CMAKE_CXX_STANDARD 17)
 
 set(FM1_CLAP "" CACHE PATH "The FM-1.clap bundle the wrappers carry")
@@ -21,6 +26,7 @@ FetchContent_Declare(clap-wrapper
 FetchContent_MakeAvailable(clap-wrapper)
 
 # An instrument ('aumu'); the codes name it to AU hosts: manufacturer Fm1e, subtype Fm1s.
+if(APPLE)
 add_library(fm1_auv2 MODULE)
 target_add_auv2_wrapper(
         TARGET fm1_auv2
@@ -32,6 +38,7 @@ target_add_auv2_wrapper(
         SUBTYPE_CODE "Fm1s"
         INSTRUMENT_TYPE "aumu"
         MACOS_EMBEDDED_CLAP_LOCATION "${FM1_CLAP}")
+endif()
 
 # The VST3 (Steinberg's SDK, MIT since 3.8), the same CLAP inside.
 add_library(fm1_vst3 MODULE)
