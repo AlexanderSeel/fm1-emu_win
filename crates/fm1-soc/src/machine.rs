@@ -191,7 +191,7 @@ pub struct LoopSkip {
 struct Visit {
     core: PlainState,
     p33: p33::Snap,
-    adc: (u32, bool, bool),
+    adc: crate::periph::AdcState,
     at: u32,
     log: usize,
 }
@@ -953,6 +953,23 @@ mod tests {
         for jit in [false, true] {
             let (_, soc) = run_both_jit(&code, &regs, jit, &setup, 1_200_000);
             assert!(soc.loop_skip.skipped > 500_000, "jit {jit}: {} skipped", soc.loop_skip.skipped);
+        }
+    }
+
+    #[test]
+    fn adc_poll_of_a_pulled_up_row_converts_every_round() {
+        // [0x13100] = 0x50 (ch 0 = row PA7, pulled up: every conversion moves the noise
+        // generator), r2 = [0x13104], round again: no round repeats, and skip or not, the
+        // generator ends where it does without the skip
+        let code = [STORE.as_slice(), &LOAD, &[0x60, 0xff, 0x00, 0x20, 0xf9, 0xff]].concat();
+        let regs = [(1, 0x13104 + 544), (5, 0x13100 + 128), (3, 0x50)];
+        let setup = |s: &mut Soc| {
+            s.write32(0x50008, 1 << 7);
+            s.write32(0x50010, 1 << 7);
+        };
+        for jit in [false, true] {
+            let (_, soc) = run_both_jit(&code, &regs, jit, &setup, 300_000);
+            assert_eq!(soc.loop_skip.skipped, 0, "jit {jit}");
         }
     }
 
