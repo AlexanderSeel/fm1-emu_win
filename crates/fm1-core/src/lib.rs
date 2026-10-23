@@ -4194,14 +4194,14 @@ mod tests {
             *self.mem.get(addr as usize).unwrap_or(&0)
         }
         fn read16(&mut self, addr: u32) -> u16 {
-            u16::from_le_bytes([self.read8(addr), self.read8(addr + 1)])
+            u16::from_le_bytes([self.read8(addr), self.read8(addr.wrapping_add(1))])
         }
         fn read32(&mut self, addr: u32) -> u32 {
             u32::from_le_bytes([
                 self.read8(addr),
-                self.read8(addr + 1),
-                self.read8(addr + 2),
-                self.read8(addr + 3),
+                self.read8(addr.wrapping_add(1)),
+                self.read8(addr.wrapping_add(2)),
+                self.read8(addr.wrapping_add(3)),
             ])
         }
         fn write8(&mut self, addr: u32, value: u8) {
@@ -4211,12 +4211,12 @@ mod tests {
         }
         fn write16(&mut self, addr: u32, value: u16) {
             for (i, b) in value.to_le_bytes().iter().enumerate() {
-                self.write8(addr + i as u32, *b);
+                self.write8(addr.wrapping_add(i as u32), *b);
             }
         }
         fn write32(&mut self, addr: u32, value: u32) {
             for (i, b) in value.to_le_bytes().iter().enumerate() {
-                self.write8(addr + i as u32, *b);
+                self.write8(addr.wrapping_add(i as u32), *b);
             }
         }
     }
@@ -5191,8 +5191,6 @@ mod tests {
         assert!(order_matters > swapped / 2, "{order_matters} of {swapped}");
     }
 
-    /// A swappable pair in a block: run_fast runs it as one op of two instructions; cut by the
-    /// budget after its head, or stepped, it gives the same.
     /// The eight register-base block moves (`eb 00..70`: bit 4 the base written back, bit 5 a
     /// store, bit 6 the block below the base), stepped and through the micro-op blocks. #59:
     /// JIANT halted on `40 eb 06 00`, {r1, r2} = [-r0].
@@ -5243,6 +5241,8 @@ mod tests {
         }
     }
 
+    /// A swappable pair in a block: run_fast runs it as one op of two instructions; cut by the
+    /// budget after its head, or stepped, it gives the same.
     #[test]
     fn swapped_pair_in_a_block() {
         // a bus with XIP code at 0x02000000 (its low 64 KiB alias), no ticks due

@@ -191,18 +191,15 @@ impl Machine {
         cpu.regs[0] = params;
         if let Some(st) = &stock {
             cpu.regs[0] = fm1_soc::stock_boot(&mut soc, &st.flash, params, st.board);
-            soc.sfc_key = Some(st.key);
+            soc.sfc_boot(st.key, st.app_end);
         }
         if let Some(path) = o.flash.as_ref().filter(|p| std::path::Path::new(p).exists()) {
             let f = std::fs::read(path)?;
             if f.len() != fm1_soc::FLASH_SIZE {
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{path}: not a {} byte flash image", fm1_soc::FLASH_SIZE)));
             }
+            // (through the SFC as the loader leaves it, and again when the firmware sets its window)
             soc.restore_flash(&f);
-            if let Some(st) = &stock {
-                // (the window from the chip: what a run before wrote into the app area too)
-                soc.xip_from_flash(st.key, 0x93000);
-            }
         }
         let skip_log = std::env::var("FM1_SKIP_LOG").ok().map(|_| Default::default());
         let blocks = std::env::var("FM1_NO_BLOCKS").is_err();
