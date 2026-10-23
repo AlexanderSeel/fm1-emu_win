@@ -1072,11 +1072,32 @@ mod tests {
     }
 
     #[test]
+    fn a_second_release_with_core_1_running_latches_nothing() {
+        // 0x10008 bit 3 set (core 1 starts), cleared and set again: no second release is latched.
+        // (Nothing would take it with core 1 running, and run_blocks would break after every
+        // run_fast return: cpu0 one instruction a slice, its time nearly stopped.)
+        let (mut cpu, mut soc) = machine(&[0x60, 0xff, 0x00, 0x20, 0xfd, 0xff], &[], true);
+        soc.write32(0x01C7_FFF8, XIP_BASE);
+        soc.write32(0x10008, 8);
+        let (mut c1, mut t) = (None, false);
+        run_dual(&mut c1, &mut soc, 8192, 1 << 20, false, |s, k| run_blocks(&mut cpu, s, k, &mut t)).unwrap();
+        assert!(c1.is_some() && !soc.cpu1_release, "core 1 started, the release taken");
+        soc.write32(0x10008, 0);
+        soc.write32(0x10008, 8);
+        assert!(!soc.cpu1_release, "a second release latched");
+        let before = cpu.insn_count;
+        for _ in 0..4 {
+            run_dual(&mut c1, &mut soc, 8192, 1 << 20, false, |s, k| run_blocks(&mut cpu, s, k, &mut t)).unwrap();
+        }
+        assert!(cpu.insn_count - before >= 4 * 8000, "cpu0 ran {} in 4 calls of 8192", cpu.insn_count - before);
+    }
+
+    #[test]
     fn latched_release_in_the_dual_phase_stops_cpu0_where_it_would_without_the_skip() {
         // cpu1 already runs and the firmware sets 0x10008 bit 3 again (0 -> 1): `cpu1_release`
         // is latched and nothing takes it, so run_blocks breaks after every run_fast return.
         // cpu0 polls a RAM word from RAM code a step at a time: a probe must not run on past
-        // such a break. (That cpu0 then runs one instruction a slice is master's latch, PLAN 5.31.)
+        // such a break. (A latch only the first release makes now: `a_second_release_...`.)
         let both = |skip: bool| {
             let (_, mut soc) = machine(&[0x60, 0xff, 0x00, 0x20, 0xfd, 0xff], &[], skip);
             soc.ram.load(0x8000, &[LOAD.as_slice(), &[0x60, 0xff, 0x00, 0x20, 0xf9, 0xff]].concat());

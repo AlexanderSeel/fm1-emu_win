@@ -217,7 +217,7 @@ pub struct Soc {
     /// to report in.
     pub cpu1_release: bool,
     /// core 1 was released once: a later run on 0x1EEE004 is the stock IPC's resume after a
-    /// pause, not a release.
+    /// pause, not a release, and a later 0 -> 1 of 0x10008 bit 3 latches nothing (core 1 runs on).
     cpu1_released_once: bool,
     /// FM1_AUDIO_TRACE: log each audio half-buffer (debugging the DMA's pace).
     audio_trace: bool,
@@ -962,7 +962,9 @@ impl Soc {
                 }
             }
             Region::Clk => {
-                if addr == 0x10008 && value & 8 != 0 && self.sfr_get(addr) & 8 == 0 {
+                if addr == 0x10008 && value & 8 != 0 && self.sfr_get(addr) & 8 == 0 && !self.cpu1_released_once {
+                    // (once, as C1_CON's: set again later, with core 1 running, nothing would take
+                    // the latch, and the runner would stop cpu0 after every block call)
                     self.cpu1_released_once = true;
                     self.cpu1_release = true;
                     self.periph.next_due = 0; // the runner looks at it before the next instruction
